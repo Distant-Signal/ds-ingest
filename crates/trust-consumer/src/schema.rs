@@ -4,6 +4,15 @@
 //! name and field). `0005`/`0008` are unconfirmed and parse into
 //! `TrustMessage::Unknown` rather than being guessed at -- per this
 //! codebase's "no invented API details" convention.
+//!
+//! One thing that research pass got wrong: it claimed TRUST delivers a
+//! JSON array of `{header, body}` envelopes per batch. A real RDM Train
+//! Movements Kafka consumer run against `local.env` proved otherwise --
+//! every record's payload was a single bare `{header, body}` object, which
+//! made the old array-only `serde_json::from_str::<Vec<Envelope>>` fail
+//! with `invalid type: map, expected a sequence` on every message. `parse_batch`
+//! below accepts either shape defensively, since a single live data point
+//! disproving "always an array" doesn't prove "never an array" either.
 
 use serde::Deserialize;
 
@@ -74,12 +83,27 @@ pub enum TrustMessage {
     Unknown(String),
 }
 
-/// TRUST sends a JSON array of `{header, body}` envelopes per batch (every
-/// 5s or 32 messages, whichever first -- confirmed by the design doc's
-/// research). One malformed envelope inside an otherwise-good batch is
-/// logged and skipped, not treated as a reason to drop the whole batch.
+/// A real Kafka record's payload delivers a single `{header, body}` envelope
+/// object -- confirmed by a live production error (see this module's header
+/// doc). Defensive handling for a JSON array of envelopes is kept too, since
+/// the design doc's research claimed that shape and it hasn't been *proven*
+/// to never occur, e.g. on some other topic/product variant. Either way, one
+/// malformed envelope inside an otherwise-good payload is logged and
+/// skipped, not treated as a reason to drop everything else.
+///
+/// Dispatches on `serde_json::Value::is_array` rather than an
+/// `#[serde(untagged)]` enum: untagged deserialization was tried first, but
+/// on a genuinely malformed payload (wrong shape, not just wrong type) it
+/// collapses both attempts into a single unhelpful "data did not match any
+/// variant of untagged enum" with no field-level detail -- confirmed by
+/// hand against this exact struct shape. Parsing to `Value` first and then
+/// routing through `serde_json::from_value` keeps serde's normal, specific
+/// field-level errors (e.g. "missing field `header`") for a shape that's
+/// neither of the two expected ones.
 pub fn parse_batch(raw: &str) -> anyhow::Result<Vec<TrustMessage>> {
-    let envelopes: Vec<Envelope> = serde_json::from_str(raw)?;
+    let value: serde_json::Value = serde_json::from_str(raw)?;
+    let envelopes: Vec<Envelope> =
+        if value.is_array() { serde_json::from_value(value)? } else { vec![serde_json::from_value(value)?] };
     Ok(envelopes.into_iter().filter_map(parse_envelope).collect())
 }
 
@@ -124,6 +148,40 @@ mod tests {
         let messages = parse_batch(raw).unwrap();
         assert_eq!(messages.len(), 1);
         assert!(matches!(&messages[0], TrustMessage::Movement(m) if m.event_type == "DEPARTURE"));
+    }
+
+    /// The exact shape a real RDM Train Movements Kafka record delivers: a
+    /// single bare `{header, body}` object, NOT wrapped in an array. This is
+    /// the payload shape that triggered the live `invalid type: map,
+    /// expected a sequence` error against `parse_batch`'s old
+    /// array-only `serde_json::from_str::<Vec<Envelope>>` -- without the
+    /// single/array dispatch above, this exact input reproduces that
+    /// failure.
+    #[test]
+    fn parses_a_single_bare_envelope_object_not_wrapped_in_an_array() {
+        let raw = r#"{"header":{"msg_type":"0003"},"body":{
+            "train_id":"221832406","event_type":"DEPARTURE",
+            "planned_timestamp":"1756400000000","actual_timestamp":"1756400060000",
+            "loc_stanox":"87701","variation_status":"LATE"
+        }}"#;
+        let messages = parse_batch(raw).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(&messages[0], TrustMessage::Movement(m) if m.event_type == "DEPARTURE"));
+    }
+
+    /// A payload that is neither a bare envelope object nor an array of
+    /// them (e.g. missing `header` entirely) must fail with a specific,
+    /// actionable field-level error -- not serde's generic untagged-enum
+    /// "data did not match any variant" message, which names no field and
+    /// gives no hint what's wrong.
+    #[test]
+    fn a_malformed_payload_produces_a_specific_field_level_error() {
+        let raw = r#"{"not_an_envelope": true}"#;
+        let err = parse_batch(raw).unwrap_err();
+        assert!(
+            err.to_string().contains("header"),
+            "expected a field-level error mentioning `header`, got: {err}"
+        );
     }
 
     #[test]

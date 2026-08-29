@@ -9,10 +9,12 @@ use async_trait::async_trait;
 
 #[async_trait]
 pub trait MovementFeed: Send {
-    /// Returns the next batch of raw JSON message-batch bodies (each
-    /// element is one TRUST batch -- itself a JSON array of envelopes, per
-    /// `schema::parse_batch`'s input shape) not yet committed. An empty
-    /// `Vec` means "nothing new right now," not an error.
+    /// Returns the next batch of raw JSON message-batch bodies (each element
+    /// is one raw Kafka record's payload -- per `schema::parse_batch`'s
+    /// input shape, that's normally a single bare `{header, body}` envelope
+    /// object, confirmed live against a real RDM Train Movements feed, with
+    /// a JSON array of envelopes handled defensively too) not yet committed.
+    /// An empty `Vec` means "nothing new right now," not an error.
     async fn next_batch(&mut self) -> anyhow::Result<Vec<String>>;
 
     /// Commits offsets for everything returned by the most recent
