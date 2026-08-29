@@ -25,7 +25,7 @@ pub struct Config {
     /// trust-consumer replicas sharing one group would each get a subset
     /// of partitions, which is fine for horizontal scaling but NOT this
     /// plan's v1 (single replica; see Helm chart task).
-    #[arg(long, env, default_value = "nr-status-trust-consumer")]
+    #[arg(long, env, default_value = "distant-signal-trust-consumer")]
     pub kafka_consumer_group: String,
 
     /// RDM's "Consumer key" for this product (SASL username).
