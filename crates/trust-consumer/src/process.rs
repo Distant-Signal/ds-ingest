@@ -105,6 +105,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use anyhow::Context;
 use chrono::NaiveDate;
 
 use crate::feed::MovementFeed;
@@ -248,7 +249,19 @@ pub async fn run_once<F: MovementFeed>(
     let mut events = Vec::new();
 
     for raw in raw_batches {
-        let messages = crate::schema::parse_batch(&raw)?;
+        // The raw payload is attached to the error via `.with_context` (not
+        // just propagated with `?`) so a real-world parse failure's log line
+        // shows the actual bytes that didn't match either shape
+        // `schema::parse_batch` understands -- this codebase has already
+        // been burned twice by an envelope-shape assumption that looked
+        // right on paper (a JSON-array batch, then a bare single-object
+        // envelope) but didn't match what a real broker sent; the fix both
+        // times was a live payload, not another guess. Without the raw
+        // string in the error, `main.rs`'s `tracing::error!(error = ?err,
+        // ...)` only ever showed the parse failure's shape (e.g. "missing
+        // field `header`"), never the payload that produced it.
+        let messages = crate::schema::parse_batch(&raw)
+            .with_context(|| format!("raw payload: {raw}"))?;
         for message in messages {
             if let Some(event) = process_message(&message, reference, state) {
                 events.push(event);
