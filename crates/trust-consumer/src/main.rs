@@ -14,6 +14,7 @@ mod eta;
 mod dedup;
 mod process;
 mod queries;
+mod stanox_crs;
 
 use std::time::Duration;
 
@@ -161,7 +162,7 @@ mod tests {
     const ORIGIN_DEPARTURE: &str = r#"[{"header":{"msg_type":"0003"},"body":{
         "train_id":"221832406","event_type":"DEPARTURE",
         "planned_timestamp":"1787941920000","actual_timestamp":"1787941920000",
-        "loc_stanox":"WAT","variation_status":"ON TIME"
+        "loc_stanox":"87212","variation_status":"ON TIME"
     }}]"#;
 
     fn one_pending_pin() -> process::Reference {

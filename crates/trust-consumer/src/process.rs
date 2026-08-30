@@ -6,20 +6,27 @@
 //!
 //! # Known simplification left for follow-up work
 //!
-//! **STANOX->CRS translation is not implemented.** `loc_crs` is hardcoded
-//! `None` throughout `process_message`, and `matching::resolve_origin_departure`
-//! is consequently handed the raw `loc_stanox` where it documents wanting a
-//! CRS. TRUST messages carry STANOX codes, not CRS; the `crates/api`-owned
-//! `stations` reference table doesn't currently store a STANOX column
-//! (`common::StationReference` has no such field -- confirmed, not assumed).
-//! Closing this gap is a small, self-contained follow-up: add a STANOX
-//! column to the stations migration, source it from whatever RDM reference
-//! product publishes the STANOX<->CRS mapping (unconfirmed -- another GAP),
-//! and thread a lookup table into `process_message`. Until then,
+//! **STANOX->CRS translation is implemented via a checked-in static
+//! lookup table, `stanox_crs::stanox_to_crs`.** `loc_crs` in
+//! `process_message` is the real translated CRS (or `None` when the
+//! STANOX isn't in the table -- see below), and
+//! `matching::resolve_origin_departure` is handed that translated CRS,
+//! not the raw `loc_stanox`, so a pin's `pin_origin_crs` can now actually
+//! compare equal to it. The table itself is generated from a real CIF
+//! full-timetable extract's `TI` (TIPLOC Insert) records, not fetched
+//! live -- this crate has no CIF SCHEDULE feed connection (a separate,
+//! larger, unbuilt ingestion pipeline; see
+//! docs/superpowers/specs/2026-08-30-schedule-feed-ingress-design.md) --
+//! see `stanox_crs`'s own module doc for full provenance, the exact
+//! record format it was decoded against, and the (small, documented)
+//! set of STANOX values deliberately excluded as ambiguous. A lookup
+//! miss -- a genuinely unmapped or non-passenger STANOX (freight-only
+//! sidings, signals, junctions), or one of the table's excluded
+//! ambiguous entries -- still yields `loc_crs = None`, preserving the
+//! honest "we don't know" behaviour this module always had:
 //! `last_reported_location` falls back to the raw STANOX (per
-//! `journey::apply_movement`'s existing fallback), which is honest but not
-//! display-friendly, and a pin only resolves when its `pin_origin_crs`
-//! happens to compare equal to the feed's STANOX string.
+//! `journey::apply_movement`'s existing fallback), and a pin simply
+//! doesn't match on that event.
 //!
 //! **A tracked train can stay `resolution_status = 'pending'` in the
 //! database forever even while this process tracks it correctly.**
@@ -298,7 +305,11 @@ fn process_message(
         TrustMessage::Movement(movement) => {
             let planned = movement.planned_timestamp.as_deref().and_then(parse_epoch_millis);
             let actual = movement.actual_timestamp.as_deref().and_then(parse_epoch_millis);
-            let loc_crs = None; // STANOX->CRS translation: see this module's docs.
+            // Real translation now -- see `stanox_crs`'s module doc for
+            // where the table comes from and why a miss (`None`) is the
+            // honest, expected outcome for a non-passenger or otherwise
+            // unmapped STANOX, not a bug.
+            let loc_crs = movement.loc_stanox.as_deref().and_then(crate::stanox_crs::stanox_to_crs);
 
             // Already-resolved train_ids short-circuit matching entirely;
             // only a genuinely unseen train_id is offered to the pins.
@@ -323,7 +334,13 @@ fn process_message(
                     }
 
                     let actual_ts = actual?;
-                    let loc_stanox = movement.loc_stanox.as_deref()?;
+                    // A pin can only ever be claimed by a Movement whose
+                    // location translated to a real CRS -- an untranslated
+                    // STANOX can never equal a pin's `pin_origin_crs`, so
+                    // there's nothing to attempt a match against. This
+                    // mirrors the existing early-returns just above for a
+                    // missing `event_type`/`actual_timestamp`.
+                    let loc_crs_for_match = loc_crs?;
 
                     // A pin already claimed by some other train_id must not
                     // be offered again. `resolve_origin_departure` is a
@@ -342,7 +359,7 @@ fn process_message(
                         .collect();
 
                     let tracked_train_id =
-                        crate::matching::resolve_origin_departure(loc_stanox, actual_ts, &unclaimed)?;
+                        crate::matching::resolve_origin_departure(loc_crs_for_match, actual_ts, &unclaimed)?;
                     state.resolved.insert(movement.train_id.clone(), tracked_train_id);
                     (tracked_train_id, true)
                 }
@@ -527,7 +544,7 @@ mod tests {
     const ORIGIN_DEPARTURE: &str = r#"[{"header":{"msg_type":"0003"},"body":{
         "train_id":"221832406","event_type":"DEPARTURE",
         "planned_timestamp":"1787941920000","actual_timestamp":"1787941920000",
-        "loc_stanox":"WAT","variation_status":"ON TIME"
+        "loc_stanox":"87212","variation_status":"ON TIME"
     }}]"#;
 
     #[tokio::test]
@@ -548,7 +565,7 @@ mod tests {
         let raw_batch = r#"[{"header":{"msg_type":"0003"},"body":{
             "train_id":"999","event_type":"DEPARTURE",
             "planned_timestamp":"1787941920000","actual_timestamp":"1787941920000",
-            "loc_stanox":"PAD","variation_status":"ON TIME"
+            "loc_stanox":"73000","variation_status":"ON TIME"
         }}]"#;
         let mut feed = FakeMovementFeed::new(vec![vec![raw_batch.to_string()]]);
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
@@ -598,7 +615,7 @@ mod tests {
         let later_arrival = r#"[{"header":{"msg_type":"0003"},"body":{
             "train_id":"221832406","event_type":"ARRIVAL",
             "planned_timestamp":"1787943000000","actual_timestamp":"1787943000000",
-            "loc_stanox":"WOK","variation_status":"ON TIME"
+            "loc_stanox":"86031","variation_status":"ON TIME"
         }}]"#;
         let mut feed = FakeMovementFeed::new(vec![
             vec![ORIGIN_DEPARTURE.to_string()],
@@ -724,7 +741,7 @@ mod tests {
         let later_arrival = r#"[{"header":{"msg_type":"0003"},"body":{
             "train_id":"221832406","event_type":"ARRIVAL",
             "planned_timestamp":"1787943000000","actual_timestamp":"1787943000000",
-            "loc_stanox":"WOK","variation_status":"ON TIME"
+            "loc_stanox":"86031","variation_status":"ON TIME"
         }}]"#;
         let mut feed = FakeMovementFeed::new(vec![vec![later_arrival.to_string()]]);
         let mut reference = Reference { pending: Vec::new() };
@@ -750,7 +767,7 @@ mod tests {
         let later_arrival = r#"[{"header":{"msg_type":"0003"},"body":{
             "train_id":"221832406","event_type":"ARRIVAL",
             "planned_timestamp":"1787943000000","actual_timestamp":"1787943000000",
-            "loc_stanox":"WOK","variation_status":"ON TIME"
+            "loc_stanox":"86031","variation_status":"ON TIME"
         }}]"#;
         let mut feed = FakeMovementFeed::new(vec![
             vec![ORIGIN_DEPARTURE.to_string()],
@@ -782,7 +799,7 @@ mod tests {
         let other_train_departure = r#"[{"header":{"msg_type":"0003"},"body":{
             "train_id":"221832407","event_type":"DEPARTURE",
             "planned_timestamp":"1787942400000","actual_timestamp":"1787942400000",
-            "loc_stanox":"WAT","variation_status":"ON TIME"
+            "loc_stanox":"87212","variation_status":"ON TIME"
         }}]"#;
         let mut feed = FakeMovementFeed::new(vec![
             vec![ORIGIN_DEPARTURE.to_string()],
@@ -814,7 +831,7 @@ mod tests {
         let arrival_at_origin = r#"[{"header":{"msg_type":"0003"},"body":{
             "train_id":"221832499","event_type":"ARRIVAL",
             "planned_timestamp":"1787941920000","actual_timestamp":"1787941920000",
-            "loc_stanox":"WAT","variation_status":"ON TIME"
+            "loc_stanox":"87212","variation_status":"ON TIME"
         }}]"#;
         let mut feed = FakeMovementFeed::new(vec![
             vec![arrival_at_origin.to_string()],
@@ -844,7 +861,7 @@ mod tests {
         let pass_at_origin = r#"[{"header":{"msg_type":"0003"},"body":{
             "train_id":"221832499","event_type":"PASS",
             "planned_timestamp":"1787941920000","actual_timestamp":"1787941920000",
-            "loc_stanox":"WAT","variation_status":"ON TIME"
+            "loc_stanox":"87212","variation_status":"ON TIME"
         }}]"#;
         let mut feed = FakeMovementFeed::new(vec![vec![pass_at_origin.to_string()]]);
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
