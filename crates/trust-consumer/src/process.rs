@@ -6,8 +6,9 @@
 //!
 //! # Known simplification left for follow-up work
 //!
-//! **STANOX->CRS translation is implemented via a checked-in static
-//! lookup table, `stanox_crs::stanox_to_crs`.** `loc_crs` in
+//! **STANOX->CRS translation is implemented via a table loaded once at
+//! startup from `reference-data/stanox-crs.csv`,
+//! `stanox_crs::StanoxCrsTable::stanox_to_crs`.** `loc_crs` in
 //! `process_message` is the real translated CRS (or `None` when the
 //! STANOX isn't in the table -- see below), and
 //! `matching::resolve_origin_departure` is handed that translated CRS,
@@ -17,13 +18,13 @@
 //! live -- this crate has no CIF SCHEDULE feed connection (a separate,
 //! larger, unbuilt ingestion pipeline; see
 //! docs/superpowers/specs/2026-08-30-schedule-feed-ingress-design.md) --
-//! see `stanox_crs`'s own module doc for full provenance, the exact
-//! record format it was decoded against, and the (small, documented)
-//! set of STANOX values deliberately excluded as ambiguous. A lookup
-//! miss -- a genuinely unmapped or non-passenger STANOX (freight-only
-//! sidings, signals, junctions), or one of the table's excluded
-//! ambiguous entries -- still yields `loc_crs = None`, preserving the
-//! honest "we don't know" behaviour this module always had:
+//! see `stanox_crs`'s own module doc and `reference-data/stanox-crs.md`
+//! for full provenance, the exact record format it was decoded against,
+//! and the (small, documented) set of STANOX values deliberately excluded
+//! as ambiguous. A lookup miss -- a genuinely unmapped or non-passenger
+//! STANOX (freight-only sidings, signals, junctions), or one of the
+//! table's excluded ambiguous entries -- still yields `loc_crs = None`,
+//! preserving the honest "we don't know" behaviour this module always had:
 //! `last_reported_location` falls back to the raw STANOX (per
 //! `journey::apply_movement`'s existing fallback), and a pin simply
 //! doesn't match on that event.
@@ -251,6 +252,7 @@ pub async fn run_once<F: MovementFeed>(
     feed: &mut F,
     reference: &Reference,
     state: &mut ProcessorState,
+    stanox_crs: &crate::stanox_crs::StanoxCrsTable,
 ) -> anyhow::Result<Vec<common::TrainMovementEventMessage>> {
     let raw_batches = feed.next_batch().await?;
     let mut events = Vec::new();
@@ -270,7 +272,7 @@ pub async fn run_once<F: MovementFeed>(
         let messages = crate::schema::parse_batch(&raw)
             .with_context(|| format!("raw payload: {raw}"))?;
         for message in messages {
-            if let Some(event) = process_message(&message, reference, state) {
+            if let Some(event) = process_message(&message, reference, state, stanox_crs) {
                 events.push(event);
             }
         }
@@ -283,6 +285,7 @@ fn process_message(
     message: &TrustMessage,
     reference: &Reference,
     state: &mut ProcessorState,
+    stanox_crs: &crate::stanox_crs::StanoxCrsTable,
 ) -> Option<common::TrainMovementEventMessage> {
     match message {
         // An Activation never produces a posted event of its own -- it only
@@ -309,7 +312,8 @@ fn process_message(
             // where the table comes from and why a miss (`None`) is the
             // honest, expected outcome for a non-passenger or otherwise
             // unmapped STANOX, not a bug.
-            let loc_crs = movement.loc_stanox.as_deref().and_then(crate::stanox_crs::stanox_to_crs);
+            let loc_crs: Option<String> =
+                movement.loc_stanox.as_deref().and_then(|stanox| stanox_crs.stanox_to_crs(stanox));
 
             // Already-resolved train_ids short-circuit matching entirely;
             // only a genuinely unseen train_id is offered to the pins.
@@ -340,7 +344,7 @@ fn process_message(
                     // there's nothing to attempt a match against. This
                     // mirrors the existing early-returns just above for a
                     // missing `event_type`/`actual_timestamp`.
-                    let loc_crs_for_match = loc_crs?;
+                    let loc_crs_for_match = loc_crs.as_deref()?;
 
                     // A pin already claimed by some other train_id must not
                     // be offered again. `resolve_origin_departure` is a
@@ -366,7 +370,7 @@ fn process_message(
             };
 
             let previous = previous_state(state, &movement.train_id);
-            let mut derived = crate::journey::apply_movement(&previous, movement, loc_crs);
+            let mut derived = crate::journey::apply_movement(&previous, movement, loc_crs.as_deref());
             if let (Some(p), Some(a), Some("LATE")) = (planned, actual, movement.variation_status.as_deref()) {
                 derived.delay_minutes = Some((a - p).num_minutes() as i32);
             }
@@ -405,7 +409,7 @@ fn process_message(
                 msg_type: "0003".to_string(),
                 event_type: Some(movement.event_type.clone()),
                 loc_stanox: movement.loc_stanox.clone(),
-                loc_crs: loc_crs.map(str::to_string),
+                loc_crs,
                 planned_timestamp: planned,
                 actual_timestamp: actual,
                 variation_status: movement.variation_status.clone(),
@@ -525,9 +529,26 @@ fn parse_epoch_millis(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::LazyLock;
+
     use super::*;
     use crate::feed::FakeMovementFeed;
     use crate::matching::PendingPin;
+    use crate::stanox_crs::StanoxCrsTable;
+
+    /// The real, checked-in `reference-data/stanox-crs.csv` -- not a
+    /// synthetic fixture -- loaded once and shared across every test below,
+    /// mirroring how `crates/aggregator`/`crates/api`'s own tests load the
+    /// real `lines/` directory directly (see e.g.
+    /// `crates/aggregator/src/segments.rs`'s `load_all_lines`). These tests
+    /// depend on real STANOX values (`"87212"` -> `"WAT"`, `"73000"`,
+    /// `"86031"`) actually translating, same as before this table moved out
+    /// of a Rust literal.
+    static TEST_STANOX_CRS: LazyLock<StanoxCrsTable> = LazyLock::new(|| {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../reference-data/stanox-crs.csv");
+        StanoxCrsTable::from_file(&path).expect("reference-data/stanox-crs.csv should parse")
+    });
 
     fn reference_with_one_pending(id: i64, crs: &str, scheduled: &str) -> Reference {
         Reference {
@@ -553,7 +574,7 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let events = run_once(&mut feed, &reference, &mut state).await.unwrap();
+        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tracked_train_id, 1);
@@ -571,7 +592,7 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let events = run_once(&mut feed, &reference, &mut state).await.unwrap();
+        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert!(events.is_empty());
     }
 
@@ -580,7 +601,7 @@ mod tests {
         let mut feed = FakeMovementFeed::new(vec![vec![]]);
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
-        let events = run_once(&mut feed, &reference, &mut state).await.unwrap();
+        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert!(events.is_empty());
     }
 
@@ -598,10 +619,10 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let activation_events = run_once(&mut feed, &reference, &mut state).await.unwrap();
+        let activation_events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert!(activation_events.is_empty(), "an Activation alone posts nothing");
 
-        let events = run_once(&mut feed, &reference, &mut state).await.unwrap();
+        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].resolved_train_uid, Some("C21373".to_string()));
         assert_eq!(events[0].resolved_train_id, Some("221832406".to_string()));
@@ -624,10 +645,10 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let first = run_once(&mut feed, &reference, &mut state).await.unwrap();
+        let first = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert_eq!(first[0].resolved_train_id, Some("221832406".to_string()));
 
-        let second = run_once(&mut feed, &reference, &mut state).await.unwrap();
+        let second = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].tracked_train_id, 1, "same tracked train as the resolving movement");
         assert_eq!(second[0].last_reported_location, Some("WOK".to_string()));
@@ -647,10 +668,10 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let movement_events = run_once(&mut feed, &reference, &mut state).await.unwrap();
+        let movement_events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert_eq!(movement_events[0].last_reported_location, Some("WAT".to_string()));
 
-        let events = run_once(&mut feed, &reference, &mut state).await.unwrap();
+        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tracked_train_id, 1);
         assert_eq!(events[0].msg_type, "0002");
@@ -671,7 +692,7 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let events = run_once(&mut feed, &reference, &mut state).await.unwrap();
+        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert!(events.is_empty(), "nothing to attribute the cancellation to");
     }
 
@@ -685,8 +706,8 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        run_once(&mut feed, &reference, &mut state).await.unwrap();
-        let events = run_once(&mut feed, &reference, &mut state).await.unwrap();
+        run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
+        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].msg_type, "0006");
@@ -702,7 +723,7 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let events = run_once(&mut feed, &reference, &mut state).await.unwrap();
+        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert!(events.is_empty());
     }
 
@@ -713,7 +734,7 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let events = run_once(&mut feed, &reference, &mut state).await.unwrap();
+        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert!(events.is_empty());
     }
 
@@ -754,7 +775,7 @@ mod tests {
         );
         assert!(reference.pending.is_empty(), "a resolved ref is not a matchable pin");
 
-        let events = run_once(&mut feed, &reference, &mut state).await.unwrap();
+        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert_eq!(events.len(), 1, "the restart-surviving train is still tracked");
         assert_eq!(events[0].tracked_train_id, 7);
         assert_eq!(events[0].resolved_train_id, None, "rehydration is not a fresh resolution");
@@ -776,7 +797,7 @@ mod tests {
         let mut reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let first = run_once(&mut feed, &reference, &mut state).await.unwrap();
+        let first = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert_eq!(first[0].tracked_train_id, 1);
 
         apply_reference_reload(
@@ -785,7 +806,7 @@ mod tests {
             &mut state,
         );
 
-        let second = run_once(&mut feed, &reference, &mut state).await.unwrap();
+        let second = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert_eq!(second[0].tracked_train_id, 1, "the in-process resolution wins over the reload row");
     }
 
@@ -808,11 +829,11 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let first = run_once(&mut feed, &reference, &mut state).await.unwrap();
+        let first = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert_eq!(first[0].tracked_train_id, 1);
         assert_eq!(first[0].resolved_train_id, Some("221832406".to_string()));
 
-        let second = run_once(&mut feed, &reference, &mut state).await.unwrap();
+        let second = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert!(
             second.is_empty(),
             "the only pin is already claimed by 221832406; 221832407 must not take it too",
@@ -840,7 +861,7 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let events = run_once(&mut feed, &reference, &mut state).await.unwrap();
+        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert!(events.is_empty(), "an arrival is not an origin departure");
         assert!(
             !state.resolved.contains_key("221832499"),
@@ -848,7 +869,7 @@ mod tests {
         );
 
         // The pin must still be there for the train that really departs.
-        let events = run_once(&mut feed, &reference, &mut state).await.unwrap();
+        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tracked_train_id, 1);
         assert_eq!(events[0].resolved_train_id, Some("221832406".to_string()));
@@ -867,7 +888,7 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let events = run_once(&mut feed, &reference, &mut state).await.unwrap();
+        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert!(events.is_empty());
         assert!(state.resolved.is_empty(), "the pin stays unclaimed");
     }
@@ -918,7 +939,7 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        run_once(&mut feed, &reference, &mut state).await.unwrap();
+        run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert_eq!(
             state.pending_activations.get("221832406").map(|a| a.schedule_end_date),
             Some(None),
@@ -927,7 +948,7 @@ mod tests {
 
         prune_expired_activations(&mut state.pending_activations, "2099-01-01".parse().unwrap());
 
-        let events = run_once(&mut feed, &reference, &mut state).await.unwrap();
+        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert_eq!(events[0].resolved_train_uid, Some("C21373".to_string()));
     }
 
@@ -942,7 +963,7 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        run_once(&mut feed, &reference, &mut state).await.unwrap();
+        run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert_eq!(state.pending_activations.len(), 1);
 
         prune_expired_activations(&mut state.pending_activations, "2026-08-29".parse().unwrap());

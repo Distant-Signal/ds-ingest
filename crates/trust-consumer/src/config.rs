@@ -1,4 +1,12 @@
-use clap::Parser;
+use std::path::Path;
+
+use clap::{Parser, ValueHint};
+
+use crate::stanox_crs::StanoxCrsTable;
+
+fn parse_stanox_crs(path: &str) -> anyhow::Result<StanoxCrsTable> {
+    StanoxCrsTable::from_file(Path::new(path))
+}
 
 /// CLI/env configuration for the `trust-consumer` service.
 ///
@@ -77,4 +85,24 @@ pub struct Config {
     /// Open Questions #6.
     #[arg(long, env, default_value = "0.0.0.0:8081")]
     pub health_bind_url: String,
+
+    /// STANOX->CRS translation table, loaded once at startup. See
+    /// `crate::stanox_crs`'s module doc for the file format and
+    /// `reference-data/stanox-crs.md` for full provenance. Baked into the
+    /// image at `/app/reference-data/stanox-crs.csv` by
+    /// `docker/trust-consumer.Dockerfile`, same pattern as `aggregator`'s
+    /// `--lines-dir`/`LINES_DIR` (`crates/aggregator/src/config.rs`) --
+    /// though unlike that one this is a single file, not a directory, so
+    /// no `LineCatalogue`-style `Vec`-shaped newtype is needed:
+    /// `StanoxCrsTable` isn't a `Vec<T>`, so `clap_derive` doesn't
+    /// misinfer its arg-collection behaviour the way it would for one.
+    #[arg(
+        long = "stanox-crs-file",
+        env = "STANOX_CRS_FILE",
+        default_value = "/app/reference-data/stanox-crs.csv",
+        value_parser = parse_stanox_crs,
+        value_hint = ValueHint::FilePath,
+        value_name = "FILE"
+    )]
+    pub stanox_crs: StanoxCrsTable,
 }

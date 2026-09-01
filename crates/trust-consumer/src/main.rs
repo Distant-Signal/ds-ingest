@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        let outcome = run_cycle(&mut feed, &reference, &mut state, async |events| {
+        let outcome = run_cycle(&mut feed, &reference, &mut state, &config.stanox_crs, async |events| {
             queries::post_train_events(&http, &config.api_ingest_url, &config.internal_token, events).await
         })
         .await;
@@ -127,13 +127,14 @@ async fn run_cycle<F, P>(
     feed: &mut F,
     reference: &process::Reference,
     state: &mut process::ProcessorState,
+    stanox_crs: &stanox_crs::StanoxCrsTable,
     post: P,
 ) -> Cycle
 where
     F: MovementFeed,
     P: AsyncFnOnce(&[common::TrainMovementEventMessage]) -> anyhow::Result<()>,
 {
-    let events = match process::run_once(feed, reference, state).await {
+    let events = match process::run_once(feed, reference, state, stanox_crs).await {
         Ok(events) => events,
         Err(err) => {
             tracing::error!(error = ?err, "error processing movement feed batch");
@@ -156,8 +157,20 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::LazyLock;
+
     use super::*;
     use crate::feed::FakeMovementFeed;
+
+    /// The real, checked-in `reference-data/stanox-crs.csv`, mirroring
+    /// `process.rs`'s own test fixture of the same name -- these tests
+    /// depend on the real STANOX `"87212"` translating to `"WAT"` to match
+    /// `one_pending_pin`'s pin.
+    static TEST_STANOX_CRS: LazyLock<stanox_crs::StanoxCrsTable> = LazyLock::new(|| {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../reference-data/stanox-crs.csv");
+        stanox_crs::StanoxCrsTable::from_file(&path).expect("reference-data/stanox-crs.csv should parse")
+    });
 
     const ORIGIN_DEPARTURE: &str = r#"[{"header":{"msg_type":"0003"},"body":{
         "train_id":"221832406","event_type":"DEPARTURE",
@@ -189,7 +202,7 @@ mod tests {
         let mut state = process::ProcessorState::default();
 
         let outcome =
-            run_cycle(&mut feed, &reference, &mut state, async |_| Err(anyhow::anyhow!("api is down"))).await;
+            run_cycle(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, async |_| Err(anyhow::anyhow!("api is down"))).await;
 
         assert_eq!(outcome, Cycle::Failed);
         assert_eq!(feed.committed_count, 0, "a batch that never reached api must not be committed");
@@ -203,7 +216,7 @@ mod tests {
         let reference = one_pending_pin();
         let mut state = process::ProcessorState::default();
 
-        let outcome = run_cycle(&mut feed, &reference, &mut state, async |events| {
+        let outcome = run_cycle(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, async |events| {
             assert_eq!(events.len(), 1, "the pinned train's origin departure");
             Ok(())
         })
@@ -222,7 +235,7 @@ mod tests {
         let reference = one_pending_pin();
         let mut state = process::ProcessorState::default();
 
-        let outcome = run_cycle(&mut feed, &reference, &mut state, async |_| Ok(())).await;
+        let outcome = run_cycle(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, async |_| Ok(())).await;
 
         assert_eq!(outcome, Cycle::Committed);
         assert_eq!(feed.committed_count, 0);
@@ -244,7 +257,7 @@ mod tests {
 
         for _ in 0..3 {
             let outcome =
-                run_cycle(&mut feed, &reference, &mut state, async |_| Err(anyhow::anyhow!("api is down"))).await;
+                run_cycle(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, async |_| Err(anyhow::anyhow!("api is down"))).await;
             assert_eq!(outcome, Cycle::Failed);
         }
         assert_eq!(feed.committed_count, 0, "nothing reached api, so nothing may be confirmed");
@@ -258,7 +271,7 @@ mod tests {
         let reference = one_pending_pin();
         let mut state = process::ProcessorState::default();
 
-        let outcome = run_cycle(&mut feed, &reference, &mut state, async |_| Ok(())).await;
+        let outcome = run_cycle(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, async |_| Ok(())).await;
 
         assert_eq!(outcome, Cycle::Failed);
         assert_eq!(feed.committed_count, 0);

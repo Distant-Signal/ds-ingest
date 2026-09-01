@@ -56,6 +56,7 @@ RUN apt-get update \
     && useradd --system --no-create-home --shell /usr/sbin/nologin trust-consumer
 
 COPY --from=builder /usr/local/bin/trust-consumer /usr/local/bin/trust-consumer
+COPY --chown=trust-consumer:trust-consumer reference-data/ /app/reference-data/
 
 USER trust-consumer
 
