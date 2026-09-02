@@ -6,18 +6,19 @@
 //! manual live-stack check, the same posture `crates/enricher`'s
 //! DB-touching `queries.rs` takes.
 
-use common::ingest::INTERNAL_TOKEN_HEADER;
+use common::oauth_client::OAuthTokenCache;
 use common::{TrackedTrainRef, TrainMovementEventMessage};
 use reqwest::Client;
 
 pub async fn fetch_active_tracked_trains(
     client: &Client,
     url: &str,
-    internal_token: &str,
+    tokens: &OAuthTokenCache,
 ) -> anyhow::Result<Vec<TrackedTrainRef>> {
+    let token = tokens.get_token(client).await?;
     let response = client
         .get(url)
-        .header(INTERNAL_TOKEN_HEADER, internal_token)
+        .bearer_auth(&token)
         .send()
         .await?
         .error_for_status()?;
@@ -27,11 +28,12 @@ pub async fn fetch_active_tracked_trains(
 pub async fn fetch_stanox_crs(
     client: &Client,
     url: &str,
-    internal_token: &str,
+    tokens: &OAuthTokenCache,
 ) -> anyhow::Result<Vec<common::StanoxCrsRecord>> {
+    let token = tokens.get_token(client).await?;
     let response = client
         .get(url)
-        .header(INTERNAL_TOKEN_HEADER, internal_token)
+        .bearer_auth(&token)
         .send()
         .await?
         .error_for_status()?;
@@ -41,11 +43,11 @@ pub async fn fetch_stanox_crs(
 pub async fn post_train_events(
     client: &Client,
     url: &str,
-    internal_token: &str,
+    tokens: &OAuthTokenCache,
     events: &[TrainMovementEventMessage],
 ) -> anyhow::Result<()> {
     if events.is_empty() {
         return Ok(());
     }
-    common::ingest::post_batch(client, url, internal_token, events, "train events").await
+    common::ingest::post_batch(client, url, tokens, events, "train events").await
 }
