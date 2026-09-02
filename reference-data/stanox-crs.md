@@ -134,3 +134,49 @@ sorted by `stanox` for a reviewable diff.
    `stanox`, apply the exclusion policy above.
 4. Regenerate `stanox-crs.csv`: write the header `stanox,crs`, then one
    `stanox,crs` line per resolved entry, sorted by `stanox`.
+
+## This file's role since the live table (2026-09-01)
+
+As of
+docs/superpowers/specs/2026-09-01-schedule-ingest-stanox-crs-table-design.md,
+`trust-consumer` no longer relies on this file exclusively: `crates/schedule-reference`
+derives a live-refreshed equivalent from the same `TI`/`A` record types
+documented above, straight from the CIF SCHEDULE feed `schedule-ingest`
+already receives daily, and `trust-consumer` periodically reloads it (see
+`crates/trust-consumer/src/stanox_crs.rs`'s module doc). This file is kept
+indefinitely, not deprecated: it remains the startup value and the
+permanent fail-open fallback (an environment with no `schedule-reference`
+running, e.g. local dev, behaves exactly as it always has). Regenerating it
+by hand (the recipe above) is still valid and still occasionally useful for
+spot-checking the live table's output, but is no longer this crate's only
+path to a working STANOX/CRS table.
+
+**A real discrepancy this transition surfaced**: this table's regeneration
+recipe above (step 2) reads `crs` directly off each `TI` line only -- it
+never fills a blank `TI` `crs` from the `MSN` file's `A` records before the
+ambiguity grouping in step 3 runs. `crates/schedule-reference/src/parser.rs`'s
+`resolve` does complete blank `TI` CRS values from `MSN` *before* grouping,
+exactly as this design's Decision 2 specifies ("a `TI` record's blank CRS
+is filled from `MSN`'s `A` record for the same TIPLOC before this grouping
+runs"). Applied to the real 2026-08-28 extract, that ordering difference
+surfaces one additional genuine ambiguity this file's 14-value exclusion
+list above does not carry: STANOX `63631` is shared by TIPLOC `STPANCI`
+(London St Pancras International, `TI` carries `CRS=SPX` directly) and
+TIPLOC `STPADOM` (St Pancras International, domestic side; `TI`'s `CRS`
+field is blank, and `MSN`'s own `A` record for `STPADOM` resolves it to
+`STP`, London St Pancras's primary CRS) -- two distinct, non-`X`-prefixed
+CRS candidates for one STANOX, with no principled tiebreaker, so the live
+parser excludes it rather than guessing. This file's checked-in row for
+`63631` (`SPX`) predates that check and was never itself wrong for the
+`STPANCI` TIPLOC alone -- it simply never considered `STPADOM`'s
+MSN-resolvable CRS as a competing candidate for the same STANOX, because
+this file's own regeneration recipe (unlike the live parser) does not
+apply MSN completion before grouping. Consequently, the live table (3,180
+resolved rows out of 3,186 STANOX with any resolvable CRS, 15 excluded
+ambiguous STANOX, not 3,124/14) and this CSV (3,124 rows, 14 excluded) are
+not expected to match row-for-row on this specific STANOX going forward --
+this is treated as the live parser being more conservative and more
+correct, not as a bug to reconcile by changing either policy. Left as an
+open note rather than "fixed" here, since fixing this CSV's regeneration
+recipe to match is optional per this file's now-fallback-only role (see
+above), not required.

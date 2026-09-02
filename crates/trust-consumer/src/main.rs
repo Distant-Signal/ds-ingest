@@ -41,6 +41,15 @@ async fn main() -> anyhow::Result<()> {
     let reload_interval = Duration::from_secs(config.reference_reload_secs);
     let mut last_reference_reload = tokio::time::Instant::now() - reload_interval;
 
+    // The CSV-derived table `config.stanox_crs` already loaded at parse
+    // time becomes the shared cell's initial value -- the startup value
+    // and the fail-open fallback stay exactly as they were (Decision 3);
+    // only the read path (a per-cycle snapshot instead of a bare
+    // reference) and the addition of this reload block are new.
+    let stanox_crs = std::sync::RwLock::new(config.stanox_crs.clone());
+    let stanox_crs_reload_interval = Duration::from_secs(config.stanox_crs_reload_secs);
+    let mut last_stanox_crs_reload = tokio::time::Instant::now() - stanox_crs_reload_interval;
+
     // Owned here, for the whole life of the process: TRUST spreads one
     // train's Activation, origin departure, later movements and any
     // cancellation across many batches, so this state must survive every
@@ -77,7 +86,13 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        let outcome = run_cycle(&mut feed, &reference, &mut state, &config.stanox_crs, async |events| {
+        if last_stanox_crs_reload.elapsed() >= stanox_crs_reload_interval {
+            let fetched = queries::fetch_stanox_crs(&http, &config.stanox_crs_url, &config.internal_token).await;
+            process::apply_stanox_crs_reload(fetched, &stanox_crs);
+            last_stanox_crs_reload = tokio::time::Instant::now();
+        }
+
+        let outcome = run_cycle(&mut feed, &reference, &mut state, &stanox_crs, async |events| {
             queries::post_train_events(&http, &config.api_ingest_url, &config.internal_token, events).await
         })
         .await;
@@ -127,14 +142,16 @@ async fn run_cycle<F, P>(
     feed: &mut F,
     reference: &process::Reference,
     state: &mut process::ProcessorState,
-    stanox_crs: &stanox_crs::StanoxCrsTable,
+    stanox_crs: &std::sync::RwLock<stanox_crs::StanoxCrsTable>,
     post: P,
 ) -> Cycle
 where
     F: MovementFeed,
     P: AsyncFnOnce(&[common::TrainMovementEventMessage]) -> anyhow::Result<()>,
 {
-    let events = match process::run_once(feed, reference, state, stanox_crs).await {
+    let snapshot = stanox_crs.read().expect("stanox_crs lock poisoned").clone();
+
+    let events = match process::run_once(feed, reference, state, &snapshot).await {
         Ok(events) => events,
         Err(err) => {
             tracing::error!(error = ?err, "error processing movement feed batch");
@@ -167,9 +184,9 @@ mod tests {
     /// `process.rs`'s own test fixture of the same name -- these tests
     /// depend on the real STANOX `"87212"` translating to `"WAT"` to match
     /// `one_pending_pin`'s pin.
-    static TEST_STANOX_CRS: LazyLock<stanox_crs::StanoxCrsTable> = LazyLock::new(|| {
+    static TEST_STANOX_CRS: LazyLock<std::sync::RwLock<stanox_crs::StanoxCrsTable>> = LazyLock::new(|| {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../reference-data/stanox-crs.csv");
-        stanox_crs::StanoxCrsTable::from_file(&path).expect("reference-data/stanox-crs.csv should parse")
+        std::sync::RwLock::new(stanox_crs::StanoxCrsTable::from_file(&path).expect("reference-data/stanox-crs.csv should parse"))
     });
 
     const ORIGIN_DEPARTURE: &str = r#"[{"header":{"msg_type":"0003"},"body":{

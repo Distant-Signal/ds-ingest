@@ -9,20 +9,34 @@
 //!
 //! # Where the data lives
 //!
-//! The table itself is `reference-data/stanox-crs.csv`, loaded at runtime
-//! via `StanoxCrsTable::from_file` -- not compiled in. This mirrors
-//! `common::LineDefinition::from_file`/`from_dir` (the `lines/` catalogue):
-//! large reference data lives in a checked-in data file, not a Rust source
-//! literal, and is read once at process startup by
-//! `crates/trust-consumer/src/config.rs`'s `--stanox-crs-file` /
-//! `STANOX_CRS_FILE` flag (default `/app/reference-data/stanox-crs.csv`,
-//! baked into the image by `docker/trust-consumer.Dockerfile`).
+//! Two tiers, in order:
 //!
-//! **Full provenance -- exactly how this data was extracted from a real CIF
-//! full-timetable extract, the record format's byte offsets, and the
-//! documented exclusion policy for ambiguous STANOX values -- lives in
-//! `reference-data/stanox-crs.md`, colocated with the data file itself.**
-//! Read that before regenerating or extending this table.
+//! 1. **Startup / fallback**: `reference-data/stanox-crs.csv`, loaded once
+//!    at process startup via `StanoxCrsTable::from_file` -- the
+//!    `--stanox-crs-file`/`STANOX_CRS_FILE` flag in `config.rs`, unchanged
+//!    since before the live table existed. This remains the checked-in
+//!    default for local dev and any environment without the schedule-feed
+//!    pipeline deployed, and the value this crate falls back to (and keeps
+//!    indefinitely) if the live table below is ever empty, unreachable, or
+//!    a fresh environment has never had `crates/schedule-reference`
+//!    successfully run.
+//! 2. **Live reload**: once `crates/schedule-reference` (a sibling
+//!    container to `schedule-ingest`, see
+//!    docs/superpowers/specs/2026-09-01-schedule-ingest-stanox-crs-table-design.md)
+//!    has successfully parsed a CIF SCHEDULE delivery, this crate's main
+//!    loop periodically (`--stanox-crs-reload-secs`) `GET`s
+//!    `/private/stanox-crs` and swaps a fresh `StanoxCrsTable::from_records`
+//!    into a shared `std::sync::RwLock` cell (see `main.rs`'s second
+//!    reload block, alongside its existing tracked-trains reload). A
+//!    failed or empty reload never clears the currently-loaded table --
+//!    see `process::apply_stanox_crs_reload`.
+//!
+//! **Full provenance for the CSV specifically** -- exactly how it was
+//! extracted, the record format's byte offsets, and the documented
+//! exclusion policy for ambiguous STANOX values -- lives in
+//! `reference-data/stanox-crs.md`. The live table applies the identical
+//! exclusion policy, reimplemented as real code in
+//! `crates/schedule-reference/src/parser.rs`.
 //!
 //! A lookup miss (`None`) is the honest "we don't know" case, not an
 //! error: it covers both genuinely non-passenger locations (signals,
@@ -131,6 +145,16 @@ impl StanoxCrsTable {
         Ok(Self { by_stanox })
     }
 
+    /// Builds a table directly from `api`'s `GET /private/stanox-crs`
+    /// response rows -- the live-reload counterpart to `from_file`/`parse`.
+    /// `tiploc`/`station_name`/`source_sequence` are not needed for
+    /// lookup and are dropped here; only `stanox`/`crs` matter to
+    /// `stanox_to_crs`.
+    pub fn from_records(records: Vec<common::StanoxCrsRecord>) -> Self {
+        let by_stanox = records.into_iter().map(|r| (r.stanox, r.crs)).collect();
+        Self { by_stanox }
+    }
+
     /// Translates a TRUST Movement's `loc_stanox` to a National Rail CRS
     /// code. Returns `None` when the STANOX isn't in the table -- see this
     /// module's doc comment for what that honestly means.
@@ -222,6 +246,20 @@ mod tests {
         assert_eq!(table.stanox_to_crs("07257"), Some("GLC".to_string()), "Glasgow Central");
         assert_eq!(table.stanox_to_crs("81700"), Some("BRI".to_string()), "Bristol Temple Meads");
         assert_eq!(table.stanox_to_crs("17132"), Some("LDS".to_string()), "Leeds");
+    }
+
+    #[test]
+    fn from_records_builds_a_table_usable_by_stanox_to_crs() {
+        let records = vec![common::StanoxCrsRecord {
+            stanox: "72410".to_string(),
+            crs: "EUS".to_string(),
+            tiploc: "EUSTON".to_string(),
+            station_name: "LONDON EUSTON".to_string(),
+            source_sequence: 942,
+        }];
+        let table = StanoxCrsTable::from_records(records);
+        assert_eq!(table.stanox_to_crs("72410"), Some("EUS".to_string()));
+        assert_eq!(table.stanox_to_crs("99999"), None);
     }
 
     #[test]

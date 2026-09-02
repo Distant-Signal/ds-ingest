@@ -105,4 +105,17 @@ pub struct Config {
         value_name = "FILE"
     )]
     pub stanox_crs: StanoxCrsTable,
+
+    /// How often to reload the live STANOX->CRS table from `api`. Deliberately
+    /// coarser than `reference_reload_secs`'s 60s default -- the underlying
+    /// data changes roughly daily (Decision 4), so "promptly" only matters
+    /// relative to that, not to a human creating a pin. UNRESEARCHED
+    /// starting figure, same posture as `MINE_LIST_LIMIT`/`MAX_PIN_AGE`
+    /// elsewhere in this codebase (see the spec's Open questions #1).
+    #[arg(long, env, default_value_t = 3600)]
+    pub stanox_crs_reload_secs: u64,
+
+    /// The `api` crate's endpoint for the live STANOX/CRS table.
+    #[arg(long, env, default_value = "http://api:8080/private/stanox-crs")]
+    pub stanox_crs_url: String,
 }

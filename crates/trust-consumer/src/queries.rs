@@ -24,6 +24,20 @@ pub async fn fetch_active_tracked_trains(
     Ok(response.json().await?)
 }
 
+pub async fn fetch_stanox_crs(
+    client: &Client,
+    url: &str,
+    internal_token: &str,
+) -> anyhow::Result<Vec<common::StanoxCrsRecord>> {
+    let response = client
+        .get(url)
+        .header(INTERNAL_TOKEN_HEADER, internal_token)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(response.json().await?)
+}
+
 pub async fn post_train_events(
     client: &Client,
     url: &str,

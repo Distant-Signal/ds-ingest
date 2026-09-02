@@ -242,6 +242,38 @@ pub fn prune_expired_activations(activations: &mut HashMap<String, PendingActiva
     });
 }
 
+/// Applies one `stanox_crs` reload tick's HTTP result to the shared cell.
+/// Pure with respect to the swap-vs-keep *decision* -- given directly what
+/// the fetch produced, not performing the fetch itself -- so the fail-open
+/// policy below is unit-testable without a live `api`, mirroring
+/// `apply_reference_reload`'s own split from `queries::fetch_active_tracked_trains`.
+///
+/// Fails open in both failure shapes: an `Err` (network/HTTP failure) or an
+/// empty `Ok` (fresh environment, or `schedule-reference` has never
+/// successfully run) both leave the currently-loaded table (CSV-derived at
+/// startup, or a previously-fetched live one) untouched, never swapping in
+/// an empty table that would silently stop translating every STANOX. See
+/// the spec's Error handling section.
+pub fn apply_stanox_crs_reload(
+    fetched: anyhow::Result<Vec<common::StanoxCrsRecord>>,
+    cell: &std::sync::RwLock<crate::stanox_crs::StanoxCrsTable>,
+) {
+    match fetched {
+        Ok(records) if !records.is_empty() => {
+            let count = records.len();
+            let table = crate::stanox_crs::StanoxCrsTable::from_records(records);
+            *cell.write().expect("stanox_crs lock poisoned") = table;
+            tracing::info!(count, "reloaded live stanox/crs table");
+        }
+        Ok(_) => {
+            tracing::warn!("live stanox_crs table is empty; keeping the currently loaded table");
+        }
+        Err(err) => {
+            tracing::error!(error = ?err, "failed to reload stanox_crs table; keeping the currently loaded table");
+        }
+    }
+}
+
 /// One full cycle: pull whatever the feed has, parse it, resolve/derive
 /// against `reference` and `state`, and return the batch of events that
 /// would be posted to `api` -- NOT posted here, so tests can assert on the
@@ -808,6 +840,40 @@ mod tests {
 
         let second = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS).await.unwrap();
         assert_eq!(second[0].tracked_train_id, 1, "the in-process resolution wins over the reload row");
+    }
+
+    // --- stanox_crs live reload (Task 5) ---
+
+    #[test]
+    fn a_successful_reload_replaces_the_table_for_subsequent_lookups() {
+        let initial = StanoxCrsTable::from_records(vec![common::StanoxCrsRecord {
+            stanox: "72410".to_string(), crs: "EUS".to_string(),
+            tiploc: "EUSTON".to_string(), station_name: "LONDON EUSTON".to_string(), source_sequence: 940,
+        }]);
+        let cell = std::sync::RwLock::new(initial);
+
+        let fresh = vec![common::StanoxCrsRecord {
+            stanox: "72410".to_string(), crs: "EU2".to_string(),
+            tiploc: "EUSTON".to_string(), station_name: "LONDON EUSTON".to_string(), source_sequence: 942,
+        }];
+        apply_stanox_crs_reload(Ok(fresh), &cell);
+
+        assert_eq!(cell.read().unwrap().stanox_to_crs("72410"), Some("EU2".to_string()));
+    }
+
+    #[test]
+    fn a_failed_or_empty_reload_does_not_clear_the_currently_loaded_table() {
+        let initial = StanoxCrsTable::from_records(vec![common::StanoxCrsRecord {
+            stanox: "72410".to_string(), crs: "EUS".to_string(),
+            tiploc: "EUSTON".to_string(), station_name: "LONDON EUSTON".to_string(), source_sequence: 940,
+        }]);
+        let cell = std::sync::RwLock::new(initial);
+
+        apply_stanox_crs_reload(Err(anyhow::anyhow!("api is down")), &cell);
+        assert_eq!(cell.read().unwrap().stanox_to_crs("72410"), Some("EUS".to_string()), "a failed fetch must not clear the table");
+
+        apply_stanox_crs_reload(Ok(Vec::new()), &cell);
+        assert_eq!(cell.read().unwrap().stanox_to_crs("72410"), Some("EUS".to_string()), "an empty live table must not clear the table either");
     }
 
     // --- Double-claimed pins (fix 2) ---
