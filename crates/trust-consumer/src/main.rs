@@ -5,15 +5,15 @@
 //! Constraints for why this crate isn't named `poller-trust`.
 
 mod config;
+mod dedup;
+mod eta;
 mod feed;
 mod health;
-mod schema;
-mod matching;
 mod journey;
-mod eta;
-mod dedup;
+mod matching;
 mod process;
 mod queries;
+mod schema;
 mod stanox_crs;
 
 use std::time::Duration;
@@ -37,7 +37,9 @@ async fn main() -> anyhow::Result<()> {
 
     let mut feed = KafkaMovementFeed::connect(&config, connection_state)?;
 
-    let mut reference = process::Reference { pending: Vec::new() };
+    let mut reference = process::Reference {
+        pending: Vec::new(),
+    };
     let reload_interval = Duration::from_secs(config.reference_reload_secs);
     let mut last_reference_reload = tokio::time::Instant::now() - reload_interval;
 
@@ -87,14 +89,28 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if last_stanox_crs_reload.elapsed() >= stanox_crs_reload_interval {
-            let fetched = queries::fetch_stanox_crs(&http, &config.stanox_crs_url, &config.internal_token).await;
+            let fetched =
+                queries::fetch_stanox_crs(&http, &config.stanox_crs_url, &config.internal_token)
+                    .await;
             process::apply_stanox_crs_reload(fetched, &stanox_crs);
             last_stanox_crs_reload = tokio::time::Instant::now();
         }
 
-        let outcome = run_cycle(&mut feed, &reference, &mut state, &stanox_crs, async |events| {
-            queries::post_train_events(&http, &config.api_ingest_url, &config.internal_token, events).await
-        })
+        let outcome = run_cycle(
+            &mut feed,
+            &reference,
+            &mut state,
+            &stanox_crs,
+            async |events| {
+                queries::post_train_events(
+                    &http,
+                    &config.api_ingest_url,
+                    &config.internal_token,
+                    events,
+                )
+                .await
+            },
+        )
         .await;
 
         if outcome == Cycle::Failed {
@@ -184,10 +200,15 @@ mod tests {
     /// `process.rs`'s own test fixture of the same name -- these tests
     /// depend on the real STANOX `"87212"` translating to `"WAT"` to match
     /// `one_pending_pin`'s pin.
-    static TEST_STANOX_CRS: LazyLock<std::sync::RwLock<stanox_crs::StanoxCrsTable>> = LazyLock::new(|| {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../reference-data/stanox-crs.csv");
-        std::sync::RwLock::new(stanox_crs::StanoxCrsTable::from_file(&path).expect("reference-data/stanox-crs.csv should parse"))
-    });
+    static TEST_STANOX_CRS: LazyLock<std::sync::RwLock<stanox_crs::StanoxCrsTable>> =
+        LazyLock::new(|| {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../reference-data/stanox-crs.csv");
+            std::sync::RwLock::new(
+                stanox_crs::StanoxCrsTable::from_file(&path)
+                    .expect("reference-data/stanox-crs.csv should parse"),
+            )
+        });
 
     const ORIGIN_DEPARTURE: &str = r#"[{"header":{"msg_type":"0003"},"body":{
         "train_id":"221832406","event_type":"DEPARTURE",
@@ -218,11 +239,20 @@ mod tests {
         let reference = one_pending_pin();
         let mut state = process::ProcessorState::default();
 
-        let outcome =
-            run_cycle(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, async |_| Err(anyhow::anyhow!("api is down"))).await;
+        let outcome = run_cycle(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            async |_| Err(anyhow::anyhow!("api is down")),
+        )
+        .await;
 
         assert_eq!(outcome, Cycle::Failed);
-        assert_eq!(feed.committed_count, 0, "a batch that never reached api must not be committed");
+        assert_eq!(
+            feed.committed_count, 0,
+            "a batch that never reached api must not be committed"
+        );
     }
 
     /// And the same batch, posted successfully, does commit -- otherwise the
@@ -233,10 +263,16 @@ mod tests {
         let reference = one_pending_pin();
         let mut state = process::ProcessorState::default();
 
-        let outcome = run_cycle(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, async |events| {
-            assert_eq!(events.len(), 1, "the pinned train's origin departure");
-            Ok(())
-        })
+        let outcome = run_cycle(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            async |events| {
+                assert_eq!(events.len(), 1, "the pinned train's origin departure");
+                Ok(())
+            },
+        )
         .await;
 
         assert_eq!(outcome, Cycle::Committed);
@@ -252,7 +288,14 @@ mod tests {
         let reference = one_pending_pin();
         let mut state = process::ProcessorState::default();
 
-        let outcome = run_cycle(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, async |_| Ok(())).await;
+        let outcome = run_cycle(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            async |_| Ok(()),
+        )
+        .await;
 
         assert_eq!(outcome, Cycle::Committed);
         assert_eq!(feed.committed_count, 0);
@@ -273,11 +316,20 @@ mod tests {
         let mut state = process::ProcessorState::default();
 
         for _ in 0..3 {
-            let outcome =
-                run_cycle(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, async |_| Err(anyhow::anyhow!("api is down"))).await;
+            let outcome = run_cycle(
+                &mut feed,
+                &reference,
+                &mut state,
+                &TEST_STANOX_CRS,
+                async |_| Err(anyhow::anyhow!("api is down")),
+            )
+            .await;
             assert_eq!(outcome, Cycle::Failed);
         }
-        assert_eq!(feed.committed_count, 0, "nothing reached api, so nothing may be confirmed");
+        assert_eq!(
+            feed.committed_count, 0,
+            "nothing reached api, so nothing may be confirmed"
+        );
     }
 
     /// A feed that errors outright is a failed cycle too, and equally must
@@ -288,7 +340,14 @@ mod tests {
         let reference = one_pending_pin();
         let mut state = process::ProcessorState::default();
 
-        let outcome = run_cycle(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, async |_| Ok(())).await;
+        let outcome = run_cycle(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            async |_| Ok(()),
+        )
+        .await;
 
         assert_eq!(outcome, Cycle::Failed);
         assert_eq!(feed.committed_count, 0);

@@ -16,7 +16,10 @@ pub struct DerivedState {
 
 impl DerivedState {
     pub fn awaiting_activation() -> Self {
-        Self { status: "awaiting_activation".to_string(), ..Default::default() }
+        Self {
+            status: "awaiting_activation".to_string(),
+            ..Default::default()
+        }
     }
 }
 
@@ -25,8 +28,14 @@ impl DerivedState {
 /// see Task 14's note on where that lookup comes from); `None` if
 /// untranslatable, in which case `last_reported_location` falls back to the
 /// raw STANOX so nothing is silently dropped.
-pub fn apply_movement(previous: &DerivedState, movement: &Movement, loc_crs: Option<&str>) -> DerivedState {
-    let location = loc_crs.map(str::to_string).or_else(|| movement.loc_stanox.clone());
+pub fn apply_movement(
+    previous: &DerivedState,
+    movement: &Movement,
+    loc_crs: Option<&str>,
+) -> DerivedState {
+    let location = loc_crs
+        .map(str::to_string)
+        .or_else(|| movement.loc_stanox.clone());
     let delay_minutes = variation_to_minutes(movement.variation_status.as_deref());
 
     // "PASS" doesn't complete the journey; only the last scheduled
@@ -46,7 +55,10 @@ pub fn apply_movement(previous: &DerivedState, movement: &Movement, loc_crs: Opt
 }
 
 pub fn apply_cancellation(previous: &DerivedState) -> DerivedState {
-    DerivedState { status: "cancelled".to_string(), ..previous.clone() }
+    DerivedState {
+        status: "cancelled".to_string(),
+        ..previous.clone()
+    }
 }
 
 /// TRUST's `variation_status` is a category ("ON TIME", "LATE", "EARLY"),
@@ -87,7 +99,11 @@ mod tests {
     #[test]
     fn a_movement_sets_status_to_en_route() {
         let previous = DerivedState::awaiting_activation();
-        let state = apply_movement(&previous, &movement("DEPARTURE", Some("ON TIME")), Some("WAT"));
+        let state = apply_movement(
+            &previous,
+            &movement("DEPARTURE", Some("ON TIME")),
+            Some("WAT"),
+        );
         assert_eq!(state.status, "en_route");
         assert_eq!(state.last_reported_location, Some("WAT".to_string()));
         assert_eq!(state.last_event_type, Some("DEPARTURE".to_string()));
@@ -103,14 +119,30 @@ mod tests {
     #[test]
     fn on_time_and_early_clamp_delay_to_zero() {
         let previous = DerivedState::awaiting_activation();
-        assert_eq!(apply_movement(&previous, &movement("ARRIVAL", Some("ON TIME")), Some("WOK")).delay_minutes, Some(0));
-        assert_eq!(apply_movement(&previous, &movement("ARRIVAL", Some("EARLY")), Some("WOK")).delay_minutes, Some(0));
+        assert_eq!(
+            apply_movement(
+                &previous,
+                &movement("ARRIVAL", Some("ON TIME")),
+                Some("WOK")
+            )
+            .delay_minutes,
+            Some(0)
+        );
+        assert_eq!(
+            apply_movement(&previous, &movement("ARRIVAL", Some("EARLY")), Some("WOK"))
+                .delay_minutes,
+            Some(0)
+        );
     }
 
     #[test]
     fn late_is_left_for_the_caller_to_fill_in() {
         let previous = DerivedState::awaiting_activation();
-        assert_eq!(apply_movement(&previous, &movement("ARRIVAL", Some("LATE")), Some("WOK")).delay_minutes, None);
+        assert_eq!(
+            apply_movement(&previous, &movement("ARRIVAL", Some("LATE")), Some("WOK"))
+                .delay_minutes,
+            None
+        );
     }
 
     #[test]

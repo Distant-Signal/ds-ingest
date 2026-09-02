@@ -87,7 +87,10 @@ mod tests {
 
     #[test]
     fn the_earliest_created_pending_pin_wins_on_ambiguity() {
-        let pending = vec![pin(1, "WAT", "2026-08-28T18:32:00Z"), pin(2, "WAT", "2026-08-28T18:35:00Z")];
+        let pending = vec![
+            pin(1, "WAT", "2026-08-28T18:32:00Z"),
+            pin(2, "WAT", "2026-08-28T18:35:00Z"),
+        ];
         let actual: DateTime<Utc> = "2026-08-28T18:33:00Z".parse().unwrap();
         assert_eq!(resolve_origin_departure("WAT", actual, &pending), Some(1));
     }

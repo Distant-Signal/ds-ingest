@@ -61,7 +61,11 @@ impl KafkaMovementFeed {
 
         consumer.subscribe(&[&config.kafka_topic])?;
 
-        Ok(Self { consumer, connection_state, last_received: None })
+        Ok(Self {
+            consumer,
+            connection_state,
+            last_received: None,
+        })
     }
 }
 
@@ -70,17 +74,25 @@ impl MovementFeed for KafkaMovementFeed {
     async fn next_batch(&mut self) -> anyhow::Result<Vec<String>> {
         match self.consumer.recv().await {
             Ok(message) => {
-                self.connection_state.store(true, std::sync::atomic::Ordering::Relaxed);
-                let payload = message.payload().ok_or_else(|| anyhow::anyhow!("empty Kafka message payload"))?;
+                self.connection_state
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                let payload = message
+                    .payload()
+                    .ok_or_else(|| anyhow::anyhow!("empty Kafka message payload"))?;
                 let batch = String::from_utf8_lossy(payload).into_owned();
                 // Recorded only once the payload is in hand: an empty
                 // payload returns `Err` above, and an errored batch must
                 // not leave an offset behind for `commit` to store.
-                self.last_received = Some((message.topic().to_string(), message.partition(), message.offset()));
+                self.last_received = Some((
+                    message.topic().to_string(),
+                    message.partition(),
+                    message.offset(),
+                ));
                 Ok(vec![batch])
             }
             Err(err) => {
-                self.connection_state.store(false, std::sync::atomic::Ordering::Relaxed);
+                self.connection_state
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 Err(err.into())
             }
         }
@@ -100,7 +112,8 @@ impl MovementFeed for KafkaMovementFeed {
         // and nowhere else. `commit_consumer_state` then writes whatever
         // is stored across the whole assignment.
         self.consumer.store_offset(topic, *partition, *offset)?;
-        self.consumer.commit_consumer_state(rdkafka::consumer::CommitMode::Async)?;
+        self.consumer
+            .commit_consumer_state(rdkafka::consumer::CommitMode::Async)?;
 
         // Cleared only once both steps succeeded, so a failed store or
         // commit leaves the offset in hand for the next attempt rather

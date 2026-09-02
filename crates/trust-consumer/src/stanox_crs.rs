@@ -86,7 +86,8 @@ impl StanoxCrsTable {
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading STANOX->CRS table at {}", path.display()))?;
-        Self::parse(&text).with_context(|| format!("parsing STANOX->CRS table at {}", path.display()))
+        Self::parse(&text)
+            .with_context(|| format!("parsing STANOX->CRS table at {}", path.display()))
     }
 
     /// Parses a headered, comma-delimited STANOX->CRS table.
@@ -106,14 +107,15 @@ impl StanoxCrsTable {
     /// more machinery than the data needs.
     fn parse(text: &str) -> anyhow::Result<Self> {
         let mut lines = text.lines();
-        let header = lines.next().context("STANOX->CRS table is empty (missing header line)")?;
+        let header = lines
+            .next()
+            .context("STANOX->CRS table is empty (missing header line)")?;
         let columns: Vec<&str> = header.split(',').map(str::trim).collect();
 
         let column_index = |name: &str| -> anyhow::Result<usize> {
-            columns
-                .iter()
-                .position(|&c| c == name)
-                .with_context(|| format!("STANOX->CRS table header is missing required column {name:?}: {header:?}"))
+            columns.iter().position(|&c| c == name).with_context(|| {
+                format!("STANOX->CRS table header is missing required column {name:?}: {header:?}")
+            })
         };
         let stanox_col = column_index("stanox")?;
         let crs_col = column_index("crs")?;
@@ -127,8 +129,12 @@ impl StanoxCrsTable {
 
             let fields: Vec<&str> = line.split(',').collect();
             let record = StanoxCrsRecord {
-                stanox: field_at(&fields, stanox_col, line_no, "stanox")?.trim().to_string(),
-                crs: field_at(&fields, crs_col, line_no, "crs")?.trim().to_string(),
+                stanox: field_at(&fields, stanox_col, line_no, "stanox")?
+                    .trim()
+                    .to_string(),
+                crs: field_at(&fields, crs_col, line_no, "crs")?
+                    .trim()
+                    .to_string(),
             };
 
             if record.stanox.is_empty() {
@@ -138,7 +144,10 @@ impl StanoxCrsTable {
                 bail!("STANOX->CRS table row {line_no} has an empty crs: {line:?}");
             }
             if let Some(previous) = by_stanox.insert(record.stanox.clone(), record.crs) {
-                bail!("STANOX->CRS table row {line_no} duplicates stanox {:?} (previously {previous:?})", record.stanox);
+                bail!(
+                    "STANOX->CRS table row {line_no} duplicates stanox {:?} (previously {previous:?})",
+                    record.stanox
+                );
             }
         }
 
@@ -184,11 +193,15 @@ impl StanoxCrsTable {
 
 /// Looks up `fields[index]`, turning a too-short row into a named parse
 /// error instead of an `unwrap` panic on genuinely malformed input.
-fn field_at<'a>(fields: &[&'a str], index: usize, line_no: usize, column: &str) -> anyhow::Result<&'a str> {
-    fields
-        .get(index)
-        .copied()
-        .with_context(|| format!("STANOX->CRS table row {line_no} is missing its {column:?} column"))
+fn field_at<'a>(
+    fields: &[&'a str],
+    index: usize,
+    line_no: usize,
+    column: &str,
+) -> anyhow::Result<&'a str> {
+    fields.get(index).copied().with_context(|| {
+        format!("STANOX->CRS table row {line_no} is missing its {column:?} column")
+    })
 }
 
 #[cfg(test)]
@@ -202,7 +215,8 @@ mod tests {
     /// `lines/` directory directly (e.g. `crates/aggregator/src/segments.rs`'s
     /// `load_all_lines`), rather than a synthetic stand-in.
     fn load_real_table() -> StanoxCrsTable {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../reference-data/stanox-crs.csv");
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../reference-data/stanox-crs.csv");
         StanoxCrsTable::from_file(&path).expect("reference-data/stanox-crs.csv should parse")
     }
 
@@ -212,16 +226,22 @@ mod tests {
     /// exercised through the generated data file, so this test would catch
     /// a mistake in either the extraction script or the file's contents,
     /// not just re-assert whatever the file already says.
-    const REAL_EUSTON: &str = "TIEUSTON 00144400NLONDON EUSTON             724102893EUSLONDON EUSTON           ";
-    const REAL_KINGS_CROSS: &str = "TIKNGX   00612100QLONDON KINGS CROSS        543112901KGXLONDON KINGS X          ";
-    const REAL_ABERDEEN: &str = "TIABRDEEN00897600GABERDEEN                  020712800ABDABERDEEN                ";
-    const REAL_GLASGOW_CENTRAL: &str = "TIGLGC   04981300TGLASGOW CENTRAL           072572857GLCGLASGOW CENTRAL         ";
+    const REAL_EUSTON: &str =
+        "TIEUSTON 00144400NLONDON EUSTON             724102893EUSLONDON EUSTON           ";
+    const REAL_KINGS_CROSS: &str =
+        "TIKNGX   00612100QLONDON KINGS CROSS        543112901KGXLONDON KINGS X          ";
+    const REAL_ABERDEEN: &str =
+        "TIABRDEEN00897600GABERDEEN                  020712800ABDABERDEEN                ";
+    const REAL_GLASGOW_CENTRAL: &str =
+        "TIGLGC   04981300TGLASGOW CENTRAL           072572857GLCGLASGOW CENTRAL         ";
     /// The STANOX-sharing case `reference-data/stanox-crs.md` documents:
     /// `87201` is shared by London Victoria's real passenger CRS (`VIC`,
     /// this line)...
-    const REAL_VICTORIA: &str = "TIVICTRIA00542600PLONDON VICTORIA           87201   0VICLONDON VICTORIA         ";
+    const REAL_VICTORIA: &str =
+        "TIVICTRIA00542600PLONDON VICTORIA           87201   0VICLONDON VICTORIA         ";
     /// ...and a real non-passenger `XVR` TIPLOC at the very same STANOX.
-    const REAL_VICTORIA_CARRIAGE_ROAD: &str = "TIVICTRCR48542662MVICTORIA CARRIAGE ROAD    87201   0XVR                        ";
+    const REAL_VICTORIA_CARRIAGE_ROAD: &str =
+        "TIVICTRCR48542662MVICTORIA CARRIAGE ROAD    87201   0XVR                        ";
 
     fn decode(real_ti_line: &str) -> (&str, &str) {
         (real_ti_line[44..49].trim(), real_ti_line[53..56].trim())
@@ -240,12 +260,36 @@ mod tests {
     #[test]
     fn translates_real_known_stations() {
         let table = load_real_table();
-        assert_eq!(table.stanox_to_crs("72410"), Some("EUS".to_string()), "Euston");
-        assert_eq!(table.stanox_to_crs("54311"), Some("KGX".to_string()), "King's Cross");
-        assert_eq!(table.stanox_to_crs("02071"), Some("ABD".to_string()), "Aberdeen");
-        assert_eq!(table.stanox_to_crs("07257"), Some("GLC".to_string()), "Glasgow Central");
-        assert_eq!(table.stanox_to_crs("81700"), Some("BRI".to_string()), "Bristol Temple Meads");
-        assert_eq!(table.stanox_to_crs("17132"), Some("LDS".to_string()), "Leeds");
+        assert_eq!(
+            table.stanox_to_crs("72410"),
+            Some("EUS".to_string()),
+            "Euston"
+        );
+        assert_eq!(
+            table.stanox_to_crs("54311"),
+            Some("KGX".to_string()),
+            "King's Cross"
+        );
+        assert_eq!(
+            table.stanox_to_crs("02071"),
+            Some("ABD".to_string()),
+            "Aberdeen"
+        );
+        assert_eq!(
+            table.stanox_to_crs("07257"),
+            Some("GLC".to_string()),
+            "Glasgow Central"
+        );
+        assert_eq!(
+            table.stanox_to_crs("81700"),
+            Some("BRI".to_string()),
+            "Bristol Temple Meads"
+        );
+        assert_eq!(
+            table.stanox_to_crs("17132"),
+            Some("LDS".to_string()),
+            "Leeds"
+        );
     }
 
     #[test]
@@ -307,28 +351,43 @@ mod tests {
         let table = load_real_table();
         for (stanox, crs) in &table.by_stanox {
             assert_eq!(stanox.len(), 5, "STANOX must be 5 digits: {stanox}");
-            assert!(stanox.chars().all(|c| c.is_ascii_digit()), "non-digit STANOX: {stanox}");
+            assert!(
+                stanox.chars().all(|c| c.is_ascii_digit()),
+                "non-digit STANOX: {stanox}"
+            );
             assert_eq!(crs.len(), 3, "CRS must be 3 letters: {crs}");
-            assert!(crs.chars().all(|c| c.is_ascii_uppercase()), "non-uppercase CRS: {crs}");
+            assert!(
+                crs.chars().all(|c| c.is_ascii_uppercase()),
+                "non-uppercase CRS: {crs}"
+            );
         }
     }
 
     #[test]
     fn parse_rejects_a_header_missing_the_crs_column() {
         let err = StanoxCrsTable::parse("stanox\n72410\n").unwrap_err();
-        assert!(format!("{err:#}").contains("crs"), "error should name the missing column: {err:#}");
+        assert!(
+            format!("{err:#}").contains("crs"),
+            "error should name the missing column: {err:#}"
+        );
     }
 
     #[test]
     fn parse_rejects_a_duplicate_stanox() {
         let err = StanoxCrsTable::parse("stanox,crs\n72410,EUS\n72410,EUS\n").unwrap_err();
-        assert!(format!("{err:#}").contains("duplicates"), "error should mention the duplicate: {err:#}");
+        assert!(
+            format!("{err:#}").contains("duplicates"),
+            "error should mention the duplicate: {err:#}"
+        );
     }
 
     #[test]
     fn parse_rejects_an_empty_crs() {
         let err = StanoxCrsTable::parse("stanox,crs\n72410,\n").unwrap_err();
-        assert!(format!("{err:#}").contains("empty crs"), "error should mention the empty crs: {err:#}");
+        assert!(
+            format!("{err:#}").contains("empty crs"),
+            "error should mention the empty crs: {err:#}"
+        );
     }
 
     #[test]

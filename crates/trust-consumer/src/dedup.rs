@@ -14,7 +14,13 @@ pub fn dedup_key(
     planned_timestamp: Option<&str>,
 ) -> String {
     let mut hasher = Sha256::new();
-    for field in [train_id, msg_type, event_type.unwrap_or(""), loc_stanox.unwrap_or(""), planned_timestamp.unwrap_or("")] {
+    for field in [
+        train_id,
+        msg_type,
+        event_type.unwrap_or(""),
+        loc_stanox.unwrap_or(""),
+        planned_timestamp.unwrap_or(""),
+    ] {
         hasher.update(field.as_bytes());
         hasher.update(b"\0");
     }
@@ -29,15 +35,39 @@ mod tests {
     #[test]
     fn identical_inputs_hash_identically() {
         assert_eq!(
-            dedup_key("221832406", "0003", Some("DEPARTURE"), Some("87701"), Some("1756400000000")),
-            dedup_key("221832406", "0003", Some("DEPARTURE"), Some("87701"), Some("1756400000000")),
+            dedup_key(
+                "221832406",
+                "0003",
+                Some("DEPARTURE"),
+                Some("87701"),
+                Some("1756400000000")
+            ),
+            dedup_key(
+                "221832406",
+                "0003",
+                Some("DEPARTURE"),
+                Some("87701"),
+                Some("1756400000000")
+            ),
         );
     }
 
     #[test]
     fn a_different_event_type_at_the_same_location_hashes_differently() {
-        let a = dedup_key("221832406", "0003", Some("ARRIVAL"), Some("87701"), Some("1756400000000"));
-        let b = dedup_key("221832406", "0003", Some("DEPARTURE"), Some("87701"), Some("1756400000000"));
+        let a = dedup_key(
+            "221832406",
+            "0003",
+            Some("ARRIVAL"),
+            Some("87701"),
+            Some("1756400000000"),
+        );
+        let b = dedup_key(
+            "221832406",
+            "0003",
+            Some("DEPARTURE"),
+            Some("87701"),
+            Some("1756400000000"),
+        );
         assert_ne!(a, b);
     }
 

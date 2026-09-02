@@ -27,35 +27,56 @@ struct Header {
     msg_type: String,
 }
 
+// `toc_id`/`train_service_code`/`schedule_wtt_id`/`schedule_start_date` are
+// part of `0001`'s confirmed shape (this module's header doc) but have no
+// consumer yet -- `process.rs`'s Activation handling only needs
+// `train_id`/`train_uid` (to park a pin claim) and `schedule_end_date` (to
+// expire it). Kept, not deleted, for the same "faithful port of the
+// confirmed wire shape" reason as `matcher::Evidence`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Activation {
     pub train_id: String,
     pub train_uid: String,
+    #[allow(dead_code)]
     pub toc_id: String,
+    #[allow(dead_code)]
     pub train_service_code: String,
+    #[allow(dead_code)]
     pub schedule_wtt_id: String,
+    #[allow(dead_code)]
     pub schedule_start_date: String,
     pub schedule_end_date: String,
 }
 
+// `gbtt_timestamp`/`reporting_stanox`/`toc_id` are part of `0003`'s
+// confirmed shape but have no consumer yet -- see the Activation comment
+// above for why they're kept rather than deleted.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Movement {
     pub train_id: String,
     pub event_type: String, // ARRIVAL | DEPARTURE | PASS
+    #[allow(dead_code)]
     pub gbtt_timestamp: Option<String>,
     pub planned_timestamp: Option<String>,
     pub actual_timestamp: Option<String>,
+    #[allow(dead_code)]
     pub reporting_stanox: Option<String>,
     pub loc_stanox: Option<String>,
+    #[allow(dead_code)]
     pub toc_id: Option<String>,
     pub variation_status: Option<String>,
 }
 
+// `canx_reason_code`/`canx_type` are part of `0002`'s confirmed shape but
+// have no consumer yet -- see the Activation comment above for why they're
+// kept rather than deleted.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Cancellation {
     pub train_id: String,
     pub canx_timestamp: Option<String>,
+    #[allow(dead_code)]
     pub canx_reason_code: Option<String>,
+    #[allow(dead_code)]
     pub canx_type: Option<String>, // "EN ROUTE" | "AT ORIGIN"
 }
 
@@ -102,18 +123,31 @@ pub enum TrustMessage {
 /// neither of the two expected ones.
 pub fn parse_batch(raw: &str) -> anyhow::Result<Vec<TrustMessage>> {
     let value: serde_json::Value = serde_json::from_str(raw)?;
-    let envelopes: Vec<Envelope> =
-        if value.is_array() { serde_json::from_value(value)? } else { vec![serde_json::from_value(value)?] };
+    let envelopes: Vec<Envelope> = if value.is_array() {
+        serde_json::from_value(value)?
+    } else {
+        vec![serde_json::from_value(value)?]
+    };
     Ok(envelopes.into_iter().filter_map(parse_envelope).collect())
 }
 
 fn parse_envelope(envelope: Envelope) -> Option<TrustMessage> {
     let parsed = match envelope.header.msg_type.as_str() {
-        "0001" => serde_json::from_value(envelope.body).ok().map(TrustMessage::Activation),
-        "0002" => serde_json::from_value(envelope.body).ok().map(TrustMessage::Cancellation),
-        "0003" => serde_json::from_value(envelope.body).ok().map(TrustMessage::Movement),
-        "0006" => serde_json::from_value(envelope.body).ok().map(TrustMessage::ChangeOfOrigin),
-        "0007" => serde_json::from_value(envelope.body).ok().map(TrustMessage::ChangeOfIdentity),
+        "0001" => serde_json::from_value(envelope.body)
+            .ok()
+            .map(TrustMessage::Activation),
+        "0002" => serde_json::from_value(envelope.body)
+            .ok()
+            .map(TrustMessage::Cancellation),
+        "0003" => serde_json::from_value(envelope.body)
+            .ok()
+            .map(TrustMessage::Movement),
+        "0006" => serde_json::from_value(envelope.body)
+            .ok()
+            .map(TrustMessage::ChangeOfOrigin),
+        "0007" => serde_json::from_value(envelope.body)
+            .ok()
+            .map(TrustMessage::ChangeOfIdentity),
         other => return Some(TrustMessage::Unknown(other.to_string())),
     };
     if parsed.is_none() {
@@ -203,7 +237,11 @@ mod tests {
             }}
         ]"#;
         let messages = parse_batch(raw).unwrap();
-        assert_eq!(messages.len(), 1, "the malformed envelope is dropped, the good one survives");
+        assert_eq!(
+            messages.len(),
+            1,
+            "the malformed envelope is dropped, the good one survives"
+        );
     }
 
     #[test]

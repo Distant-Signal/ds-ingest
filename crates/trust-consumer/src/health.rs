@@ -22,9 +22,10 @@ pub fn spawn(bind_url: String) -> ConnectionState {
     let state_for_server = Arc::clone(&state);
 
     tokio::spawn(async move {
-        let app = axum::Router::new()
-            .route("/healthz", get(move || healthz(Arc::clone(&state_for_server))))
-            ;
+        let app = axum::Router::new().route(
+            "/healthz",
+            get(move || healthz(Arc::clone(&state_for_server))),
+        );
         let listener = match tokio::net::TcpListener::bind(&bind_url).await {
             Ok(listener) => listener,
             Err(err) => {

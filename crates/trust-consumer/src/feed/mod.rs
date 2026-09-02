@@ -54,7 +54,11 @@ pub struct FakeMovementFeed {
 #[cfg(test)]
 impl FakeMovementFeed {
     pub fn new(batches: Vec<Vec<String>>) -> Self {
-        Self { batches: batches.into(), received_since_commit: false, committed_count: 0 }
+        Self {
+            batches: batches.into(),
+            received_since_commit: false,
+            committed_count: 0,
+        }
     }
 }
 

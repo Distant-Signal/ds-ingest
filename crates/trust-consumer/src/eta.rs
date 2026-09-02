@@ -46,7 +46,10 @@ mod tests {
         let planned: DateTime<Utc> = "2026-08-28T18:32:00Z".parse().unwrap();
         let actual: DateTime<Utc> = "2026-08-28T18:37:00Z".parse().unwrap(); // 5m late
         let next_scheduled: DateTime<Utc> = "2026-08-28T18:50:00Z".parse().unwrap();
-        assert_eq!(propagate_eta(planned, actual, Some(next_scheduled)), Some("2026-08-28T18:55:00Z".parse().unwrap()));
+        assert_eq!(
+            propagate_eta(planned, actual, Some(next_scheduled)),
+            Some("2026-08-28T18:55:00Z".parse().unwrap())
+        );
     }
 
     #[test]
@@ -54,6 +57,9 @@ mod tests {
         let planned: DateTime<Utc> = "2026-08-28T18:32:00Z".parse().unwrap();
         let actual: DateTime<Utc> = "2026-08-28T18:30:00Z".parse().unwrap(); // 2m early
         let next_scheduled: DateTime<Utc> = "2026-08-28T18:50:00Z".parse().unwrap();
-        assert_eq!(propagate_eta(planned, actual, Some(next_scheduled)), Some("2026-08-28T18:48:00Z".parse().unwrap()));
+        assert_eq!(
+            propagate_eta(planned, actual, Some(next_scheduled)),
+            Some("2026-08-28T18:48:00Z".parse().unwrap())
+        );
     }
 }
