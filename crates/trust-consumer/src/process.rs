@@ -116,9 +116,10 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Context;
 use chrono::NaiveDate;
 
+use trust_schema::journey::DerivedState;
+use trust_schema::schema::TrustMessage;
+
 use crate::feed::MovementFeed;
-use crate::journey::DerivedState;
-use crate::schema::TrustMessage;
 
 /// In-memory mirror of what `api`'s active-tracked-trains reference set
 /// contains, refreshed on `run_once`'s caller's own schedule (main.rs's
@@ -304,8 +305,8 @@ pub async fn run_once<F: MovementFeed>(
         // string in the error, `main.rs`'s `tracing::error!(error = ?err,
         // ...)` only ever showed the parse failure's shape (e.g. "missing
         // field `header`"), never the payload that produced it.
-        let messages =
-            crate::schema::parse_batch(&raw).with_context(|| format!("raw payload: {raw}"))?;
+        let messages = trust_schema::schema::parse_batch(&raw)
+            .with_context(|| format!("raw payload: {raw}"))?;
         for message in messages {
             if let Some(event) = process_message(&message, reference, state, stanox_crs) {
                 events.push(event);
@@ -420,7 +421,7 @@ fn process_message(
 
             let previous = previous_state(state, &movement.train_id);
             let mut derived =
-                crate::journey::apply_movement(&previous, movement, loc_crs.as_deref());
+                trust_schema::journey::apply_movement(&previous, movement, loc_crs.as_deref());
             if let (Some(p), Some(a), Some("LATE")) =
                 (planned, actual, movement.variation_status.as_deref())
             {
@@ -447,7 +448,7 @@ fn process_message(
                 (None, None)
             };
 
-            let dedup = crate::dedup::dedup_key(
+            let dedup = trust_schema::dedup::dedup_key(
                 &movement.train_id,
                 "0003",
                 Some(&movement.event_type),
@@ -486,12 +487,13 @@ fn process_message(
             let tracked_train_id = state.resolved.get(&cancellation.train_id).copied()?;
 
             let previous = previous_state(state, &cancellation.train_id);
-            let derived = crate::journey::apply_cancellation(&previous);
+            let derived = trust_schema::journey::apply_cancellation(&previous);
             state
                 .last_derived
                 .insert(cancellation.train_id.clone(), derived.clone());
 
-            let dedup = crate::dedup::dedup_key(&cancellation.train_id, "0002", None, None, None);
+            let dedup =
+                trust_schema::dedup::dedup_key(&cancellation.train_id, "0002", None, None, None);
 
             Some(common::TrainMovementEventMessage {
                 tracked_train_id,
@@ -565,7 +567,7 @@ fn passthrough_event(
         tracked_train_id,
         resolved_train_uid: None,
         resolved_train_id: None,
-        dedup_key: crate::dedup::dedup_key(train_id, msg_type, None, None, None),
+        dedup_key: trust_schema::dedup::dedup_key(train_id, msg_type, None, None, None),
         msg_type: msg_type.to_string(),
         event_type: None,
         loc_stanox: None,
