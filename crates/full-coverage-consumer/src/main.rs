@@ -45,10 +45,50 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use clap::Parser;
-use config::Config;
+use config::{Config, MovementFeedBackend};
 use feed::MovementFeed;
 use feed::kafka::KafkaMovementFeed;
+use movement_feed::redis_stream::{GapInfo, RedisStreamMovementFeed};
 use trust_schema::schema::TrustMessage;
+
+/// Wraps whichever concrete `MovementFeed` this deployment selected. See
+/// `trust-consumer/src/main.rs`'s identical type for the full reasoning on
+/// why this is a manual enum rather than `Box<dyn MovementFeed>`
+/// (`check_gap` is a `RedisStreamMovementFeed`-only inherent method, not
+/// reachable through the trait object).
+enum ActiveFeed {
+    Kafka(KafkaMovementFeed),
+    // Boxed: RedisStreamMovementFeed is meaningfully larger than
+    // KafkaMovementFeed (clippy::large_enum_variant) -- see
+    // trust-consumer/src/main.rs's identical note.
+    RedisStream(Box<RedisStreamMovementFeed>),
+}
+
+#[async_trait::async_trait]
+impl MovementFeed for ActiveFeed {
+    async fn next_batch(&mut self) -> anyhow::Result<Vec<String>> {
+        match self {
+            ActiveFeed::Kafka(feed) => feed.next_batch().await,
+            ActiveFeed::RedisStream(feed) => feed.next_batch().await,
+        }
+    }
+
+    async fn commit(&mut self) -> anyhow::Result<()> {
+        match self {
+            ActiveFeed::Kafka(feed) => feed.commit().await,
+            ActiveFeed::RedisStream(feed) => feed.commit().await,
+        }
+    }
+}
+
+impl ActiveFeed {
+    async fn check_gap(&mut self) -> anyhow::Result<Option<GapInfo>> {
+        match self {
+            ActiveFeed::Kafka(_) => Ok(None),
+            ActiveFeed::RedisStream(feed) => feed.check_gap().await,
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -71,7 +111,22 @@ async fn main() -> anyhow::Result<()> {
             password: config.internal_oauth_password.clone(),
         });
 
-    let mut feed = KafkaMovementFeed::connect(&config, connection_state)?;
+    let mut feed = match config.movement_feed_backend {
+        MovementFeedBackend::Kafka => {
+            ActiveFeed::Kafka(KafkaMovementFeed::connect(&config, connection_state)?)
+        }
+        MovementFeedBackend::RedisStream => ActiveFeed::RedisStream(Box::new(
+            RedisStreamMovementFeed::connect(
+                &config.redis_url,
+                "full-coverage-consumer",
+                "full-coverage-consumer-1",
+                Duration::from_secs(config.redis_autoclaim_min_idle_secs),
+            )
+            .await?,
+        )),
+    };
+    let redis_gap_check_interval = Duration::from_secs(config.redis_gap_check_secs);
+    let mut last_redis_gap_check = tokio::time::Instant::now() - redis_gap_check_interval;
 
     // Built once, before the loop: purely static-catalogue-derived, so it
     // only needs rebuilding when config.lines changes, which doesn't
@@ -135,6 +190,31 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             last_stanox_crs_reload = tokio::time::Instant::now();
+        }
+
+        // 2b. redis-stream gap check -- a no-op under the Kafka backend
+        // (ActiveFeed::check_gap returns Ok(None) immediately for that
+        // variant). See docs/superpowers/specs/2026-09-04-movement-relay-design.md
+        // Decision 2's "definitive gap detection."
+        if last_redis_gap_check.elapsed() >= redis_gap_check_interval {
+            match feed.check_gap().await {
+                Ok(Some(gap)) => {
+                    tracing::error!(
+                        last_delivered = %gap.group_last_delivered_id,
+                        new_first_entry = %gap.stream_first_entry_id,
+                        "movement-events stream gap detected: some events between these IDs were trimmed before full-coverage-consumer ever read them -- this can bias this consumer's own shadow-mode SampleStats for the affected window (e.g. inflating the unconfirmed-by-window-close = cancelled bucket); treat any rail day during which a gap was detected as not clean signal"
+                    );
+                    metrics::counter!(common::metrics::metric_name(
+                        "full_coverage_consumer_stream_gap_detected_total"
+                    ))
+                    .increment(1);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(error = ?err, "failed to check movement-events stream for a gap; will retry next cycle");
+                }
+            }
+            last_redis_gap_check = tokio::time::Instant::now();
         }
 
         // 3. consume + correlate.

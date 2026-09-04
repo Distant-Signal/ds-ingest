@@ -8,6 +8,30 @@ fn parse_stanox_crs(path: &str) -> anyhow::Result<StanoxCrsTable> {
     StanoxCrsTable::from_file(Path::new(path))
 }
 
+/// Which transport this crate's `MovementFeed` uses. See
+/// docs/superpowers/plans/2026-09-04-movement-relay-plan.md, "Judgment
+/// calls," item 5, for why this exists: Deploy A ships this defaulting to
+/// `kafka` (zero behavior change); Deploy B's B3 step flips it to
+/// `redis-stream` via a Helm value, with no new code merge at cutover
+/// time.
+#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+pub enum MovementFeedBackend {
+    /// Today's production default -- a direct Kafka consumer via
+    /// `feed::kafka::KafkaMovementFeed`. Unchanged behavior from before
+    /// this plan.
+    Kafka,
+    /// The new Redis Streams reader
+    /// (`movement_feed::redis_stream::RedisStreamMovementFeed`), reading
+    /// what `movement-relay` publishes. Selected only once
+    /// docs/superpowers/specs/2026-09-04-movement-relay-design.md's
+    /// Deploy B has moved the real Kafka credential over to
+    /// `movement-relay` -- selecting this BEFORE that happens means this
+    /// crate simply reads nothing (the stream/group exist but
+    /// `movement-relay` was never enabled to publish into them), not a
+    /// crash -- a safe, if useless, misconfiguration.
+    RedisStream,
+}
+
 /// CLI/env configuration for the `trust-consumer` service.
 ///
 /// `kafka_topic` and `kafka_sasl_mechanism` deliberately have no default:
@@ -132,4 +156,98 @@ pub struct Config {
     /// The `api` crate's endpoint for the live STANOX/CRS table.
     #[arg(long, env, default_value = "http://api:8080/private/stanox-crs")]
     pub stanox_crs_url: String,
+
+    /// Which transport this crate's `MovementFeed` uses. See
+    /// `MovementFeedBackend`'s own doc. Defaults to `kafka` -- Deploy A
+    /// (docs/superpowers/plans/2026-09-04-movement-relay-plan.md) changes
+    /// nothing about production behavior until this is explicitly flipped.
+    #[arg(long, env, value_enum, default_value_t = MovementFeedBackend::Kafka)]
+    pub movement_feed_backend: MovementFeedBackend,
+
+    /// Only read when `movement_feed_backend = redis-stream`. Always
+    /// required regardless of the selected backend -- Redis is already an
+    /// always-on chart-level dependency (`redis.enabled: true`), so
+    /// requiring this unconditionally is simpler than making it
+    /// conditionally required, and costs nothing when unused under the
+    /// `kafka` backend.
+    #[arg(long, env, default_value = "redis://redis:6379")]
+    pub redis_url: String,
+
+    /// How long an entry may sit unacked in this consumer's own
+    /// pending-entries list before `RedisStreamMovementFeed`'s periodic
+    /// sweep reclaims it. Sized small relative to `enricher`'s own
+    /// `reclaimMinIdleSecs` (1000s) -- see
+    /// docs/superpowers/specs/2026-09-04-movement-relay-design.md
+    /// Decision 2's own note: this crate's cycle latency (consume ->
+    /// derive -> POST to api -> ack) should be sub-second in the healthy
+    /// case, unlike enricher's slower LLM-call latency.
+    #[arg(long, env, default_value_t = 30)]
+    pub redis_autoclaim_min_idle_secs: u64,
+
+    /// How often (seconds), under the `redis-stream` backend only, this
+    /// crate compares the `trust-consumer` Redis Streams consumer group's
+    /// `last-delivered-id` against the stream's oldest retained entry
+    /// (`RedisStreamMovementFeed::check_gap`) -- the design doc Decision
+    /// 2's "definitive gap detection" mechanism. Same cadence shape as
+    /// `reference_reload_secs`/`stanox_crs_reload_secs`. A no-op timer
+    /// under the `kafka` backend.
+    #[arg(long, env, default_value_t = 60)]
+    pub redis_gap_check_secs: u64,
+
+    /// Prometheus metrics port. Off (`metrics_enabled: false`) by default
+    /// today because this crate has never needed one before this plan --
+    /// added here so `trust_consumer_stream_gap_detected_total` (Task 4)
+    /// has somewhere real to be scraped from. Mirrors
+    /// `full-coverage-consumer/src/config.rs`'s identical pair of fields.
+    #[arg(long, env, default_value_t = 9095)]
+    pub metrics_port: u16,
+    #[arg(long, env, default_value_t = true)]
+    pub metrics_enabled: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The concrete regression test for "Deploy A changes nothing about
+    /// default production behavior" (docs/superpowers/plans/2026-09-04-movement-relay-plan.md
+    /// Task 4): parsing only the pre-existing required arguments -- none of
+    /// this plan's new flags -- must still yield `MovementFeedBackend::Kafka`.
+    #[test]
+    fn movement_feed_backend_defaults_to_kafka_when_unset() {
+        // The real, checked-in reference-data/stanox-crs.csv, since
+        // --stanox-crs-file's default value is parsed eagerly (its
+        // value_parser opens and parses the file) even when this test never
+        // touches STANOX/CRS behavior -- mirrors main.rs's own
+        // TEST_STANOX_CRS test fixture path.
+        let stanox_crs_file = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../reference-data/stanox-crs.csv");
+
+        let config = Config::try_parse_from([
+            "trust-consumer",
+            "--kafka-brokers",
+            "kafka.example.com:9092",
+            "--kafka-topic",
+            "test-topic",
+            "--kafka-sasl-username",
+            "user",
+            "--kafka-sasl-password",
+            "pass",
+            "--kafka-sasl-mechanism",
+            "PLAIN",
+            "--internal-oauth-token-url",
+            "http://auth.example.com/token",
+            "--internal-oauth-client-id",
+            "client-id",
+            "--internal-oauth-username",
+            "svc-user",
+            "--internal-oauth-password",
+            "svc-pass",
+            "--stanox-crs-file",
+            stanox_crs_file.to_str().unwrap(),
+        ])
+        .expect("minimal required args should parse");
+
+        assert_eq!(config.movement_feed_backend, MovementFeedBackend::Kafka);
+    }
 }

@@ -23,6 +23,17 @@ impl std::ops::Deref for LineCatalogue {
     }
 }
 
+/// Which transport this crate's `MovementFeed` uses. Verbatim copy of
+/// `trust-consumer/src/config.rs`'s own enum -- see that file's doc for the
+/// full reasoning; kept as two independent enums (rather than a shared
+/// type) since each crate owns its own `Config` struct and clap derive
+/// needs the enum in scope either way.
+#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+pub enum MovementFeedBackend {
+    Kafka,
+    RedisStream,
+}
+
 /// CLI/env configuration for the `full-coverage-consumer` service -- a
 /// second, independent Kafka consumer against the same RDM Train
 /// Movements feed `trust-consumer` reads, correlating every event against
@@ -115,6 +126,31 @@ pub struct Config {
     pub metrics_port: u16,
     #[arg(long, env, default_value_t = true)]
     pub metrics_enabled: bool,
+
+    /// Which transport this crate's `MovementFeed` uses. Defaults to
+    /// `kafka` -- Deploy A (docs/superpowers/plans/2026-09-04-movement-relay-plan.md)
+    /// changes nothing about production behavior until this is explicitly
+    /// flipped. See `MovementFeedBackend`'s own doc.
+    #[arg(long, env, value_enum, default_value_t = MovementFeedBackend::Kafka)]
+    pub movement_feed_backend: MovementFeedBackend,
+
+    /// Only read when `movement_feed_backend = redis-stream`. See
+    /// `trust-consumer/src/config.rs`'s identical field for the full
+    /// reasoning on why this is always required regardless of backend.
+    #[arg(long, env, default_value = "redis://redis:6379")]
+    pub redis_url: String,
+
+    /// See `trust-consumer/src/config.rs`'s identical field.
+    #[arg(long, env, default_value_t = 30)]
+    pub redis_autoclaim_min_idle_secs: u64,
+
+    /// How often (seconds), under the `redis-stream` backend only, this
+    /// crate compares the `full-coverage-consumer` Redis Streams consumer
+    /// group's `last-delivered-id` against the stream's oldest retained
+    /// entry (`RedisStreamMovementFeed::check_gap`). A no-op timer under
+    /// the `kafka` backend.
+    #[arg(long, env, default_value_t = 60)]
+    pub redis_gap_check_secs: u64,
 }
 
 impl Config {
@@ -202,6 +238,10 @@ mod tests {
             health_bind_url: String::new(),
             metrics_port: 9093,
             metrics_enabled: false,
+            movement_feed_backend: MovementFeedBackend::Kafka,
+            redis_url: String::new(),
+            redis_autoclaim_min_idle_secs: 30,
+            redis_gap_check_secs: 60,
         }
     }
 
@@ -227,5 +267,41 @@ mod tests {
             "line-b, line-unknown",
         );
         assert_eq!(config.shadow_line_ids(), vec!["line-b".to_string()]);
+    }
+
+    /// The concrete regression test for "Deploy A changes nothing about
+    /// default production behavior" (docs/superpowers/plans/2026-09-04-movement-relay-plan.md
+    /// Task 4): parsing only the pre-existing required arguments -- none of
+    /// this plan's new flags -- must still yield `MovementFeedBackend::Kafka`.
+    #[test]
+    fn movement_feed_backend_defaults_to_kafka_when_unset() {
+        let lines_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lines");
+
+        let config = Config::try_parse_from([
+            "full-coverage-consumer",
+            "--kafka-brokers",
+            "kafka.example.com:9092",
+            "--kafka-topic",
+            "test-topic",
+            "--kafka-sasl-username",
+            "user",
+            "--kafka-sasl-password",
+            "pass",
+            "--kafka-sasl-mechanism",
+            "PLAIN",
+            "--internal-oauth-token-url",
+            "http://auth.example.com/token",
+            "--internal-oauth-client-id",
+            "client-id",
+            "--internal-oauth-username",
+            "svc-user",
+            "--internal-oauth-password",
+            "svc-pass",
+            "--lines-dir",
+            lines_dir.to_str().unwrap(),
+        ])
+        .expect("minimal required args should parse");
+
+        assert_eq!(config.movement_feed_backend, MovementFeedBackend::Kafka);
     }
 }

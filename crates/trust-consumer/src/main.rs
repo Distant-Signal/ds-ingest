@@ -16,9 +16,59 @@ mod stanox_crs;
 use std::time::Duration;
 
 use clap::Parser;
-use config::Config;
+use config::{Config, MovementFeedBackend};
 use feed::MovementFeed;
 use feed::kafka::KafkaMovementFeed;
+use movement_feed::redis_stream::{GapInfo, RedisStreamMovementFeed};
+
+/// Wraps whichever concrete `MovementFeed` this deployment selected
+/// (`config::MovementFeedBackend`) behind one type, delegating
+/// `MovementFeed`'s two methods to whichever variant is active. A `Box<dyn
+/// MovementFeed>` would work for `next_batch`/`commit` alone, but
+/// `check_gap` (Task 4) is a `RedisStreamMovementFeed`-only inherent
+/// method, not part of the `MovementFeed` trait -- deliberately, since
+/// `KafkaMovementFeed` has no analog -- so it isn't reachable through a
+/// trait object without a downcast. This repo's existing code never does
+/// `Box<dyn Any>`-style downcasting anywhere, so a small manual enum is
+/// preferred here instead.
+enum ActiveFeed {
+    Kafka(KafkaMovementFeed),
+    // Boxed: RedisStreamMovementFeed is >5x KafkaMovementFeed's size
+    // (clippy::large_enum_variant), so boxing keeps every ActiveFeed value
+    // -- including the Kafka variant, the one actually used in production
+    // today -- from paying for the larger variant's stack space.
+    RedisStream(Box<RedisStreamMovementFeed>),
+}
+
+#[async_trait::async_trait]
+impl MovementFeed for ActiveFeed {
+    async fn next_batch(&mut self) -> anyhow::Result<Vec<String>> {
+        match self {
+            ActiveFeed::Kafka(feed) => feed.next_batch().await,
+            ActiveFeed::RedisStream(feed) => feed.next_batch().await,
+        }
+    }
+
+    async fn commit(&mut self) -> anyhow::Result<()> {
+        match self {
+            ActiveFeed::Kafka(feed) => feed.commit().await,
+            ActiveFeed::RedisStream(feed) => feed.commit().await,
+        }
+    }
+}
+
+impl ActiveFeed {
+    /// `Ok(None)` immediately for the `Kafka` variant (no analog); delegates
+    /// to `RedisStreamMovementFeed::check_gap` for the `RedisStream`
+    /// variant. See docs/superpowers/specs/2026-09-04-movement-relay-design.md
+    /// Decision 2's "definitive gap detection."
+    async fn check_gap(&mut self) -> anyhow::Result<Option<GapInfo>> {
+        match self {
+            ActiveFeed::Kafka(_) => Ok(None),
+            ActiveFeed::RedisStream(feed) => feed.check_gap().await,
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -29,6 +79,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::parse();
+    if config.metrics_enabled {
+        common::metrics::install(config.metrics_port)?;
+    }
     let connection_state = health::spawn(config.health_bind_url.clone());
     let http = reqwest::Client::new();
     let internal_oauth =
@@ -40,7 +93,22 @@ async fn main() -> anyhow::Result<()> {
             password: config.internal_oauth_password.clone(),
         });
 
-    let mut feed = KafkaMovementFeed::connect(&config, connection_state)?;
+    let mut feed = match config.movement_feed_backend {
+        MovementFeedBackend::Kafka => {
+            ActiveFeed::Kafka(KafkaMovementFeed::connect(&config, connection_state)?)
+        }
+        MovementFeedBackend::RedisStream => ActiveFeed::RedisStream(Box::new(
+            RedisStreamMovementFeed::connect(
+                &config.redis_url,
+                "trust-consumer",
+                "trust-consumer-1",
+                Duration::from_secs(config.redis_autoclaim_min_idle_secs),
+            )
+            .await?,
+        )),
+    };
+    let redis_gap_check_interval = Duration::from_secs(config.redis_gap_check_secs);
+    let mut last_redis_gap_check = tokio::time::Instant::now() - redis_gap_check_interval;
 
     let mut reference = process::Reference {
         pending: Vec::new(),
@@ -98,6 +166,30 @@ async fn main() -> anyhow::Result<()> {
                 queries::fetch_stanox_crs(&http, &config.stanox_crs_url, &internal_oauth).await;
             process::apply_stanox_crs_reload(fetched, &stanox_crs);
             last_stanox_crs_reload = tokio::time::Instant::now();
+        }
+
+        // A no-op under the Kafka backend (ActiveFeed::check_gap returns
+        // Ok(None) immediately for that variant) -- only meaningful once
+        // this deployment has been cut over to Redis Streams (Deploy B).
+        if last_redis_gap_check.elapsed() >= redis_gap_check_interval {
+            match feed.check_gap().await {
+                Ok(Some(gap)) => {
+                    tracing::error!(
+                        last_delivered = %gap.group_last_delivered_id,
+                        new_first_entry = %gap.stream_first_entry_id,
+                        "movement-events stream gap detected: some events between these IDs were trimmed before trust-consumer ever read them -- any Activation/Movement in that range is silently lost, possibly stranding a pin in resolution_status='pending' forever"
+                    );
+                    metrics::counter!(common::metrics::metric_name(
+                        "trust_consumer_stream_gap_detected_total"
+                    ))
+                    .increment(1);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(error = ?err, "failed to check movement-events stream for a gap; will retry next cycle");
+                }
+            }
+            last_redis_gap_check = tokio::time::Instant::now();
         }
 
         let outcome = run_cycle(

@@ -1,0 +1,28 @@
+[package]
+name = "movement-feed"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "test-util"] }
+
+# `FakeMovementFeed` is gated on `any(test, feature = "test-util")`, not a
+# bare `#[cfg(test)]`: it needs to be usable from BOTH trust-consumer's and
+# full-coverage-consumer's own `#[cfg(test)]` modules, which live in a
+# different crate than this one -- a plain `#[cfg(test)]` item is never
+# exported outside the crate that declares it, even under `cfg(test)`,
+# because Cargo compiles each crate's own test harness separately and a
+# dependency crate is always compiled in non-test mode when pulled in as a
+# dependency. This is the first crate in this workspace needing that shape
+# (confirmed via `grep -rn 'feature = "test-util"'` across the workspace
+# before adding it) -- see docs/superpowers/specs/2026-09-04-movement-relay-design.md
+# Decision 3 and docs/superpowers/plans/2026-09-04-movement-relay-plan.md
+# Task 2 for the full reasoning.
+[features]
+test-util = []
