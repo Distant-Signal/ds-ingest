@@ -76,6 +76,11 @@ where
         Ok(batch) => batch,
         Err(err) => {
             tracing::error!(error = ?err, "error receiving from Kafka");
+            metrics::counter!(
+                common::metrics::metric_name("movement_relay_errors_total"),
+                "operation" => "kafka_receive"
+            )
+            .increment(1);
             return Cycle::Failed;
         }
     };
@@ -85,12 +90,22 @@ where
             Ok(envelopes) => envelopes,
             Err(err) => {
                 tracing::error!(error = ?err, raw = %raw, "failed to classify Kafka record; not committing this record's offset");
+                metrics::counter!(
+                    common::metrics::metric_name("movement_relay_errors_total"),
+                    "operation" => "classify_record"
+                )
+                .increment(1);
                 return Cycle::Failed;
             }
         };
         for (msg_type, payload) in &envelopes {
             if let Err(err) = sink.publish(msg_type, payload).await {
                 tracing::error!(error = ?err, msg_type, "failed to XADD envelope; not committing this record's offset");
+                metrics::counter!(
+                    common::metrics::metric_name("movement_relay_errors_total"),
+                    "operation" => "publish_event"
+                )
+                .increment(1);
                 return Cycle::Failed;
             }
             metrics::counter!(
@@ -103,6 +118,11 @@ where
 
     if let Err(err) = source.commit().await {
         tracing::error!(error = ?err, "failed to commit Kafka offset");
+        metrics::counter!(
+            common::metrics::metric_name("movement_relay_errors_total"),
+            "operation" => "commit_offsets"
+        )
+        .increment(1);
         return Cycle::Failed;
     }
     Cycle::Committed
@@ -118,12 +138,22 @@ where
 async fn stream_lag_loop(redis_url: String, interval: Duration) {
     let Ok(client) = redis::Client::open(redis_url) else {
         tracing::error!("stream_lag_loop: failed to build Redis client; lag gauge disabled");
+        metrics::counter!(
+            common::metrics::metric_name("movement_relay_errors_total"),
+            "operation" => "redis_client_build"
+        )
+        .increment(1);
         return;
     };
     let mut conn = match client.get_connection_manager().await {
         Ok(conn) => conn,
         Err(err) => {
             tracing::error!(error = ?err, "stream_lag_loop: failed to connect; lag gauge disabled");
+            metrics::counter!(
+                common::metrics::metric_name("movement_relay_errors_total"),
+                "operation" => "redis_connect"
+            )
+            .increment(1);
             return;
         }
     };

@@ -202,6 +202,11 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(err) => {
                     tracing::error!(error = ?err, "failed to reload stanox/crs table; keeping previous snapshot");
+                    metrics::counter!(
+                        common::metrics::metric_name("full_coverage_consumer_errors_total"),
+                        "operation" => "reload_stanox_crs"
+                    )
+                    .increment(1);
                 }
             }
             last_stanox_crs_reload = tokio::time::Instant::now();
@@ -254,6 +259,11 @@ async fn main() -> anyhow::Result<()> {
                         }
                         Err(err) => {
                             tracing::error!(error = ?err, raw = %raw, "failed to parse TRUST batch; dropping this payload");
+                            metrics::counter!(
+                                common::metrics::metric_name("full_coverage_consumer_errors_total"),
+                                "operation" => "parse_batch"
+                            )
+                            .increment(1);
                         }
                     }
                 }
@@ -263,10 +273,20 @@ async fn main() -> anyhow::Result<()> {
                 // its stats-write cadence, unlike trust-consumer's.
                 if let Err(err) = feed.commit().await {
                     tracing::error!(error = ?err, "failed to commit Kafka offsets");
+                    metrics::counter!(
+                        common::metrics::metric_name("full_coverage_consumer_errors_total"),
+                        "operation" => "commit_offsets"
+                    )
+                    .increment(1);
                 }
             }
             Err(err) => {
                 tracing::error!(error = ?err, "error receiving from movement feed");
+                metrics::counter!(
+                    common::metrics::metric_name("full_coverage_consumer_errors_total"),
+                    "operation" => "movement_feed_receive"
+                )
+                .increment(1);
                 tokio::time::sleep(ERROR_BACKOFF).await;
             }
         }
@@ -330,6 +350,11 @@ async fn reload_population(
                         Ok(entries) => population.insert(line_id, date, entries),
                         Err(err) => {
                             tracing::error!(error = ?err, line_id = %line_id, %date, "failed to deserialize schedule-line-population response");
+                            metrics::counter!(
+                                common::metrics::metric_name("full_coverage_consumer_errors_total"),
+                                "operation" => "reload_line_population_deserialize"
+                            )
+                            .increment(1);
                         }
                     }
                 }
@@ -340,6 +365,11 @@ async fn reload_population(
                 }
                 Err(err) => {
                     tracing::error!(error = ?err, line_id = %line_id, %date, "failed to fetch schedule line population; keeping previous snapshot");
+                    metrics::counter!(
+                        common::metrics::metric_name("full_coverage_consumer_errors_total"),
+                        "operation" => "reload_line_population_fetch"
+                    )
+                    .increment(1);
                 }
             }
         }
@@ -475,6 +505,11 @@ async fn write_stats(
     .await
     {
         tracing::error!(error = ?err, "failed to post full-coverage line stats; will retry next cycle");
+        metrics::counter!(
+            common::metrics::metric_name("full_coverage_consumer_errors_total"),
+            "operation" => "post_line_stats"
+        )
+        .increment(1);
     }
 
     let station_rows = station_correlate::build_station_rows(station_state, now, defaults);
@@ -491,6 +526,11 @@ async fn write_stats(
     .await
     {
         tracing::error!(error = ?err, "failed to post station full-coverage samples; will retry next cycle");
+        metrics::counter!(
+            common::metrics::metric_name("full_coverage_consumer_errors_total"),
+            "operation" => "post_station_samples"
+        )
+        .increment(1);
     }
 }
 

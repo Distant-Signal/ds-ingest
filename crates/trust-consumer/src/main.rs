@@ -178,6 +178,11 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(err) => {
                     tracing::error!(error = ?err, "failed to reload active tracked trains; retrying next cycle");
+                    metrics::counter!(
+                        common::metrics::metric_name("trust_consumer_errors_total"),
+                        "operation" => "reload_tracked_trains"
+                    )
+                    .increment(1);
                 }
             }
         }
@@ -283,17 +288,32 @@ where
         Ok(events) => events,
         Err(err) => {
             tracing::error!(error = ?err, "error processing movement feed batch");
+            metrics::counter!(
+                common::metrics::metric_name("trust_consumer_errors_total"),
+                "operation" => "process_batch"
+            )
+            .increment(1);
             return Cycle::Failed;
         }
     };
 
     if let Err(err) = post(&events).await {
         tracing::error!(error = ?err, "failed to post train events; not committing this batch's offsets");
+        metrics::counter!(
+            common::metrics::metric_name("trust_consumer_errors_total"),
+            "operation" => "post_train_events"
+        )
+        .increment(1);
         return Cycle::Failed;
     }
 
     if let Err(err) = feed.commit().await {
         tracing::error!(error = ?err, "failed to commit Kafka offsets");
+        metrics::counter!(
+            common::metrics::metric_name("trust_consumer_errors_total"),
+            "operation" => "commit_offsets"
+        )
+        .increment(1);
         return Cycle::Failed;
     }
 

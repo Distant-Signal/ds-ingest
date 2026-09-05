@@ -274,6 +274,11 @@ pub fn apply_stanox_crs_reload(
         }
         Err(err) => {
             tracing::error!(error = ?err, "failed to reload stanox_crs table; keeping the currently loaded table");
+            metrics::counter!(
+                common::metrics::metric_name("trust_consumer_errors_total"),
+                "operation" => "reload_stanox_crs"
+            )
+            .increment(1);
         }
     }
 }
