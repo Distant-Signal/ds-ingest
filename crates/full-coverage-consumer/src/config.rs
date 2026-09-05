@@ -1,27 +1,5 @@
-use std::path::PathBuf;
-
-use anyhow::Result;
 use clap::Parser;
-use common::LineDefinition;
-
-fn parse_lines(path: &str) -> Result<LineCatalogue> {
-    LineDefinition::from_dir(&PathBuf::from(path)).map(LineCatalogue)
-}
-
-/// Newtype around the parsed line catalogue -- same shape (and same
-/// `clap_derive` gotcha it works around) as `crates/aggregator/src/config.rs::LineCatalogue`,
-/// `crates/api/src/data/config.rs`'s, and `crates/schedule-reference/src/config.rs`'s
-/// identical `--lines-dir` fields. Needed here to build Decision 2c's
-/// reverse tiploc->line index (`population::build_tiploc_index`, Task 9).
-#[derive(Debug, Clone, Default)]
-pub struct LineCatalogue(pub Vec<LineDefinition>);
-
-impl std::ops::Deref for LineCatalogue {
-    type Target = Vec<LineDefinition>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
+use common::config::{LineCatalogue, parse_lines};
 
 /// Which transport this crate's `MovementFeed` uses. Verbatim copy of
 /// `trust-consumer/src/config.rs`'s own enum -- see that file's doc for the
@@ -47,18 +25,10 @@ pub struct Config {
     // still has its own consumer_group default and its own env var
     // names at the crate/binary layer, per Decision 1's "connection vs.
     // group membership" reasoning.
-    #[arg(long, env)]
-    pub kafka_brokers: String,
-    #[arg(long, env)]
-    pub kafka_topic: String,
+    #[command(flatten)]
+    pub kafka: common::service_args::KafkaConnectionArgs,
     #[arg(long, env, default_value = "distant-signal-full-coverage-consumer")]
     pub kafka_consumer_group: String,
-    #[arg(long, env)]
-    pub kafka_sasl_username: String,
-    #[arg(long, env)]
-    pub kafka_sasl_password: String,
-    #[arg(long, env)]
-    pub kafka_sasl_mechanism: String,
 
     // api endpoints
     #[arg(
@@ -87,16 +57,8 @@ pub struct Config {
     pub stanox_crs_url: String,
 
     // Shared+distinct OAuth2 (Decision 5 -- same shape as every other caller)
-    #[arg(long, env)]
-    pub internal_oauth_token_url: String,
-    #[arg(long, env)]
-    pub internal_oauth_client_id: String,
-    #[arg(long, env, default_value = "groups")]
-    pub internal_oauth_scope: String,
-    #[arg(long, env)]
-    pub internal_oauth_username: String,
-    #[arg(long, env)]
-    pub internal_oauth_password: String,
+    #[command(flatten)]
+    pub internal_oauth: common::oauth_client::InternalOAuthArgs,
 
     // Reload cadences
     #[arg(long, env, default_value_t = 300)]
@@ -124,8 +86,8 @@ pub struct Config {
     pub health_bind_url: String,
     #[arg(long, env, default_value_t = 9093)]
     pub metrics_port: u16,
-    #[arg(long, env, default_value_t = true)]
-    pub metrics_enabled: bool,
+    #[command(flatten)]
+    pub metrics: common::service_args::MetricsArgs,
 
     /// Which transport this crate's `MovementFeed` uses. Defaults to
     /// `kafka` -- Deploy A (docs/superpowers/plans/2026-09-04-movement-relay-plan.md)
@@ -187,6 +149,8 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    use common::LineDefinition;
+
     use super::*;
 
     fn fixture_line(id: &str, tiploc: Option<&str>) -> LineDefinition {
@@ -215,21 +179,25 @@ mod tests {
 
     fn base_config(lines: Vec<LineDefinition>, shadow_lines: &str) -> Config {
         Config {
-            kafka_brokers: String::new(),
-            kafka_topic: String::new(),
+            kafka: common::service_args::KafkaConnectionArgs {
+                kafka_brokers: String::new(),
+                kafka_topic: String::new(),
+                kafka_sasl_username: String::new(),
+                kafka_sasl_password: String::new(),
+                kafka_sasl_mechanism: String::new(),
+            },
             kafka_consumer_group: String::new(),
-            kafka_sasl_username: String::new(),
-            kafka_sasl_password: String::new(),
-            kafka_sasl_mechanism: String::new(),
             schedule_line_population_url: String::new(),
             full_coverage_stats_url: String::new(),
             station_full_coverage_stats_url: String::new(),
             stanox_crs_url: String::new(),
-            internal_oauth_token_url: String::new(),
-            internal_oauth_client_id: String::new(),
-            internal_oauth_scope: String::new(),
-            internal_oauth_username: String::new(),
-            internal_oauth_password: String::new(),
+            internal_oauth: common::oauth_client::InternalOAuthArgs {
+                internal_oauth_token_url: String::new(),
+                internal_oauth_client_id: String::new(),
+                internal_oauth_scope: String::new(),
+                internal_oauth_username: String::new(),
+                internal_oauth_password: String::new(),
+            },
             population_reload_secs: 300,
             stanox_crs_reload_secs: 3600,
             stats_write_interval_secs: 60,
@@ -237,7 +205,9 @@ mod tests {
             lines: LineCatalogue(lines),
             health_bind_url: String::new(),
             metrics_port: 9093,
-            metrics_enabled: false,
+            metrics: common::service_args::MetricsArgs {
+                metrics_enabled: false,
+            },
             movement_feed_backend: MovementFeedBackend::Kafka,
             redis_url: String::new(),
             redis_autoclaim_min_idle_secs: 30,

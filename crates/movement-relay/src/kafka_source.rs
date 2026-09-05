@@ -49,17 +49,17 @@ impl KafkaRawSource {
     pub fn connect(config: &Config, ready: ReadyState) -> anyhow::Result<Self> {
         let context = RelayContext { ready };
         let consumer: StreamConsumer<RelayContext> = ClientConfig::new()
-            .set("bootstrap.servers", &config.kafka_brokers)
+            .set("bootstrap.servers", &config.kafka.kafka_brokers)
             .set("group.id", &config.kafka_consumer_group)
             .set("security.protocol", "SASL_SSL")
-            .set("sasl.mechanisms", &config.kafka_sasl_mechanism)
-            .set("sasl.username", &config.kafka_sasl_username)
-            .set("sasl.password", &config.kafka_sasl_password)
+            .set("sasl.mechanisms", &config.kafka.kafka_sasl_mechanism)
+            .set("sasl.username", &config.kafka.kafka_sasl_username)
+            .set("sasl.password", &config.kafka.kafka_sasl_password)
             .set("enable.auto.commit", "false")
             .set("enable.auto.offset.store", "false")
             .create_with_context(context)?;
 
-        consumer.subscribe(&[&config.kafka_topic])?;
+        consumer.subscribe(&[&config.kafka.kafka_topic])?;
 
         Ok(Self {
             consumer,

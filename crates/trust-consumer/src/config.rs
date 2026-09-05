@@ -44,14 +44,10 @@ pub enum MovementFeedBackend {
 /// `crates/poller-tocs/src/config.rs`'s `rdm_tocs_base_url`.
 #[derive(Debug, Parser)]
 pub struct Config {
-    /// RDM Kafka broker address(es), comma-separated, e.g.
-    /// `kafka.raildata.org.uk:9094`. GAP: unconfirmed hostname.
-    #[arg(long, env)]
-    pub kafka_brokers: String,
-
-    /// GAP: unconfirmed exact topic name for the Train Movements product.
-    #[arg(long, env)]
-    pub kafka_topic: String,
+    /// RDM Kafka broker/topic/SASL connection config, shared across
+    /// `trust-consumer`/`full-coverage-consumer`/`movement-relay`.
+    #[command(flatten)]
+    pub kafka: common::service_args::KafkaConnectionArgs,
 
     /// Consumer group id. Fixed per deployment, not per-process -- multiple
     /// trust-consumer replicas sharing one group would each get a subset
@@ -59,22 +55,6 @@ pub struct Config {
     /// plan's v1 (single replica; see Helm chart task).
     #[arg(long, env, default_value = "distant-signal-trust-consumer")]
     pub kafka_consumer_group: String,
-
-    /// RDM's "Consumer key" for this product (SASL username).
-    #[arg(long, env)]
-    pub kafka_sasl_username: String,
-
-    /// RDM's "Consumer secret" for this product (SASL password).
-    #[arg(long, env)]
-    pub kafka_sasl_password: String,
-
-    /// GAP: unconfirmed whether RDM's Kafka product uses PLAIN or a SCRAM
-    /// variant. PLAIN is `librdkafka`'s simplest, most common default for
-    /// managed Kafka-as-a-service offerings, but this is an assumption,
-    /// not a confirmed fact -- reject silently guessing wrong by requiring
-    /// this be set explicitly rather than defaulting it.
-    #[arg(long, env)]
-    pub kafka_sasl_mechanism: String,
 
     /// The `api` crate's ingestion endpoint for train movement events.
     #[arg(long, env, default_value = "http://api:8080/private/train-events")]
@@ -85,23 +65,9 @@ pub struct Config {
     pub api_tracked_trains_url: String,
 
     /// Shared, non-secret OAuth2 client-credentials config (same value
-    /// across all 8 real callers) -- see
-    /// docs/superpowers/specs/2026-09-02-internal-service-oauth2-design.md
-    /// Decision 6.
-    #[arg(long, env)]
-    pub internal_oauth_token_url: String,
-    #[arg(long, env)]
-    pub internal_oauth_client_id: String,
-    #[arg(long, env, default_value = "groups")]
-    pub internal_oauth_scope: String,
-    /// This service's own Authentik service-account credential --
-    /// per-service, distinct from every other caller's. `username` is
-    /// identifying, not itself the secret; `password` (an Authentik
-    /// app-password) is the actual secret.
-    #[arg(long, env)]
-    pub internal_oauth_username: String,
-    #[arg(long, env)]
-    pub internal_oauth_password: String,
+    /// across all 9 real callers).
+    #[command(flatten)]
+    pub internal_oauth: common::oauth_client::InternalOAuthArgs,
 
     /// How often to reload the active-tracked-trains reference set from
     /// `api` -- picks up newly created pins and pins that resolved on a
@@ -201,8 +167,8 @@ pub struct Config {
     /// `full-coverage-consumer/src/config.rs`'s identical pair of fields.
     #[arg(long, env, default_value_t = 9095)]
     pub metrics_port: u16,
-    #[arg(long, env, default_value_t = true)]
-    pub metrics_enabled: bool,
+    #[command(flatten)]
+    pub metrics: common::service_args::MetricsArgs,
 }
 
 #[cfg(test)]

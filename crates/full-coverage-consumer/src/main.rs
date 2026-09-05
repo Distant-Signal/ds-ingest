@@ -109,19 +109,12 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let config = Config::parse();
-    if config.metrics_enabled {
+    if config.metrics.metrics_enabled {
         common::metrics::install(config.metrics_port)?;
     }
     let connection_state = health::spawn(config.health_bind_url.clone());
     let http = reqwest::Client::new();
-    let internal_oauth =
-        common::oauth_client::OAuthTokenCache::new(common::oauth_client::OAuthCredentials {
-            token_url: config.internal_oauth_token_url.clone(),
-            client_id: config.internal_oauth_client_id.clone(),
-            scope: config.internal_oauth_scope.clone(),
-            username: config.internal_oauth_username.clone(),
-            password: config.internal_oauth_password.clone(),
-        });
+    let internal_oauth = config.internal_oauth.token_cache();
 
     let mut feed = match config.movement_feed_backend {
         MovementFeedBackend::Kafka => {
