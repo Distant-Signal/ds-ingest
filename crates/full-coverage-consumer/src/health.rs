@@ -53,3 +53,42 @@ async fn healthz(state: ConnectionState) -> (StatusCode, &'static str) {
         (StatusCode::SERVICE_UNAVAILABLE, "disconnected")
     }
 }
+
+/// Centralizes every `ConnectionState` transition with a matching
+/// Prometheus gauge update, so the AtomicBool and
+/// `distant_signal_full_coverage_consumer_ready` never drift out of sync
+/// across this crate's three flip sites (`feed/kafka.rs`'s own internal
+/// update, and `main.rs`'s `ActiveFeed::next_batch` RedisStream branch) --
+/// one place that changes, not three, matching
+/// `crates/common/src/metrics.rs::metric_name`'s own stated reasoning for
+/// the identical shape of problem.
+pub fn set_connected(state: &ConnectionState, connected: bool) {
+    state.store(connected, Ordering::Relaxed);
+    metrics::gauge!(common::metrics::metric_name("full_coverage_consumer_ready"))
+        .set(if connected { 1.0 } else { 0.0 });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::set_connected;
+
+    #[test]
+    fn set_connected_updates_the_shared_atomic_state() {
+        let state = Arc::new(AtomicBool::new(false));
+
+        set_connected(&state, true);
+        assert!(state.load(Ordering::Relaxed));
+
+        set_connected(&state, false);
+        assert!(!state.load(Ordering::Relaxed));
+        // The distant_signal_full_coverage_consumer_ready gauge update
+        // inside set_connected is not independently asserted here -- no
+        // recorder is installed in this unit test, matching how
+        // crates/movement-relay/src/main.rs's own
+        // a_clean_batch_commits_and_publishes test already treats its
+        // metrics::counter! call.
+    }
+}

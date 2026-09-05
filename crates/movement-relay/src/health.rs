@@ -36,6 +36,7 @@ impl ConsumerContext for RelayContext {
         match rebalance {
             Rebalance::Assign(partitions) if !partitions.elements().is_empty() => {
                 self.ready.store(true, Ordering::Relaxed);
+                metrics::gauge!(common::metrics::metric_name("movement_relay_ready")).set(1.0);
                 tracing::info!(
                     partitions = partitions.elements().len(),
                     "movement-relay: Kafka partition assignment confirmed; readiness now true"
@@ -43,10 +44,12 @@ impl ConsumerContext for RelayContext {
             }
             Rebalance::Revoke(_) => {
                 self.ready.store(false, Ordering::Relaxed);
+                metrics::gauge!(common::metrics::metric_name("movement_relay_ready")).set(0.0);
                 tracing::warn!("movement-relay: Kafka partitions revoked; readiness now false");
             }
             Rebalance::Error(err) => {
                 self.ready.store(false, Ordering::Relaxed);
+                metrics::gauge!(common::metrics::metric_name("movement_relay_ready")).set(0.0);
                 tracing::error!(error = ?err, "movement-relay: Kafka rebalance error; readiness now false");
             }
             _ => {}

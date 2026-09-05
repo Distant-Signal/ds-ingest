@@ -51,8 +51,7 @@ impl MovementFeed for KafkaMovementFeed {
     async fn next_batch(&mut self) -> anyhow::Result<Vec<String>> {
         match self.consumer.recv().await {
             Ok(message) => {
-                self.connection_state
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                crate::health::set_connected(&self.connection_state, true);
                 let payload = message
                     .payload()
                     .ok_or_else(|| anyhow::anyhow!("empty Kafka message payload"))?;
@@ -65,8 +64,7 @@ impl MovementFeed for KafkaMovementFeed {
                 Ok(vec![batch])
             }
             Err(err) => {
-                self.connection_state
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                crate::health::set_connected(&self.connection_state, false);
                 Err(err.into())
             }
         }

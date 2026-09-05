@@ -79,7 +79,7 @@ impl MovementFeed for ActiveFeed {
             ActiveFeed::Kafka(feed) => feed.next_batch().await,
             ActiveFeed::RedisStream(feed, connection_state) => {
                 let result = feed.next_batch().await;
-                connection_state.store(result.is_ok(), std::sync::atomic::Ordering::Relaxed);
+                health::set_connected(connection_state, result.is_ok());
                 result
             }
         }
