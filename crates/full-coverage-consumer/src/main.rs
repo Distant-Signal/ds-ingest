@@ -60,8 +60,16 @@ enum ActiveFeed {
     Kafka(KafkaMovementFeed),
     // Boxed: RedisStreamMovementFeed is meaningfully larger than
     // KafkaMovementFeed (clippy::large_enum_variant) -- see
-    // trust-consumer/src/main.rs's identical note.
-    RedisStream(Box<RedisStreamMovementFeed>),
+    // trust-consumer/src/main.rs's identical note. The second field is the
+    // same bug fix as that crate's identical type: RedisStreamMovementFeed::connect
+    // never received connection_state, so /healthz stayed permanently
+    // SERVICE_UNAVAILABLE under this backend -- confirmed live on
+    // trust-consumer during Deploy B's B3 step (restart-looped on a
+    // failing liveness probe despite genuinely healthy Redis Streams
+    // reads). Updated at the ActiveFeed::next_batch call site below,
+    // mirroring KafkaMovementFeed's own internal update
+    // (feed/kafka.rs:76-95).
+    RedisStream(Box<RedisStreamMovementFeed>, health::ConnectionState),
 }
 
 #[async_trait::async_trait]
@@ -69,14 +77,18 @@ impl MovementFeed for ActiveFeed {
     async fn next_batch(&mut self) -> anyhow::Result<Vec<String>> {
         match self {
             ActiveFeed::Kafka(feed) => feed.next_batch().await,
-            ActiveFeed::RedisStream(feed) => feed.next_batch().await,
+            ActiveFeed::RedisStream(feed, connection_state) => {
+                let result = feed.next_batch().await;
+                connection_state.store(result.is_ok(), std::sync::atomic::Ordering::Relaxed);
+                result
+            }
         }
     }
 
     async fn commit(&mut self) -> anyhow::Result<()> {
         match self {
             ActiveFeed::Kafka(feed) => feed.commit().await,
-            ActiveFeed::RedisStream(feed) => feed.commit().await,
+            ActiveFeed::RedisStream(feed, _) => feed.commit().await,
         }
     }
 }
@@ -85,7 +97,7 @@ impl ActiveFeed {
     async fn check_gap(&mut self) -> anyhow::Result<Option<GapInfo>> {
         match self {
             ActiveFeed::Kafka(_) => Ok(None),
-            ActiveFeed::RedisStream(feed) => feed.check_gap().await,
+            ActiveFeed::RedisStream(feed, _) => feed.check_gap().await,
         }
     }
 }
@@ -115,15 +127,18 @@ async fn main() -> anyhow::Result<()> {
         MovementFeedBackend::Kafka => {
             ActiveFeed::Kafka(KafkaMovementFeed::connect(&config, connection_state)?)
         }
-        MovementFeedBackend::RedisStream => ActiveFeed::RedisStream(Box::new(
-            RedisStreamMovementFeed::connect(
-                &config.redis_url,
-                "full-coverage-consumer",
-                "full-coverage-consumer-1",
-                Duration::from_secs(config.redis_autoclaim_min_idle_secs),
-            )
-            .await?,
-        )),
+        MovementFeedBackend::RedisStream => ActiveFeed::RedisStream(
+            Box::new(
+                RedisStreamMovementFeed::connect(
+                    &config.redis_url,
+                    "full-coverage-consumer",
+                    "full-coverage-consumer-1",
+                    Duration::from_secs(config.redis_autoclaim_min_idle_secs),
+                )
+                .await?,
+            ),
+            connection_state,
+        ),
     };
     let redis_gap_check_interval = Duration::from_secs(config.redis_gap_check_secs);
     let mut last_redis_gap_check = tokio::time::Instant::now() - redis_gap_check_interval;
