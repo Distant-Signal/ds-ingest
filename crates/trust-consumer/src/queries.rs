@@ -15,14 +15,7 @@ pub async fn fetch_active_tracked_trains(
     url: &str,
     tokens: &OAuthTokenCache,
 ) -> anyhow::Result<Vec<TrackedTrainRef>> {
-    let token = tokens.get_token(client).await?;
-    let response = client
-        .get(url)
-        .bearer_auth(&token)
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(response.json().await?)
+    common::ingest::get_json(client, url, tokens).await
 }
 
 pub async fn fetch_stanox_crs(
@@ -30,14 +23,7 @@ pub async fn fetch_stanox_crs(
     url: &str,
     tokens: &OAuthTokenCache,
 ) -> anyhow::Result<Vec<common::StanoxCrsRecord>> {
-    let token = tokens.get_token(client).await?;
-    let response = client
-        .get(url)
-        .bearer_auth(&token)
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(response.json().await?)
+    common::ingest::get_json(client, url, tokens).await
 }
 
 pub async fn post_train_events(

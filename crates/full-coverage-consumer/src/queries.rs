@@ -28,18 +28,7 @@ pub async fn fetch_stanox_crs(
     url: &str,
     tokens: &common::oauth_client::OAuthTokenCache,
 ) -> anyhow::Result<Vec<common::StanoxCrsRecord>> {
-    // Identical to trust_consumer::queries::fetch_stanox_crs -- not
-    // extracted into trust-schema (Task 1's scope was parsing/dedup/
-    // journey only, deliberately not HTTP client code, which has no
-    // shared logic beyond "GET + bearer + deserialize," already trivial).
-    let token = tokens.get_token(client).await?;
-    let response = client
-        .get(url)
-        .bearer_auth(&token)
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(response.json().await?)
+    common::ingest::get_json(client, url, tokens).await
 }
 
 pub async fn post_full_coverage_stats(
