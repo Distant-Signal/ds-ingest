@@ -308,13 +308,63 @@ pub async fn run_once<F: MovementFeed>(
         let messages = trust_schema::schema::parse_batch(&raw)
             .with_context(|| format!("raw payload: {raw}"))?;
         for message in messages {
+            // Metrics recording, not a change to this function's return
+            // value or any behavior the 25 existing tests in this module
+            // assert on -- the same "tolerated side effect inside an
+            // otherwise value-returning function" posture this codebase
+            // already takes with logging (e.g. `schema.rs`'s own
+            // warn-and-drop). Labelled with the SAME raw msg_type string
+            // `movement-relay`'s own `movement_relay_events_published_total`
+            // counter uses (`crates/movement-relay/src/main.rs`), so the
+            // two are directly comparable side by side: published vs.
+            // received, per type, answering "is trust-consumer actually
+            // seeing what movement-relay is sending it."
+            metrics::counter!(
+                common::metrics::metric_name("trust_consumer_events_received_total"),
+                "msg_type" => msg_type_label(&message)
+            )
+            .increment(1);
             if let Some(event) = process_message(&message, reference, state, stanox_crs) {
+                metrics::counter!(common::metrics::metric_name(
+                    "trust_consumer_events_matched_total"
+                ))
+                .increment(1);
                 events.push(event);
             }
         }
     }
 
     Ok(events)
+}
+
+/// The raw `msg_type` string this `TrustMessage` was parsed from -- the
+/// same strings `trust_schema::schema::parse_envelope`'s own match arms
+/// dispatch on ("0001"/"0002"/"0003"/"0006"/"0007"), reconstructed here
+/// (rather than carried on the enum itself, which has no reason to know
+/// about its own wire tag once parsed) purely so `run_once`'s metrics
+/// above can label by the same value `movement-relay` already labels its
+/// own publish counter with. `Unknown` already carries its own raw
+/// `msg_type` string for exactly this kind of use.
+fn msg_type_label(message: &TrustMessage) -> &'static str {
+    match message {
+        TrustMessage::Activation(_) => "0001",
+        TrustMessage::Cancellation(_) => "0002",
+        TrustMessage::Movement(_) => "0003",
+        TrustMessage::ChangeOfOrigin(_) => "0006",
+        TrustMessage::ChangeOfIdentity(_) => "0007",
+        // Genuinely reachable under the Kafka backend (`process_message`'s
+        // own `Unknown` arm below logs and drops these) -- `parse_batch`
+        // does NOT filter them out itself (confirmed against
+        // `schema.rs`'s own test asserting `Unknown` surfaces in its
+        // output). Under the redis-stream backend this should be rare to
+        // absent in practice, since `movement-relay`'s own
+        // `confirmed_envelope_bodies` already drops unconfirmed types
+        // before ever publishing to Redis -- but this crate can still run
+        // against direct Kafka (`MovementFeedBackend::Kafka`), where no
+        // such upstream filter exists, so this label stays real rather
+        // than theoretical.
+        TrustMessage::Unknown(_) => "unknown",
+    }
 }
 
 fn process_message(
