@@ -17,6 +17,7 @@ use std::time::Duration;
 use clap::Parser;
 use config::Config;
 use event_sink::{EventSink, RedisEventSink};
+use health_http::ConnectionState;
 use kafka_source::{KafkaRawSource, RawKafkaSource};
 
 #[tokio::main]
@@ -31,8 +32,13 @@ async fn main() -> anyhow::Result<()> {
         common::metrics::install(config.metrics_port)?;
     }
 
-    let ready: health::ReadyState = Arc::new(AtomicBool::new(false));
-    health::spawn(config.health_bind_url.clone(), Arc::clone(&ready));
+    let ready: ConnectionState = Arc::new(AtomicBool::new(false));
+    health_http::spawn_with_state(
+        config.health_bind_url.clone(),
+        Arc::clone(&ready),
+        "partitions assigned",
+        "no confirmed partition assignment",
+    );
 
     let mut source = KafkaRawSource::connect(&config, ready)?;
     let mut sink = RedisEventSink::connect(&config.redis_url).await?;

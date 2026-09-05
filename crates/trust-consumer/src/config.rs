@@ -8,29 +8,12 @@ fn parse_stanox_crs(path: &str) -> anyhow::Result<StanoxCrsTable> {
     StanoxCrsTable::from_file(Path::new(path))
 }
 
-/// Which transport this crate's `MovementFeed` uses. See
-/// docs/superpowers/plans/2026-09-04-movement-relay-plan.md, "Judgment
-/// calls," item 5, for why this exists: Deploy A ships this defaulting to
-/// `kafka` (zero behavior change); Deploy B's B3 step flips it to
-/// `redis-stream` via a Helm value, with no new code merge at cutover
-/// time.
-#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
-pub enum MovementFeedBackend {
-    /// Today's production default -- a direct Kafka consumer via
-    /// `feed::kafka::KafkaMovementFeed`. Unchanged behavior from before
-    /// this plan.
-    Kafka,
-    /// The new Redis Streams reader
-    /// (`movement_feed::redis_stream::RedisStreamMovementFeed`), reading
-    /// what `movement-relay` publishes. Selected only once
-    /// docs/superpowers/specs/2026-09-04-movement-relay-design.md's
-    /// Deploy B has moved the real Kafka credential over to
-    /// `movement-relay` -- selecting this BEFORE that happens means this
-    /// crate simply reads nothing (the stream/group exist but
-    /// `movement-relay` was never enabled to publish into them), not a
-    /// crash -- a safe, if useless, misconfiguration.
-    RedisStream,
-}
+/// Which transport this crate's `MovementFeed` uses -- now defined once in
+/// `movement_feed`, re-exported here so every existing
+/// `use config::{Config, MovementFeedBackend};` import (and this file's own
+/// `#[arg(..., value_enum, default_value_t = MovementFeedBackend::Kafka)]`)
+/// keeps resolving unchanged.
+pub use movement_feed::MovementFeedBackend;
 
 /// CLI/env configuration for the `trust-consumer` service.
 ///

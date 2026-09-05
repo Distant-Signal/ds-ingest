@@ -1,16 +1,11 @@
 use clap::Parser;
 use common::config::{LineCatalogue, parse_lines};
 
-/// Which transport this crate's `MovementFeed` uses. Verbatim copy of
-/// `trust-consumer/src/config.rs`'s own enum -- see that file's doc for the
-/// full reasoning; kept as two independent enums (rather than a shared
-/// type) since each crate owns its own `Config` struct and clap derive
-/// needs the enum in scope either way.
-#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
-pub enum MovementFeedBackend {
-    Kafka,
-    RedisStream,
-}
+/// Which transport this crate's `MovementFeed` uses -- now defined once in
+/// `movement_feed`, re-exported here so every existing
+/// `use config::{Config, MovementFeedBackend};` import keeps resolving
+/// unchanged.
+pub use movement_feed::MovementFeedBackend;
 
 /// CLI/env configuration for the `full-coverage-consumer` service -- a
 /// second, independent Kafka consumer against the same RDM Train

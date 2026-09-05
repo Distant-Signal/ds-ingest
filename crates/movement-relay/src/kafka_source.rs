@@ -22,7 +22,7 @@ use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
 
 use crate::config::Config;
-use crate::health::{ReadyState, RelayContext};
+use crate::health::RelayContext;
 
 #[async_trait]
 pub trait RawKafkaSource: Send {
@@ -46,7 +46,7 @@ impl KafkaRawSource {
     /// way `trust-consumer`'s `KafkaMovementFeed` uses its
     /// `connection_state` flag -- the one structural divergence from that
     /// crate's copy beyond the return-shape difference.
-    pub fn connect(config: &Config, ready: ReadyState) -> anyhow::Result<Self> {
+    pub fn connect(config: &Config, ready: health_http::ConnectionState) -> anyhow::Result<Self> {
         let context = RelayContext { ready };
         let consumer: StreamConsumer<RelayContext> = ClientConfig::new()
             .set("bootstrap.servers", &config.kafka.kafka_brokers)

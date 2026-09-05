@@ -8,9 +8,10 @@ use rdkafka::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
 
+use health_http::ConnectionState;
+
 use super::MovementFeed;
 use crate::config::Config;
-use crate::health::ConnectionState;
 
 pub struct KafkaMovementFeed {
     consumer: StreamConsumer,
@@ -74,7 +75,7 @@ impl MovementFeed for KafkaMovementFeed {
     async fn next_batch(&mut self) -> anyhow::Result<Vec<String>> {
         match self.consumer.recv().await {
             Ok(message) => {
-                crate::health::set_connected(&self.connection_state, true);
+                health_http::set_connected(&self.connection_state, "trust_consumer_ready", true);
                 let payload = message
                     .payload()
                     .ok_or_else(|| anyhow::anyhow!("empty Kafka message payload"))?;
@@ -90,7 +91,7 @@ impl MovementFeed for KafkaMovementFeed {
                 Ok(vec![batch])
             }
             Err(err) => {
-                crate::health::set_connected(&self.connection_state, false);
+                health_http::set_connected(&self.connection_state, "trust_consumer_ready", false);
                 Err(err.into())
             }
         }

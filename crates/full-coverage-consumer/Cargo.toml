@@ -6,11 +6,11 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"
-axum = { version = "0.8.9", features = ["http2"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.6", features = ["derive", "env"] }
 common = { path = "../common" }
 dotenv = "0.15.0"
+health-http = { path = "../health-http" }
 metrics = "0.24"
 movement-feed = { path = "../movement-feed" }
 rdkafka = { version = "0.39.0", features = ["cmake-build", "ssl", "sasl"] }

@@ -16,7 +16,10 @@
 //! `MovementFeed` implementer. This crate is consumed only by the two
 //! downstream Redis Streams readers.
 
+pub mod active_feed;
 pub mod redis_stream;
+
+pub use active_feed::{ActiveFeed, MovementFeedBackend};
 
 use async_trait::async_trait;
 

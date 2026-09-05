@@ -7,7 +7,6 @@
 mod config;
 mod eta;
 mod feed;
-mod health;
 mod matching;
 mod process;
 mod queries;
@@ -19,74 +18,8 @@ use clap::Parser;
 use config::{Config, MovementFeedBackend};
 use feed::MovementFeed;
 use feed::kafka::KafkaMovementFeed;
-use movement_feed::redis_stream::{GapInfo, RedisStreamMovementFeed};
-
-/// Wraps whichever concrete `MovementFeed` this deployment selected
-/// (`config::MovementFeedBackend`) behind one type, delegating
-/// `MovementFeed`'s two methods to whichever variant is active. A `Box<dyn
-/// MovementFeed>` would work for `next_batch`/`commit` alone, but
-/// `check_gap` (Task 4) is a `RedisStreamMovementFeed`-only inherent
-/// method, not part of the `MovementFeed` trait -- deliberately, since
-/// `KafkaMovementFeed` has no analog -- so it isn't reachable through a
-/// trait object without a downcast. This repo's existing code never does
-/// `Box<dyn Any>`-style downcasting anywhere, so a small manual enum is
-/// preferred here instead.
-enum ActiveFeed {
-    Kafka(KafkaMovementFeed),
-    // Boxed: RedisStreamMovementFeed is >5x KafkaMovementFeed's size
-    // (clippy::large_enum_variant), so boxing keeps every ActiveFeed value
-    // -- including the Kafka variant, the one actually used in production
-    // today -- from paying for the larger variant's stack space.
-    //
-    // The second field is a real bug fix, not part of the original design:
-    // `RedisStreamMovementFeed::connect` (unlike `KafkaMovementFeed::connect`)
-    // never received `connection_state` at all, so under this backend
-    // health::healthz's `/healthz` endpoint stayed permanently
-    // SERVICE_UNAVAILABLE -- confirmed live during Deploy B's B3 step: the
-    // pod restart-looped on a failing liveness probe despite genuinely
-    // healthy Redis Streams reads. `KafkaMovementFeed` updates
-    // connection_state from *inside* its own next_batch
-    // (feed/kafka.rs:76-95); RedisStreamMovementFeed lives in the separate
-    // movement-feed crate and has no dependency on this crate's health
-    // module (by design -- it's shared with full-coverage-consumer, which
-    // has its own separate ConnectionState type), so the equivalent update
-    // happens here instead, at the ActiveFeed::next_batch call site below.
-    RedisStream(Box<RedisStreamMovementFeed>, health::ConnectionState),
-}
-
-#[async_trait::async_trait]
-impl MovementFeed for ActiveFeed {
-    async fn next_batch(&mut self) -> anyhow::Result<Vec<String>> {
-        match self {
-            ActiveFeed::Kafka(feed) => feed.next_batch().await,
-            ActiveFeed::RedisStream(feed, connection_state) => {
-                let result = feed.next_batch().await;
-                health::set_connected(connection_state, result.is_ok());
-                result
-            }
-        }
-    }
-
-    async fn commit(&mut self) -> anyhow::Result<()> {
-        match self {
-            ActiveFeed::Kafka(feed) => feed.commit().await,
-            ActiveFeed::RedisStream(feed, _) => feed.commit().await,
-        }
-    }
-}
-
-impl ActiveFeed {
-    /// `Ok(None)` immediately for the `Kafka` variant (no analog); delegates
-    /// to `RedisStreamMovementFeed::check_gap` for the `RedisStream`
-    /// variant. See docs/superpowers/specs/2026-09-04-movement-relay-design.md
-    /// Decision 2's "definitive gap detection."
-    async fn check_gap(&mut self) -> anyhow::Result<Option<GapInfo>> {
-        match self {
-            ActiveFeed::Kafka(_) => Ok(None),
-            ActiveFeed::RedisStream(feed, _) => feed.check_gap().await,
-        }
-    }
-}
+use movement_feed::ActiveFeed;
+use movement_feed::redis_stream::RedisStreamMovementFeed;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -100,7 +33,8 @@ async fn main() -> anyhow::Result<()> {
     if config.metrics.metrics_enabled {
         common::metrics::install(config.metrics_port)?;
     }
-    let connection_state = health::spawn(config.health_bind_url.clone());
+    let connection_state =
+        health_http::spawn(config.health_bind_url.clone(), "connected", "disconnected");
     let http = reqwest::Client::new();
     let internal_oauth = config.internal_oauth.token_cache();
 
@@ -119,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
                 .await?,
             ),
             connection_state,
+            "trust_consumer_ready",
         ),
     };
     let redis_gap_check_interval = Duration::from_secs(config.redis_gap_check_secs);
