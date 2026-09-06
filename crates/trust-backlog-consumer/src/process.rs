@@ -39,6 +39,18 @@ use crate::stanox_crs::StanoxCrsTable;
 #[derive(Debug, Default)]
 pub struct ProcessorState {
     pub pending_service_dates: HashMap<String, NaiveDate>,
+    /// `train_id -> train_uid`, populated identically to
+    /// `pending_service_dates` (same Activation message, same lifetime --
+    /// see this module's own doc comment). Closes the gap named in
+    /// docs/superpowers/specs/2026-09-06-shared-train-identity-design.md §3:
+    /// this consumer is now the PRIMARY writer for the shared trains/
+    /// train_movement_events tables, and a real train_uid on every event
+    /// is what lets `api` key a Movement into the right `trains` row at
+    /// all. Never removed on read (unlike trust-consumer's own
+    /// one-shot-claim `pending_activations`) -- a train's whole
+    /// Activation-to-Cancellation lifetime may span many Movements, every
+    /// one of which needs the same train_uid, not just the first.
+    pub pending_train_uids: HashMap<String, String>,
 }
 
 pub fn process_message(
@@ -57,6 +69,9 @@ pub fn process_message(
             state
                 .pending_service_dates
                 .insert(activation.train_id.clone(), service_date);
+            state
+                .pending_train_uids
+                .insert(activation.train_id.clone(), activation.train_uid.clone());
 
             let dedup =
                 trust_schema::dedup::dedup_key(&activation.train_id, "0001", None, None, None);
@@ -119,8 +134,7 @@ pub fn process_message(
 
             Some(common::TrustBacklogEventMessage {
                 crs: Some(loc_crs),
-                train_uid: None, // this consumer doesn't correlate Activation->Movement in-process;
-                // api's own backlog-match (Task 5) joins them at read time instead.
+                train_uid: state.pending_train_uids.get(&movement.train_id).cloned(),
                 train_id: movement.train_id.clone(),
                 service_date,
                 msg_type: "0003".to_string(),
@@ -149,7 +163,7 @@ pub fn process_message(
 
             Some(common::TrustBacklogEventMessage {
                 crs: None,
-                train_uid: None,
+                train_uid: state.pending_train_uids.get(&cancellation.train_id).cloned(),
                 train_id: cancellation.train_id.clone(),
                 service_date,
                 msg_type: "0002".to_string(),
@@ -374,5 +388,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.service_date, today());
+    }
+
+    #[test]
+    fn a_movement_after_a_parked_activation_carries_the_real_train_uid() {
+        let activation_msg = TrustMessage::Activation(activation("221832406", "C21373", "2026-09-05"));
+        let mut state = ProcessorState::default();
+        process_message(
+            &activation_msg,
+            &mut state,
+            &stanox_table(),
+            &crs_index_with(&["WAT"]),
+            today(),
+        );
+
+        let movement_msg = TrustMessage::Movement(movement(
+            "221832406",
+            "DEPARTURE",
+            Some("87212"),
+            Some("ON TIME"),
+        ));
+        let result = process_message(
+            &movement_msg,
+            &mut state,
+            &stanox_table(),
+            &crs_index_with(&["WAT"]),
+            today(),
+        )
+        .unwrap();
+        assert_eq!(result.train_uid, Some("C21373".to_string()));
+    }
+
+    #[test]
+    fn a_movement_with_no_parked_activation_still_carries_no_train_uid() {
+        // The accepted, unavoidable gap this task's own doc comment names --
+        // an Activation this process never saw leaves nothing to attach.
+        let message = TrustMessage::Movement(movement(
+            "999999999",
+            "DEPARTURE",
+            Some("87212"),
+            Some("ON TIME"),
+        ));
+        let mut state = ProcessorState::default();
+        let result = process_message(
+            &message,
+            &mut state,
+            &stanox_table(),
+            &crs_index_with(&["WAT"]),
+            today(),
+        )
+        .unwrap();
+        assert_eq!(result.train_uid, None);
     }
 }
