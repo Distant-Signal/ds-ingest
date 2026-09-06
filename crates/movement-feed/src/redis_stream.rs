@@ -40,9 +40,12 @@ pub struct RedisStreamMovementFeed {
 }
 
 impl RedisStreamMovementFeed {
-    /// `group` is one of the two fixed literals (`"trust-consumer"` /
-    /// `"full-coverage-consumer"`) -- see each crate's own `main.rs` call
-    /// site (Task 4). `consumer` is a fixed per-deployment name (e.g.
+    /// `group` is one of a small number of fixed literals
+    /// (`"trust-consumer"` / `"full-coverage-consumer"` /
+    /// `"trust-event-backlog"`, one per consumer crate) -- see each
+    /// crate's own `main.rs` call site (Task 4;
+    /// docs/superpowers/plans/2026-09-05-trust-event-backlog-plan.md
+    /// Task 10 for the third). `consumer` is a fixed per-deployment name (e.g.
     /// `"trust-consumer-1"`), matching `enricher::stream::CONSUMER`'s own
     /// one-fixed-name convention and this design's own
     /// single-replica constraint (design doc Decision 2).
@@ -653,6 +656,88 @@ mod redis_tests {
 
         let gap = feed.check_gap().await.unwrap();
         assert_eq!(gap, None, "no trimming has happened, so there is no gap");
+
+        cleanup(&stream).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn three_independent_consumer_groups_each_receive_every_entry_independently() {
+        let stream = unique_stream("three-groups");
+
+        // Mirrors this plan's real deployment shape: trust-consumer,
+        // full-coverage-consumer, and trust-backlog-consumer are three
+        // independent named groups on the SAME stream.
+        let mut trust_consumer = RedisStreamMovementFeed::connect_for_test(
+            &redis_url(),
+            &stream,
+            "trust-consumer",
+            "trust-consumer-1",
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+        let mut full_coverage_consumer = RedisStreamMovementFeed::connect_for_test(
+            &redis_url(),
+            &stream,
+            "full-coverage-consumer",
+            "full-coverage-consumer-1",
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+        let mut trust_backlog_consumer = RedisStreamMovementFeed::connect_for_test(
+            &redis_url(),
+            &stream,
+            "trust-event-backlog",
+            "trust-event-backlog-1",
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+
+        xadd(&stream, "payload-1").await;
+
+        // Each group's own startup PEL-replay pass is legitimately empty
+        // first (see this module's own doc comment on every other test here),
+        // then the SAME entry is delivered to all three independently.
+        trust_consumer.next_batch().await.unwrap();
+        full_coverage_consumer.next_batch().await.unwrap();
+        trust_backlog_consumer.next_batch().await.unwrap();
+
+        let a = trust_consumer.next_batch().await.unwrap();
+        let b = full_coverage_consumer.next_batch().await.unwrap();
+        let c = trust_backlog_consumer.next_batch().await.unwrap();
+
+        assert_eq!(
+            a,
+            vec!["payload-1".to_string()],
+            "trust-consumer must see the entry"
+        );
+        assert_eq!(
+            b,
+            vec!["payload-1".to_string()],
+            "full-coverage-consumer must ALSO see the same entry"
+        );
+        assert_eq!(
+            c,
+            vec!["payload-1".to_string()],
+            "trust-backlog-consumer must ALSO see the same entry -- proving the third group does not steal it from, or split it with, the other two"
+        );
+
+        // Each group acks independently -- one group's XACK must not affect
+        // another's own pending-entries list.
+        trust_consumer.commit().await.unwrap();
+        let pending_full_coverage: redis::streams::StreamPendingCountReply = full_coverage_consumer
+            .conn
+            .xpending_count(&stream, "full-coverage-consumer", "-", "+", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            pending_full_coverage.ids.len(),
+            1,
+            "full-coverage-consumer's own pending entry must be unaffected by trust-consumer's ack"
+        );
 
         cleanup(&stream).await;
     }
