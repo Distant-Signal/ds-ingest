@@ -983,9 +983,11 @@ mod tests {
     /// Movement can still claim it via the ordinary CRS+time heuristic.
     #[tokio::test]
     async fn a_schedule_matched_ref_is_treated_as_pending_for_rehydration_and_can_still_be_claimed()
-     {
+    {
         let mut feed = FakeMovementFeed::new(vec![vec![ORIGIN_DEPARTURE.to_string()]]);
-        let mut reference = Reference { pending: Vec::new() };
+        let mut reference = Reference {
+            pending: Vec::new(),
+        };
         let mut state = ProcessorState::default();
 
         let mut schedule_matched_ref = tracked_ref(1, "schedule_matched", None);

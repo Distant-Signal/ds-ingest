@@ -34,8 +34,7 @@ pub fn resolve_origin_departure(
         .iter()
         .find(|pin| {
             pin.pin_origin_crs.eq_ignore_ascii_case(loc_crs)
-                && (pin.pin_scheduled_departure - actual_timestamp).abs()
-                    <= common::MATCH_TOLERANCE
+                && (pin.pin_scheduled_departure - actual_timestamp).abs() <= common::MATCH_TOLERANCE
         })
         .map(|pin| pin.tracked_train_id)
 }
