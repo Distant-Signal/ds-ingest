@@ -15,22 +15,16 @@ pub struct PendingPin {
     pub pin_scheduled_departure: DateTime<Utc>,
 }
 
-/// How far apart a pin's scheduled departure and an observed origin
-/// departure event can be and still be considered the same real-world
-/// service. Wide enough to survive a train running late from origin (the
-/// single most common case), narrow enough that two different services
-/// from the same station rarely both fall inside it.
-const MATCH_TOLERANCE: chrono::Duration = chrono::Duration::minutes(20);
-
 /// `loc_crs` is the origin-departure Movement event's location, already
 /// translated from STANOX by the caller (see Task 11's translation table).
 /// Returns the first pending pin whose origin CRS matches and whose
-/// scheduled departure is within `MATCH_TOLERANCE` of `actual_timestamp`.
-/// If more than one pending pin matches (two users pinned trains that
-/// happen to depart the same station within the tolerance window), the
-/// earliest-created pin wins -- `pending` is expected to be pre-sorted by
-/// `tracked_at` by the caller; this function itself stays a simple
-/// first-match scan rather than re-deriving an ordering it shouldn't own.
+/// scheduled departure is within `common::MATCH_TOLERANCE` of
+/// `actual_timestamp`. If more than one pending pin matches (two users
+/// pinned trains that happen to depart the same station within the
+/// tolerance window), the earliest-created pin wins -- `pending` is
+/// expected to be pre-sorted by `tracked_at` by the caller; this function
+/// itself stays a simple first-match scan rather than re-deriving an
+/// ordering it shouldn't own.
 pub fn resolve_origin_departure(
     loc_crs: &str,
     actual_timestamp: DateTime<Utc>,
@@ -40,7 +34,8 @@ pub fn resolve_origin_departure(
         .iter()
         .find(|pin| {
             pin.pin_origin_crs.eq_ignore_ascii_case(loc_crs)
-                && (pin.pin_scheduled_departure - actual_timestamp).abs() <= MATCH_TOLERANCE
+                && (pin.pin_scheduled_departure - actual_timestamp).abs()
+                    <= common::MATCH_TOLERANCE
         })
         .map(|pin| pin.tracked_train_id)
 }

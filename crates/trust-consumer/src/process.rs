@@ -216,7 +216,14 @@ pub fn apply_reference_reload(
 
     for tracked in refs {
         match tracked.resolution_status.as_str() {
-            "pending" => pending.push(crate::matching::PendingPin {
+            // `schedule_matched` is treated exactly like `pending` here --
+            // it already carries a `train_uid` (irrelevant to this
+            // matching heuristic, which only ever compares CRS + time,
+            // never train_uid), but it still has no `train_id`, so it
+            // must stay eligible for the same live-Movement claim a plain
+            // `pending` row is (Decision 3 of
+            // docs/superpowers/specs/2026-09-05-schedule-first-train-tracking-design.md).
+            "pending" | "schedule_matched" => pending.push(crate::matching::PendingPin {
                 tracked_train_id: tracked.id,
                 pin_origin_crs: tracked.pin_origin_crs,
                 pin_scheduled_departure: tracked.pin_scheduled_departure,
@@ -967,6 +974,41 @@ mod tests {
         assert_eq!(
             events[0].resolved_train_id, None,
             "rehydration is not a fresh resolution"
+        );
+    }
+
+    /// The exact scenario this task exists for: a schedule-matched pin (a
+    /// real `train_uid` already known, no `train_id` yet) must be rehydrated
+    /// into `reference.pending` -- NOT `state.resolved` -- so a live TRUST
+    /// Movement can still claim it via the ordinary CRS+time heuristic.
+    #[tokio::test]
+    async fn a_schedule_matched_ref_is_treated_as_pending_for_rehydration_and_can_still_be_claimed()
+     {
+        let mut feed = FakeMovementFeed::new(vec![vec![ORIGIN_DEPARTURE.to_string()]]);
+        let mut reference = Reference { pending: Vec::new() };
+        let mut state = ProcessorState::default();
+
+        let mut schedule_matched_ref = tracked_ref(1, "schedule_matched", None);
+        schedule_matched_ref.train_uid = Some("C88888".to_string()); // known from the schedule match
+        schedule_matched_ref.pin_origin_crs = "WAT".to_string();
+        schedule_matched_ref.pin_scheduled_departure = "2026-08-28T18:32:00Z".parse().unwrap();
+
+        apply_reference_reload(vec![schedule_matched_ref], &mut reference, &mut state);
+        assert_eq!(
+            reference.pending.len(),
+            1,
+            "a schedule_matched ref must be rehydrated as a matchable pending pin"
+        );
+
+        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tracked_train_id, 1);
+        assert_eq!(
+            events[0].resolved_train_id,
+            Some("221832406".to_string()),
+            "the live Movement still claims it via the ordinary heuristic, unchanged"
         );
     }
 
