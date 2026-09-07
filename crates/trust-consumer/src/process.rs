@@ -46,7 +46,7 @@
 //!
 //! The consequence is confined to database-level status staleness and
 //! whatever display depends on it. Tracking itself stays correct -- events
-//! keep flowing against the right `tracked_train_id`, because that comes
+//! keep flowing against the right `tracked_train_id`s, because those come
 //! from `state.resolved`, not from the DB's status column. Closing the gap
 //! properly means either relaxing `crates/api`'s two-field guard (which
 //! reopens already-reviewed Task 4 work) or restructuring when this module
@@ -128,15 +128,25 @@ use crate::feed::MovementFeed;
 /// (feed, reference, state) -> events.
 pub struct Reference {
     pub pending: Vec<crate::matching::PendingPin>,
-    /// `train_uid -> tracked_train_id`, for every active ref whose
-    /// identity is already known (a schedule match, or an NR-primary
-    /// subscription created via `POST /Train/by-uid/.../track`, Task 20).
-    /// Checked FIRST on every Activation
+    /// `train_uid -> EVERY subscription that shares it`, for every active
+    /// ref whose identity is already known (a schedule match, or an
+    /// NR-primary subscription created via `POST /Train/by-uid/.../track`,
+    /// Task 20). Checked FIRST on every Activation
     /// (docs/superpowers/specs/2026-09-06-shared-train-identity-design.md §3)
-    /// -- strictly more reliable than the ±20-minute CRS+time heuristic
+    /// -- strictly more reliable than the +/-20-minute CRS+time heuristic
     /// `matching::resolve_origin_departure` still exists for pins that
     /// genuinely lack this.
-    pub by_train_uid: HashMap<String, i64>,
+    ///
+    /// `Vec<i64>`, not `i64` (review finding I6). "Two subscribers sharing
+    /// one physical train" is the headline scenario the whole shared-train
+    /// redesign exists to support, and one `train_uid` therefore maps to as
+    /// many subscriptions as there are subscribers. The old single-valued
+    /// map meant a blind `.insert` in `apply_reference_reload` silently
+    /// overwrote every subscriber but the last one this loop happened to
+    /// visit, so exactly one of them ever flipped to `'resolved'` -- the
+    /// rest sat at `'pending'` forever while the train was visibly
+    /// running.
+    pub by_train_uid: HashMap<String, Vec<i64>>,
     /// `tracked_train_id -> trains_id`, for every active ref that has one
     /// (regardless of resolution_status -- an already-`resolved`
     /// subscription still needs its later movements forwarded). Feeds
@@ -157,13 +167,25 @@ pub struct Reference {
 /// field, not a signature change rippling through every call site and test.
 #[derive(Debug, Default)]
 pub struct ProcessorState {
-    /// `train_id -> tracked_train_id`, populated the first time a Movement
-    /// resolves a pending pin. Consulted FIRST by every message type: a
-    /// train_id in here is already attributed, so it must never go back
-    /// through `matching::resolve_origin_departure` (that function matches
-    /// *origin departures* against pins; re-running it on a mid-journey
-    /// event would at best fail and at worst mis-attribute).
-    pub resolved: HashMap<String, i64>,
+    /// `train_id -> EVERY subscription attributed to it`. Consulted FIRST
+    /// by every message type: a train_id in here is already attributed, so
+    /// it must never go back through `matching::resolve_origin_departure`
+    /// (that function matches *origin departures* against pins; re-running
+    /// it on a mid-journey event would at best fail and at worst
+    /// mis-attribute).
+    ///
+    /// `Vec<i64>` for the same reason as `Reference::by_train_uid` above
+    /// (review finding I6) -- and it has to change in lockstep with it,
+    /// since the Activation fast path writes straight from one into the
+    /// other. Every message for a train_id now fans out to one event per
+    /// subscription in this list; see `process_message`'s own return type.
+    ///
+    /// Entries are unioned, never replaced: a subscription already here
+    /// stays, and a newly-seen one is appended. The two writers that add to
+    /// it (an Activation's `by_train_uid` match, and a Movement's CRS+time
+    /// claim) can both legitimately fire for the same train_id at different
+    /// times.
+    pub resolved: HashMap<String, Vec<i64>>,
 
     /// `train_id -> parked Activation`, populated by `0001` messages. An
     /// Activation alone can't resolve a pin (per Task 10: this app has no
@@ -227,16 +249,18 @@ pub struct PendingActivation {
 ///    doc comment names this consumer as the reason those already-resolved
 ///    refs are returned at all.
 ///
-/// Seeding uses `entry().or_insert()`, never a blind insert: a resolution
-/// this process made in memory is strictly fresher than a row that may have
-/// been read before it was written, so the live value always wins.
+/// Seeding UNIONS into `state.resolved` rather than replacing it: a
+/// resolution this process made in memory is strictly fresher than a row
+/// that may have been read before it was written, so it is never dropped --
+/// but a subscription the reload knows about and this process hasn't seen
+/// yet is added alongside it rather than being discarded.
 pub fn apply_reference_reload(
     refs: Vec<common::TrackedTrainRef>,
     reference: &mut Reference,
     state: &mut ProcessorState,
 ) {
     let mut pending = Vec::new();
-    let mut by_train_uid = HashMap::new();
+    let mut by_train_uid: HashMap<String, Vec<i64>> = HashMap::new();
     let mut trains_id_by_tracked_train_id = HashMap::new();
 
     for tracked in refs {
@@ -255,7 +279,15 @@ pub fn apply_reference_reload(
             // direct match first.
             "pending" | "schedule_matched" => {
                 if let Some(train_uid) = &tracked.train_uid {
-                    by_train_uid.insert(train_uid.clone(), tracked.id);
+                    // Push, never `insert` (review finding I6): a blind
+                    // single-value insert kept only whichever subscriber
+                    // this loop visited last, which is precisely how two
+                    // people tracking the same train ended up with one of
+                    // them stuck at `'pending'` forever.
+                    by_train_uid
+                        .entry(train_uid.clone())
+                        .or_default()
+                        .push(tracked.id);
                 }
                 // `pin_origin_crs`/`pin_scheduled_departure` are `None` for
                 // an NR-primary subscription (Task 20) whose `trains` row
@@ -276,7 +308,14 @@ pub fn apply_reference_reload(
             }
             "resolved" => {
                 if let Some(train_id) = tracked.train_id {
-                    state.resolved.entry(train_id).or_insert(tracked.id);
+                    // Union, not `or_insert` of a single value: several
+                    // already-`resolved` subscriptions can share one
+                    // `train_id`, and every one of them still needs its
+                    // later movements attributed after a restart.
+                    let ids = state.resolved.entry(train_id).or_default();
+                    if !ids.contains(&tracked.id) {
+                        ids.push(tracked.id);
+                    }
                 }
             }
             _ => {}
@@ -347,14 +386,29 @@ pub fn apply_stanox_crs_reload(
 /// known `trains_id` yet -- exactly the same accepted gap named throughout
 /// this plan (a subscription whose identity, and therefore trains_id, is
 /// still unknown has nothing to forward a signal about).
+///
+/// Deduplicated by `trains_id`, first occurrence winning. This became
+/// load-bearing with review finding I6's fix: `process_message` now fans one
+/// TRUST message out to one event per subscriber sharing the train, and
+/// every one of those carries the SAME `trains_id`, so an undeduplicated
+/// build would enqueue N identical forwarding rows for one real-world
+/// event. `notifier` reads the queue with `SELECT DISTINCT trains_id`
+/// (`crates/notifier/src/queries.rs`), so the duplicates were never going to
+/// produce duplicate notifications -- this keeps them out of the queue
+/// table in the first place, where they would otherwise scale with a
+/// popular train's subscriber count.
 pub fn build_forward_signals(
     events: &[common::TrainMovementEventMessage],
     trains_id_by_tracked_train_id: &HashMap<i64, i64>,
 ) -> Vec<common::TrainForwardSignalMessage> {
+    let mut seen: HashSet<i64> = HashSet::new();
     events
         .iter()
         .filter_map(|event| {
             let trains_id = *trains_id_by_tracked_train_id.get(&event.tracked_train_id)?;
+            if !seen.insert(trains_id) {
+                return None;
+            }
             Some(common::TrainForwardSignalMessage {
                 trains_id,
                 event_summary: format!(
@@ -416,7 +470,12 @@ pub async fn run_once<F: MovementFeed>(
                 "msg_type" => msg_type_label(&message)
             )
             .increment(1);
-            if let Some(event) = process_message(&message, reference, state, stanox_crs) {
+            // One message can now produce MORE than one event -- one per
+            // subscription sharing the resolved train (review finding I6).
+            // The counter still counts events, not messages, so it stays
+            // directly comparable with `trust_consumer_events_received_total`
+            // in the same way it always was.
+            for event in process_message(&message, reference, state, stanox_crs) {
                 metrics::counter!(common::metrics::metric_name(
                     "trust_consumer_events_matched_total"
                 ))
@@ -459,12 +518,29 @@ fn msg_type_label(message: &TrustMessage) -> &'static str {
     }
 }
 
+/// Returns one event PER SUBSCRIPTION attributed to this message's train
+/// -- an empty `Vec` for a message that resolves nothing, one element in
+/// the ordinary single-subscriber case, and N for N subscribers sharing one
+/// physical train (review finding I6).
+///
+/// Fanning out here, rather than adding a subscription list to
+/// `common::TrainMovementEventMessage`, is deliberate and is the smaller of
+/// the two changes: that wire type is shared with `api`'s ingest route,
+/// `trust-backlog-consumer`, and `upsert_train_event`'s whole call path, and
+/// every one of those already treats a batch of events as the unit of work.
+/// The duplicated events are also genuinely cheap and safe on the receiving
+/// side: `upsert_train_movement` is keyed on `trains_id` (shared by all of
+/// them) with `ON CONFLICT DO NOTHING`/`DO UPDATE`, so the movement row is
+/// written once no matter how many arrive, and the only genuinely
+/// per-subscription work -- `flip_legacy_resolution`'s
+/// `resolution_status` update -- is exactly the thing that needs to happen
+/// once per subscriber and previously happened for only one of them.
 fn process_message(
     message: &TrustMessage,
     reference: &Reference,
     state: &mut ProcessorState,
     stanox_crs: &crate::stanox_crs::StanoxCrsTable,
-) -> Option<common::TrainMovementEventMessage> {
+) -> Vec<common::TrainMovementEventMessage> {
     match message {
         // An Activation never produces a posted event of its own -- it only
         // parks its train_uid for the Movement that eventually resolves a
@@ -475,15 +551,32 @@ fn process_message(
             // needs no location or timing coincidence at all. Only a
             // train_id not already resolved is eligible -- this must never
             // clobber an existing resolution.
-            if let Some(&tracked_train_id) = reference.by_train_uid.get(&activation.train_uid)
-                && !state.resolved.contains_key(&activation.train_id)
-            {
-                state
+            // EVERY subscription sharing this train_uid is attributed,
+            // not just one (review finding I6). Unioned rather than
+            // replaced, so an existing resolution -- from an earlier
+            // Activation, a CRS+time claim, or the reference reload's
+            // rehydration -- is never clobbered; only genuinely new
+            // subscriptions are added. The "freshly resolved" flag is
+            // raised only if something actually WAS added, so a redelivered
+            // Activation for a fully-attributed train doesn't make the next
+            // Movement re-announce a resolution.
+            if let Some(sharing) = reference.by_train_uid.get(&activation.train_uid) {
+                let attributed = state
                     .resolved
-                    .insert(activation.train_id.clone(), tracked_train_id);
-                state
-                    .activation_matched_awaiting_movement
-                    .insert(activation.train_id.clone());
+                    .entry(activation.train_id.clone())
+                    .or_default();
+                let mut added_any = false;
+                for &tracked_train_id in sharing {
+                    if !attributed.contains(&tracked_train_id) {
+                        attributed.push(tracked_train_id);
+                        added_any = true;
+                    }
+                }
+                if added_any {
+                    state
+                        .activation_matched_awaiting_movement
+                        .insert(activation.train_id.clone());
+                }
             }
             state.pending_activations.insert(
                 activation.train_id.clone(),
@@ -495,7 +588,7 @@ fn process_message(
                     schedule_end_date: activation.schedule_end_date.parse::<NaiveDate>().ok(),
                 },
             );
-            None
+            Vec::new()
         }
 
         TrustMessage::Movement(movement) => {
@@ -518,9 +611,9 @@ fn process_message(
 
             // Already-resolved train_ids short-circuit matching entirely;
             // only a genuinely unseen train_id is offered to the pins.
-            let (tracked_train_id, freshly_resolved) =
-                match state.resolved.get(&movement.train_id).copied() {
-                    Some(tracked_train_id) => {
+            let (tracked_train_ids, freshly_resolved) =
+                match state.resolved.get(&movement.train_id).cloned() {
+                    Some(tracked_train_ids) => {
                         // Already resolved -- either by this same branch on
                         // an earlier Movement, by the reference reload's
                         // rehydration, or (this task) by an Activation's
@@ -532,7 +625,7 @@ fn process_message(
                         let freshly_resolved = state
                             .activation_matched_awaiting_movement
                             .remove(&movement.train_id);
-                        (tracked_train_id, freshly_resolved)
+                        (tracked_train_ids, freshly_resolved)
                     }
                     None => {
                         // Only a DEPARTURE may claim a pin. `resolve_origin_departure`
@@ -549,17 +642,21 @@ fn process_message(
                         // reason as the `claimed` filter just below: that
                         // module stays a pure function of its arguments.
                         if movement.event_type != "DEPARTURE" {
-                            return None;
+                            return Vec::new();
                         }
 
-                        let actual_ts = actual?;
+                        let Some(actual_ts) = actual else {
+                            return Vec::new();
+                        };
                         // A pin can only ever be claimed by a Movement whose
                         // location translated to a real CRS -- an untranslated
                         // STANOX can never equal a pin's `pin_origin_crs`, so
                         // there's nothing to attempt a match against. This
                         // mirrors the existing early-returns just above for a
                         // missing `event_type`/`actual_timestamp`.
-                        let loc_crs_for_match = loc_crs.as_deref()?;
+                        let Some(loc_crs_for_match) = loc_crs.as_deref() else {
+                            return Vec::new();
+                        };
 
                         // A pin already claimed by some other train_id must not
                         // be offered again. `resolve_origin_departure` is a
@@ -569,7 +666,8 @@ fn process_message(
                         // the same tracked_train_id and flip-flop what the user
                         // sees. Filtering here rather than inside `matching`
                         // keeps that module a pure function of its arguments.
-                        let claimed: HashSet<i64> = state.resolved.values().copied().collect();
+                        let claimed: HashSet<i64> =
+                            state.resolved.values().flatten().copied().collect();
                         let unclaimed: Vec<crate::matching::PendingPin> = reference
                             .pending
                             .iter()
@@ -577,15 +675,27 @@ fn process_message(
                             .cloned()
                             .collect();
 
-                        let tracked_train_id = crate::matching::resolve_origin_departure(
+                        // Still a SINGLE claim, deliberately: this is the
+                        // legacy CRS+time heuristic, and letting one
+                        // departure claim every pin that happens to fall in
+                        // its tolerance window would re-open exactly the
+                        // mis-attribution the `claimed` filter above exists
+                        // to prevent. Subscribers sharing one physical train
+                        // are attributed through `by_train_uid` (which knows
+                        // their identity for certain), not through this
+                        // guess. See this fix's report for the residual
+                        // limitation this leaves.
+                        let Some(tracked_train_id) = crate::matching::resolve_origin_departure(
                             loc_crs_for_match,
                             actual_ts,
                             &unclaimed,
-                        )?;
+                        ) else {
+                            return Vec::new();
+                        };
                         state
                             .resolved
-                            .insert(movement.train_id.clone(), tracked_train_id);
-                        (tracked_train_id, true)
+                            .insert(movement.train_id.clone(), vec![tracked_train_id]);
+                        (vec![tracked_train_id], true)
                     }
                 };
 
@@ -606,6 +716,9 @@ fn process_message(
             // `common::TrainMovementEventMessage`'s docs); the train_uid is
             // whatever an earlier Activation parked, or `None` if this
             // process never saw one.
+            // Carried on EVERY event this message fans out to, not just
+            // the first: each one drives `flip_legacy_resolution` for its
+            // own subscription, and that flip is the whole point.
             let (resolved_train_uid, resolved_train_id) = if freshly_resolved {
                 (
                     state
@@ -626,27 +739,30 @@ fn process_message(
                 movement.planned_timestamp.as_deref(),
             );
 
-            Some(common::TrainMovementEventMessage {
-                tracked_train_id,
-                resolved_train_uid,
-                resolved_train_id,
-                dedup_key: dedup,
-                msg_type: "0003".to_string(),
-                event_type: Some(movement.event_type.clone()),
-                loc_stanox: movement.loc_stanox.clone(),
-                loc_crs,
-                planned_timestamp: planned,
-                actual_timestamp: actual,
-                variation_status: movement.variation_status.clone(),
-                raw_body: serde_json::json!({}),
-                status: derived.status,
-                last_reported_location: derived.last_reported_location,
-                last_event_type: derived.last_event_type,
-                delay_minutes: derived.delay_minutes,
-                next_calling_point: derived.next_calling_point,
-                eta_next: None,
-                eta_source: None,
-            })
+            tracked_train_ids
+                .into_iter()
+                .map(|tracked_train_id| common::TrainMovementEventMessage {
+                    tracked_train_id,
+                    resolved_train_uid: resolved_train_uid.clone(),
+                    resolved_train_id: resolved_train_id.clone(),
+                    dedup_key: dedup.clone(),
+                    msg_type: "0003".to_string(),
+                    event_type: Some(movement.event_type.clone()),
+                    loc_stanox: movement.loc_stanox.clone(),
+                    loc_crs: loc_crs.clone(),
+                    planned_timestamp: planned,
+                    actual_timestamp: actual,
+                    variation_status: movement.variation_status.clone(),
+                    raw_body: serde_json::json!({}),
+                    status: derived.status.clone(),
+                    last_reported_location: derived.last_reported_location.clone(),
+                    last_event_type: derived.last_event_type.clone(),
+                    delay_minutes: derived.delay_minutes,
+                    next_calling_point: derived.next_calling_point.clone(),
+                    eta_next: None,
+                    eta_source: None,
+                })
+                .collect()
         }
 
         TrustMessage::Cancellation(cancellation) => {
@@ -654,7 +770,10 @@ fn process_message(
             // earlier Movement already resolved -- it carries no location
             // to match a pin on, so an unresolved one is dropped rather
             // than run through `resolve_origin_departure` a second time.
-            let tracked_train_id = state.resolved.get(&cancellation.train_id).copied()?;
+            let Some(tracked_train_ids) = state.resolved.get(&cancellation.train_id).cloned()
+            else {
+                return Vec::new();
+            };
 
             let previous = previous_state(state, &cancellation.train_id);
             let derived = trust_schema::journey::apply_cancellation(&previous);
@@ -665,34 +784,37 @@ fn process_message(
             let dedup =
                 trust_schema::dedup::dedup_key(&cancellation.train_id, "0002", None, None, None);
 
-            Some(common::TrainMovementEventMessage {
-                tracked_train_id,
-                resolved_train_uid: None,
-                resolved_train_id: None,
-                dedup_key: dedup,
-                msg_type: "0002".to_string(),
-                event_type: None,
-                loc_stanox: None,
-                loc_crs: None,
-                planned_timestamp: None,
-                // TRUST's confirmed `canx_timestamp` is the time the
-                // cancellation actually happened; it is the only timestamp
-                // this message shape carries, so it lands in the event's
-                // generic `actual_timestamp` rather than being dropped.
-                actual_timestamp: cancellation
-                    .canx_timestamp
-                    .as_deref()
-                    .and_then(parse_epoch_millis),
-                variation_status: None,
-                raw_body: serde_json::json!({}),
-                status: derived.status,
-                last_reported_location: derived.last_reported_location,
-                last_event_type: derived.last_event_type,
-                delay_minutes: derived.delay_minutes,
-                next_calling_point: derived.next_calling_point,
-                eta_next: None,
-                eta_source: None,
-            })
+            tracked_train_ids
+                .into_iter()
+                .map(|tracked_train_id| common::TrainMovementEventMessage {
+                    tracked_train_id,
+                    resolved_train_uid: None,
+                    resolved_train_id: None,
+                    dedup_key: dedup.clone(),
+                    msg_type: "0002".to_string(),
+                    event_type: None,
+                    loc_stanox: None,
+                    loc_crs: None,
+                    planned_timestamp: None,
+                    // TRUST's confirmed `canx_timestamp` is the time the
+                    // cancellation actually happened; it is the only timestamp
+                    // this message shape carries, so it lands in the event's
+                    // generic `actual_timestamp` rather than being dropped.
+                    actual_timestamp: cancellation
+                        .canx_timestamp
+                        .as_deref()
+                        .and_then(parse_epoch_millis),
+                    variation_status: None,
+                    raw_body: serde_json::json!({}),
+                    status: derived.status.clone(),
+                    last_reported_location: derived.last_reported_location.clone(),
+                    last_event_type: derived.last_event_type.clone(),
+                    delay_minutes: derived.delay_minutes,
+                    next_calling_point: derived.next_calling_point.clone(),
+                    eta_next: None,
+                    eta_source: None,
+                })
+                .collect()
         }
 
         TrustMessage::ChangeOfOrigin(change) => passthrough_event(&change.train_id, "0006", state),
@@ -712,7 +834,7 @@ fn process_message(
                 msg_type,
                 "unconfirmed msg_type observed; dropping without a confirmed shape to parse into"
             );
-            None
+            Vec::new()
         }
     }
 }
@@ -729,31 +851,37 @@ fn passthrough_event(
     train_id: &str,
     msg_type: &str,
     state: &ProcessorState,
-) -> Option<common::TrainMovementEventMessage> {
-    let tracked_train_id = state.resolved.get(train_id).copied()?;
+) -> Vec<common::TrainMovementEventMessage> {
+    let Some(tracked_train_ids) = state.resolved.get(train_id) else {
+        return Vec::new();
+    };
     let derived = previous_state(state, train_id);
 
-    Some(common::TrainMovementEventMessage {
-        tracked_train_id,
-        resolved_train_uid: None,
-        resolved_train_id: None,
-        dedup_key: trust_schema::dedup::dedup_key(train_id, msg_type, None, None, None),
-        msg_type: msg_type.to_string(),
-        event_type: None,
-        loc_stanox: None,
-        loc_crs: None,
-        planned_timestamp: None,
-        actual_timestamp: None,
-        variation_status: None,
-        raw_body: serde_json::json!({}),
-        status: derived.status,
-        last_reported_location: derived.last_reported_location,
-        last_event_type: derived.last_event_type,
-        delay_minutes: derived.delay_minutes,
-        next_calling_point: derived.next_calling_point,
-        eta_next: None,
-        eta_source: None,
-    })
+    let dedup = trust_schema::dedup::dedup_key(train_id, msg_type, None, None, None);
+    tracked_train_ids
+        .iter()
+        .map(|&tracked_train_id| common::TrainMovementEventMessage {
+            tracked_train_id,
+            resolved_train_uid: None,
+            resolved_train_id: None,
+            dedup_key: dedup.clone(),
+            msg_type: msg_type.to_string(),
+            event_type: None,
+            loc_stanox: None,
+            loc_crs: None,
+            planned_timestamp: None,
+            actual_timestamp: None,
+            variation_status: None,
+            raw_body: serde_json::json!({}),
+            status: derived.status.clone(),
+            last_reported_location: derived.last_reported_location.clone(),
+            last_event_type: derived.last_event_type.clone(),
+            delay_minutes: derived.delay_minutes,
+            next_calling_point: derived.next_calling_point.clone(),
+            eta_next: None,
+            eta_source: None,
+        })
+        .collect()
 }
 
 /// The last state derived for this train, or a blank `awaiting_activation`
@@ -1440,7 +1568,7 @@ mod tests {
             by_train_uid: HashMap::new(),
             trains_id_by_tracked_train_id: HashMap::new(),
         };
-        reference.by_train_uid.insert("C88888".to_string(), 1);
+        reference.by_train_uid.insert("C88888".to_string(), vec![1]);
         let mut state = ProcessorState::default();
 
         let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS)
@@ -1452,7 +1580,7 @@ mod tests {
         );
         assert_eq!(
             state.resolved.get("221832406"),
-            Some(&1),
+            Some(&vec![1]),
             "resolved immediately on Activation, before any Movement at all"
         );
     }
@@ -1479,7 +1607,7 @@ mod tests {
             by_train_uid: HashMap::new(),
             trains_id_by_tracked_train_id: HashMap::new(),
         };
-        reference.by_train_uid.insert("C88888".to_string(), 1);
+        reference.by_train_uid.insert("C88888".to_string(), vec![1]);
         let mut state = ProcessorState::default();
 
         run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS)
@@ -1588,5 +1716,290 @@ mod tests {
             Some(&99),
             "an already-resolved ref's trains_id must still be seeded for forwarding"
         );
+    }
+
+    // --- Two subscribers sharing one physical train (review finding I6) ---
+
+    fn shared_ref(train_uid: &str, ids: Vec<i64>) -> Reference {
+        Reference {
+            pending: Vec::new(),
+            by_train_uid: HashMap::from([(train_uid.to_string(), ids)]),
+            trains_id_by_tracked_train_id: HashMap::new(),
+        }
+    }
+
+    const SHARED_ACTIVATION: &str = r#"[{"header":{"msg_type":"0001"},"body":{
+        "train_id":"221832406","train_uid":"C88888","toc_id":"SW",
+        "train_service_code":"22345000","schedule_wtt_id":"WTT1",
+        "schedule_start_date":"2026-08-28","schedule_end_date":"2026-08-28"
+    }}]"#;
+
+    /// The headline scenario the whole shared-train redesign exists to
+    /// support, and the one finding I6 said was broken: TWO subscriptions
+    /// on ONE physical train. Before the fix, `by_train_uid` was
+    /// `HashMap<String, i64>` and `resolved` was `HashMap<String, i64>`, so
+    /// an Activation attributed the train to exactly one of them and the
+    /// other never received a `resolved_train_id` -- meaning `api`'s
+    /// `flip_legacy_resolution` never ran for it and it sat at `'pending'`
+    /// forever while the train was visibly running.
+    ///
+    /// Also the test `routes::train::enrich_shared_train`'s doc comment in
+    /// `crates/api` points at for the live-data half of finding I1.
+    #[tokio::test]
+    async fn nr_primary_subscriptions_resolve_from_a_live_activation_and_movement() {
+        let later_arrival = r#"[{"header":{"msg_type":"0003"},"body":{
+            "train_id":"221832406","event_type":"ARRIVAL",
+            "planned_timestamp":"1787943000000","actual_timestamp":"1787943000000",
+            "loc_stanox":"86031","variation_status":"ON TIME"
+        }}]"#;
+        let mut feed = FakeMovementFeed::new(vec![
+            vec![SHARED_ACTIVATION.to_string()],
+            vec![later_arrival.to_string()],
+        ]);
+        let reference = shared_ref("C88888", vec![1, 2]);
+        let mut state = ProcessorState::default();
+
+        let activation_events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS)
+            .await
+            .unwrap();
+        assert!(activation_events.is_empty());
+        assert_eq!(
+            state.resolved.get("221832406"),
+            Some(&vec![1, 2]),
+            "BOTH subscriptions sharing this train_uid must be attributed, not just one"
+        );
+
+        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS)
+            .await
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            2,
+            "one event per sharing subscriber, so each one's own \
+             resolution_status can be flipped"
+        );
+        let mut ids: Vec<i64> = events.iter().map(|e| e.tracked_train_id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2]);
+        for event in &events {
+            assert_eq!(
+                event.resolved_train_id,
+                Some("221832406".to_string()),
+                "every sharing subscriber needs the resolution signal, not just the first"
+            );
+            assert_eq!(event.resolved_train_uid, Some("C88888".to_string()));
+            assert_eq!(event.status, "en_route");
+        }
+        // Same real-world event -> same dedup key on both, which is exactly
+        // what makes `upsert_train_movement`'s `ON CONFLICT (trains_id,
+        // dedup_key) DO NOTHING` collapse them to one stored movement row.
+        assert_eq!(events[0].dedup_key, events[1].dedup_key);
+    }
+
+    /// The one-time resolution signal must not repeat: a SECOND movement
+    /// for the same train still fans out to both subscribers, but neither
+    /// event re-announces a resolution.
+    #[tokio::test]
+    async fn a_later_movement_still_fans_out_to_both_subscribers_without_re_resolving() {
+        let first = r#"[{"header":{"msg_type":"0003"},"body":{
+            "train_id":"221832406","event_type":"ARRIVAL",
+            "planned_timestamp":"1787943000000","actual_timestamp":"1787943000000",
+            "loc_stanox":"86031","variation_status":"ON TIME"
+        }}]"#;
+        let second = r#"[{"header":{"msg_type":"0003"},"body":{
+            "train_id":"221832406","event_type":"ARRIVAL",
+            "planned_timestamp":"1787943100000","actual_timestamp":"1787943100000",
+            "loc_stanox":"86031","variation_status":"ON TIME"
+        }}]"#;
+        let mut feed = FakeMovementFeed::new(vec![
+            vec![SHARED_ACTIVATION.to_string()],
+            vec![first.to_string()],
+            vec![second.to_string()],
+        ]);
+        let reference = shared_ref("C88888", vec![1, 2]);
+        let mut state = ProcessorState::default();
+
+        run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS)
+            .await
+            .unwrap();
+        run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS)
+            .await
+            .unwrap();
+        let later = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS)
+            .await
+            .unwrap();
+
+        assert_eq!(later.len(), 2, "both subscribers keep receiving movements");
+        for event in &later {
+            assert_eq!(event.resolved_train_id, None);
+            assert_eq!(event.resolved_train_uid, None);
+        }
+    }
+
+    /// A Cancellation carries no location to match on, so it can only ever
+    /// reach subscribers through `state.resolved` -- which means it had the
+    /// same single-value bug, and the same fix.
+    #[tokio::test]
+    async fn a_cancellation_reaches_every_subscriber_sharing_the_train() {
+        let cancellation = r#"[{"header":{"msg_type":"0002"},"body":{
+            "train_id":"221832406","canx_timestamp":"1787943000000"
+        }}]"#;
+        let departure = r#"[{"header":{"msg_type":"0003"},"body":{
+            "train_id":"221832406","event_type":"DEPARTURE",
+            "planned_timestamp":"1787941920000","actual_timestamp":"1787941920000",
+            "loc_stanox":"87212","variation_status":"ON TIME"
+        }}]"#;
+        let mut feed = FakeMovementFeed::new(vec![
+            vec![SHARED_ACTIVATION.to_string()],
+            vec![departure.to_string()],
+            vec![cancellation.to_string()],
+        ]);
+        let reference = shared_ref("C88888", vec![7, 8]);
+        let mut state = ProcessorState::default();
+
+        run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS)
+            .await
+            .unwrap();
+        run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS)
+            .await
+            .unwrap();
+        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS)
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 2);
+        let mut ids: Vec<i64> = events.iter().map(|e| e.tracked_train_id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![7, 8]);
+        for event in &events {
+            assert_eq!(event.status, "cancelled");
+        }
+    }
+
+    /// The reference-reload half of the same bug. `apply_reference_reload`
+    /// used a blind `by_train_uid.insert(...)`, so of N subscriptions
+    /// sharing a `train_uid`, only whichever this loop visited LAST
+    /// survived -- every other one was silently dropped from the
+    /// direct-match fast path on every single reload tick.
+    #[test]
+    fn apply_reference_reload_keeps_every_subscription_sharing_one_train_uid() {
+        fn subscription(id: i64, status: &str, train_uid: Option<&str>) -> common::TrackedTrainRef {
+            common::TrackedTrainRef {
+                id,
+                service_date: "2026-08-28".parse().unwrap(),
+                pin_origin_crs: None,
+                pin_scheduled_departure: None,
+                resolution_status: status.to_string(),
+                train_uid: train_uid.map(str::to_string),
+                train_id: None,
+                trains_id: Some(99),
+            }
+        }
+
+        let mut reference = Reference {
+            pending: Vec::new(),
+            by_train_uid: HashMap::new(),
+            trains_id_by_tracked_train_id: HashMap::new(),
+        };
+        let mut state = ProcessorState::default();
+
+        apply_reference_reload(
+            vec![
+                subscription(1, "pending", Some("C88888")),
+                subscription(2, "pending", Some("C88888")),
+                subscription(3, "schedule_matched", Some("C88888")),
+                subscription(4, "pending", Some("OTHER1")),
+            ],
+            &mut reference,
+            &mut state,
+        );
+
+        let mut sharing = reference
+            .by_train_uid
+            .get("C88888")
+            .cloned()
+            .expect("the shared train_uid must be present");
+        sharing.sort();
+        assert_eq!(
+            sharing,
+            vec![1, 2, 3],
+            "every subscription sharing this train_uid must survive the reload"
+        );
+        assert_eq!(reference.by_train_uid.get("OTHER1"), Some(&vec![4]));
+    }
+
+    /// The already-`resolved` rehydration path, same shape: after a
+    /// restart, EVERY subscription that shares a resolved `train_id` must
+    /// come back into `state.resolved`, or the ones that don't stop
+    /// receiving movements entirely for the rest of the process's life.
+    #[test]
+    fn apply_reference_reload_rehydrates_every_resolved_subscription_sharing_one_train_id() {
+        fn resolved(id: i64) -> common::TrackedTrainRef {
+            common::TrackedTrainRef {
+                id,
+                service_date: "2026-08-28".parse().unwrap(),
+                pin_origin_crs: None,
+                pin_scheduled_departure: None,
+                resolution_status: "resolved".to_string(),
+                train_uid: Some("C88888".to_string()),
+                train_id: Some("221832406".to_string()),
+                trains_id: Some(99),
+            }
+        }
+
+        let mut reference = Reference {
+            pending: Vec::new(),
+            by_train_uid: HashMap::new(),
+            trains_id_by_tracked_train_id: HashMap::new(),
+        };
+        let mut state = ProcessorState::default();
+        apply_reference_reload(vec![resolved(1), resolved(2)], &mut reference, &mut state);
+
+        let mut attributed = state
+            .resolved
+            .get("221832406")
+            .cloned()
+            .expect("the resolved train_id must be rehydrated");
+        attributed.sort();
+        assert_eq!(attributed, vec![1, 2]);
+
+        // And a second reload tick must not duplicate them.
+        apply_reference_reload(vec![resolved(1), resolved(2)], &mut reference, &mut state);
+        assert_eq!(state.resolved.get("221832406").map(Vec::len), Some(2));
+    }
+
+    /// One real-world event fanned out to N subscribers must still enqueue
+    /// ONE forwarding signal, not N identical ones -- they all carry the
+    /// same `trains_id` by construction.
+    #[test]
+    fn build_forward_signals_deduplicates_one_trains_id_fanned_out_to_many_subscribers() {
+        fn event(tracked_train_id: i64) -> common::TrainMovementEventMessage {
+            common::TrainMovementEventMessage {
+                tracked_train_id,
+                resolved_train_uid: None,
+                resolved_train_id: None,
+                dedup_key: "shared-dedup".to_string(),
+                msg_type: "0003".to_string(),
+                event_type: Some("ARRIVAL".to_string()),
+                loc_stanox: None,
+                loc_crs: None,
+                planned_timestamp: None,
+                actual_timestamp: None,
+                variation_status: None,
+                raw_body: serde_json::json!({}),
+                status: "en_route".to_string(),
+                last_reported_location: Some("WAT".to_string()),
+                last_event_type: Some("ARRIVAL".to_string()),
+                delay_minutes: None,
+                next_calling_point: None,
+                eta_next: None,
+                eta_source: None,
+            }
+        }
+
+        let trains_id_by_tracked_train_id = HashMap::from([(1i64, 42i64), (2i64, 42i64)]);
+        let signals = build_forward_signals(&[event(1), event(2)], &trains_id_by_tracked_train_id);
+        assert_eq!(signals.len(), 1, "one shared train, one forwarding signal");
+        assert_eq!(signals[0].trains_id, 42);
     }
 }
