@@ -257,11 +257,22 @@ pub fn apply_reference_reload(
                 if let Some(train_uid) = &tracked.train_uid {
                     by_train_uid.insert(train_uid.clone(), tracked.id);
                 }
-                pending.push(crate::matching::PendingPin {
-                    tracked_train_id: tracked.id,
-                    pin_origin_crs: tracked.pin_origin_crs,
-                    pin_scheduled_departure: tracked.pin_scheduled_departure,
-                });
+                // `pin_origin_crs`/`pin_scheduled_departure` are `None` for
+                // an NR-primary subscription (Task 20) whose `trains` row
+                // has no schedule data yet (the design spec's own accepted
+                // §1 gap) -- there is nothing for the CRS+time heuristic to
+                // match against in that case, so such a row is simply never
+                // added to `pending` (it may still be caught via
+                // `by_train_uid` above, once Task 21's read cutover lands).
+                if let (Some(pin_origin_crs), Some(pin_scheduled_departure)) =
+                    (tracked.pin_origin_crs, tracked.pin_scheduled_departure)
+                {
+                    pending.push(crate::matching::PendingPin {
+                        tracked_train_id: tracked.id,
+                        pin_origin_crs,
+                        pin_scheduled_departure,
+                    });
+                }
             }
             "resolved" => {
                 if let Some(train_id) = tracked.train_id {
@@ -1025,8 +1036,8 @@ mod tests {
         common::TrackedTrainRef {
             id,
             service_date: "2026-08-28".parse().unwrap(),
-            pin_origin_crs: "WAT".to_string(),
-            pin_scheduled_departure: "2026-08-28T18:32:00Z".parse().unwrap(),
+            pin_origin_crs: Some("WAT".to_string()),
+            pin_scheduled_departure: Some("2026-08-28T18:32:00Z".parse().unwrap()),
             resolution_status: status.to_string(),
             train_uid: None,
             train_id: train_id.map(str::to_string),
@@ -1096,8 +1107,8 @@ mod tests {
 
         let mut schedule_matched_ref = tracked_ref(1, "schedule_matched", None);
         schedule_matched_ref.train_uid = Some("C88888".to_string()); // known from the schedule match
-        schedule_matched_ref.pin_origin_crs = "WAT".to_string();
-        schedule_matched_ref.pin_scheduled_departure = "2026-08-28T18:32:00Z".parse().unwrap();
+        schedule_matched_ref.pin_origin_crs = Some("WAT".to_string());
+        schedule_matched_ref.pin_scheduled_departure = Some("2026-08-28T18:32:00Z".parse().unwrap());
 
         apply_reference_reload(vec![schedule_matched_ref], &mut reference, &mut state);
         assert_eq!(
