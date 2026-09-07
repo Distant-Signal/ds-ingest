@@ -61,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut reference = process::Reference {
         pending: Vec::new(),
+        by_train_uid: std::collections::HashMap::new(),
     };
     let reload_interval = Duration::from_secs(config.reference_reload_secs);
     let mut last_reference_reload = tokio::time::Instant::now() - reload_interval;
@@ -283,6 +284,7 @@ mod tests {
                 pin_origin_crs: "WAT".to_string(),
                 pin_scheduled_departure: "2026-08-28T18:32:00Z".parse().unwrap(),
             }],
+            by_train_uid: std::collections::HashMap::new(),
         }
     }
 

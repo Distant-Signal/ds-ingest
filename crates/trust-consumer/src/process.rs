@@ -128,6 +128,15 @@ use crate::feed::MovementFeed;
 /// (feed, reference, state) -> events.
 pub struct Reference {
     pub pending: Vec<crate::matching::PendingPin>,
+    /// `train_uid -> tracked_train_id`, for every active ref whose
+    /// identity is already known (a schedule match, or an NR-primary
+    /// subscription created via `POST /Train/by-uid/.../track`, Task 20).
+    /// Checked FIRST on every Activation
+    /// (docs/superpowers/specs/2026-09-06-shared-train-identity-design.md §3)
+    /// -- strictly more reliable than the ±20-minute CRS+time heuristic
+    /// `matching::resolve_origin_departure` still exists for pins that
+    /// genuinely lack this.
+    pub by_train_uid: HashMap<String, i64>,
 }
 
 /// Cross-batch memory the processing loop accumulates as it observes the
@@ -170,6 +179,15 @@ pub struct ProcessorState {
     /// `awaiting_activation()` and silently lose the last-known location
     /// that `journey::apply_cancellation` exists to preserve.
     pub last_derived: HashMap<String, DerivedState>,
+
+    /// `train_id`s resolved via `by_train_uid`'s direct-match fast path
+    /// (this task) but not yet confirmed by a live Movement. `api`'s own
+    /// `upsert_train_event` only flips `resolution_status` on a message
+    /// that carries `resolved_train_id` -- since the direct match happens
+    /// on the Activation itself (which never posts an event), this set
+    /// defers that one-time "freshly resolved" signal to the FIRST
+    /// Movement this process sees for the train_id, exactly once.
+    pub activation_matched_awaiting_movement: HashSet<String>,
 }
 
 /// What an Activation parks for a later Movement to claim: the `train_uid`
@@ -213,21 +231,29 @@ pub fn apply_reference_reload(
     state: &mut ProcessorState,
 ) {
     let mut pending = Vec::new();
+    let mut by_train_uid = HashMap::new();
 
     for tracked in refs {
         match tracked.resolution_status.as_str() {
             // `schedule_matched` is treated exactly like `pending` here --
-            // it already carries a `train_uid` (irrelevant to this
-            // matching heuristic, which only ever compares CRS + time,
-            // never train_uid), but it still has no `train_id`, so it
-            // must stay eligible for the same live-Movement claim a plain
-            // `pending` row is (Decision 3 of
-            // docs/superpowers/specs/2026-09-05-schedule-first-train-tracking-design.md).
-            "pending" | "schedule_matched" => pending.push(crate::matching::PendingPin {
-                tracked_train_id: tracked.id,
-                pin_origin_crs: tracked.pin_origin_crs,
-                pin_scheduled_departure: tracked.pin_scheduled_departure,
-            }),
+            // it already carries a `train_uid` (now consulted FIRST, via
+            // `by_train_uid`, by a live Activation's direct-match fast
+            // path -- see `process_message`), but it still has no
+            // `train_id`, so it must stay eligible for the same
+            // live-Movement claim a plain `pending` row is (Decision 3 of
+            // docs/superpowers/specs/2026-09-05-schedule-first-train-tracking-design.md)
+            // as a fallback for whichever pins don't get caught by the
+            // direct match first.
+            "pending" | "schedule_matched" => {
+                if let Some(train_uid) = &tracked.train_uid {
+                    by_train_uid.insert(train_uid.clone(), tracked.id);
+                }
+                pending.push(crate::matching::PendingPin {
+                    tracked_train_id: tracked.id,
+                    pin_origin_crs: tracked.pin_origin_crs,
+                    pin_scheduled_departure: tracked.pin_scheduled_departure,
+                });
+            }
             "resolved" => {
                 if let Some(train_id) = tracked.train_id {
                     state.resolved.entry(train_id).or_insert(tracked.id);
@@ -238,6 +264,7 @@ pub fn apply_reference_reload(
     }
 
     reference.pending = pending;
+    reference.by_train_uid = by_train_uid;
 }
 
 /// Drops parked Activations whose schedule has already ended. Pure, so the
@@ -390,6 +417,21 @@ fn process_message(
         // parks its train_uid for the Movement that eventually resolves a
         // pin for this train_id to claim.
         TrustMessage::Activation(activation) => {
+            // Direct train_uid match FIRST, per the design spec's §3: strictly
+            // more reliable than the ±20-minute CRS+time heuristic, since it
+            // needs no location or timing coincidence at all. Only a
+            // train_id not already resolved is eligible -- this must never
+            // clobber an existing resolution.
+            if let Some(&tracked_train_id) = reference.by_train_uid.get(&activation.train_uid)
+                && !state.resolved.contains_key(&activation.train_id)
+            {
+                state
+                    .resolved
+                    .insert(activation.train_id.clone(), tracked_train_id);
+                state
+                    .activation_matched_awaiting_movement
+                    .insert(activation.train_id.clone());
+            }
             state.pending_activations.insert(
                 activation.train_id.clone(),
                 PendingActivation {
@@ -425,7 +467,20 @@ fn process_message(
             // only a genuinely unseen train_id is offered to the pins.
             let (tracked_train_id, freshly_resolved) =
                 match state.resolved.get(&movement.train_id).copied() {
-                    Some(tracked_train_id) => (tracked_train_id, false),
+                    Some(tracked_train_id) => {
+                        // Already resolved -- either by this same branch on
+                        // an earlier Movement, by the reference reload's
+                        // rehydration, or (this task) by an Activation's
+                        // direct train_uid match. That last case never got
+                        // to post its own event (an Activation never does),
+                        // so the FIRST Movement seen for this train_id after
+                        // it is the one that must carry the one-time
+                        // "freshly resolved" signal for `api`'s db flip.
+                        let freshly_resolved = state
+                            .activation_matched_awaiting_movement
+                            .remove(&movement.train_id);
+                        (tracked_train_id, freshly_resolved)
+                    }
                     None => {
                         // Only a DEPARTURE may claim a pin. `resolve_origin_departure`
                         // knows nothing about event types -- it compares a
@@ -694,6 +749,7 @@ mod tests {
                 pin_origin_crs: crs.to_string(),
                 pin_scheduled_departure: scheduled.parse().unwrap(),
             }],
+            by_train_uid: HashMap::new(),
         }
     }
 
@@ -949,6 +1005,7 @@ mod tests {
         let mut feed = FakeMovementFeed::new(vec![vec![later_arrival.to_string()]]);
         let mut reference = Reference {
             pending: Vec::new(),
+            by_train_uid: HashMap::new(),
         };
         let mut state = ProcessorState::default();
 
@@ -987,6 +1044,7 @@ mod tests {
         let mut feed = FakeMovementFeed::new(vec![vec![ORIGIN_DEPARTURE.to_string()]]);
         let mut reference = Reference {
             pending: Vec::new(),
+            by_train_uid: HashMap::new(),
         };
         let mut state = ProcessorState::default();
 
@@ -1306,5 +1364,85 @@ mod tests {
             state.pending_activations.is_empty(),
             "unclaimed national-stream activations must not accumulate forever",
         );
+    }
+
+    // --- Direct train_uid match on Activation (Task 16) ---
+
+    #[tokio::test]
+    async fn an_activation_with_a_known_train_uid_resolves_the_pin_immediately_without_waiting_for_a_movement()
+     {
+        let activation = r#"[{"header":{"msg_type":"0001"},"body":{
+            "train_id":"221832406","train_uid":"C88888","toc_id":"SW",
+            "train_service_code":"22345000","schedule_wtt_id":"WTT1",
+            "schedule_start_date":"2026-08-28","schedule_end_date":"2026-08-28"
+        }}]"#;
+        let mut feed = FakeMovementFeed::new(vec![vec![activation.to_string()]]);
+        let mut reference = Reference {
+            pending: Vec::new(),
+            by_train_uid: HashMap::new(),
+        };
+        reference.by_train_uid.insert("C88888".to_string(), 1);
+        let mut state = ProcessorState::default();
+
+        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS)
+            .await
+            .unwrap();
+        assert!(
+            events.is_empty(),
+            "an Activation never posts an event of its own"
+        );
+        assert_eq!(
+            state.resolved.get("221832406"),
+            Some(&1),
+            "resolved immediately on Activation, before any Movement at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_movement_after_an_activation_direct_match_still_carries_resolved_train_id_for_the_db_flip()
+     {
+        let activation = r#"[{"header":{"msg_type":"0001"},"body":{
+            "train_id":"221832406","train_uid":"C88888","toc_id":"SW",
+            "train_service_code":"22345000","schedule_wtt_id":"WTT1",
+            "schedule_start_date":"2026-08-28","schedule_end_date":"2026-08-28"
+        }}]"#;
+        let later_arrival = r#"[{"header":{"msg_type":"0003"},"body":{
+            "train_id":"221832406","event_type":"ARRIVAL",
+            "planned_timestamp":"1787943000000","actual_timestamp":"1787943000000",
+            "loc_stanox":"86031","variation_status":"ON TIME"
+        }}]"#;
+        let mut feed = FakeMovementFeed::new(vec![
+            vec![activation.to_string()],
+            vec![later_arrival.to_string()],
+        ]);
+        let mut reference = Reference {
+            pending: Vec::new(),
+            by_train_uid: HashMap::new(),
+        };
+        reference.by_train_uid.insert("C88888".to_string(), 1);
+        let mut state = ProcessorState::default();
+
+        run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS)
+            .await
+            .unwrap();
+        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tracked_train_id, 1);
+        assert_eq!(events[0].resolved_train_uid, Some("C88888".to_string()));
+        assert_eq!(events[0].resolved_train_id, Some("221832406".to_string()));
+
+        // A SECOND movement for the same train_id must not re-report resolution.
+        let second_arrival = r#"[{"header":{"msg_type":"0003"},"body":{
+            "train_id":"221832406","event_type":"ARRIVAL",
+            "planned_timestamp":"1787943100000","actual_timestamp":"1787943100000",
+            "loc_stanox":"86031","variation_status":"ON TIME"
+        }}]"#;
+        let mut feed2 = FakeMovementFeed::new(vec![vec![second_arrival.to_string()]]);
+        let second_events = run_once(&mut feed2, &reference, &mut state, &TEST_STANOX_CRS)
+            .await
+            .unwrap();
+        assert_eq!(second_events[0].resolved_train_id, None);
     }
 }
