@@ -163,7 +163,10 @@ pub fn process_message(
 
             Some(common::TrustBacklogEventMessage {
                 crs: None,
-                train_uid: state.pending_train_uids.get(&cancellation.train_id).cloned(),
+                train_uid: state
+                    .pending_train_uids
+                    .get(&cancellation.train_id)
+                    .cloned(),
                 train_id: cancellation.train_id.clone(),
                 service_date,
                 msg_type: "0002".to_string(),
@@ -392,7 +395,8 @@ mod tests {
 
     #[test]
     fn a_movement_after_a_parked_activation_carries_the_real_train_uid() {
-        let activation_msg = TrustMessage::Activation(activation("221832406", "C21373", "2026-09-05"));
+        let activation_msg =
+            TrustMessage::Activation(activation("221832406", "C21373", "2026-09-05"));
         let mut state = ProcessorState::default();
         process_message(
             &activation_msg,

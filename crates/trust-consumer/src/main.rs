@@ -156,8 +156,10 @@ async fn main() -> anyhow::Result<()> {
             async |events| {
                 queries::post_train_events(&http, &config.api_ingest_url, &internal_oauth, events)
                     .await?;
-                let signals =
-                    process::build_forward_signals(events, &reference.trains_id_by_tracked_train_id);
+                let signals = process::build_forward_signals(
+                    events,
+                    &reference.trains_id_by_tracked_train_id,
+                );
                 if let Err(err) = queries::post_train_forward_signals(
                     &http,
                     &config.forward_signals_url,

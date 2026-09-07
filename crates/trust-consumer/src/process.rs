@@ -1108,7 +1108,8 @@ mod tests {
         let mut schedule_matched_ref = tracked_ref(1, "schedule_matched", None);
         schedule_matched_ref.train_uid = Some("C88888".to_string()); // known from the schedule match
         schedule_matched_ref.pin_origin_crs = Some("WAT".to_string());
-        schedule_matched_ref.pin_scheduled_departure = Some("2026-08-28T18:32:00Z".parse().unwrap());
+        schedule_matched_ref.pin_scheduled_departure =
+            Some("2026-08-28T18:32:00Z".parse().unwrap());
 
         apply_reference_reload(vec![schedule_matched_ref], &mut reference, &mut state);
         assert_eq!(
