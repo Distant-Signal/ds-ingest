@@ -137,6 +137,11 @@ pub struct Reference {
     /// `matching::resolve_origin_departure` still exists for pins that
     /// genuinely lack this.
     pub by_train_uid: HashMap<String, i64>,
+    /// `tracked_train_id -> trains_id`, for every active ref that has one
+    /// (regardless of resolution_status -- an already-`resolved`
+    /// subscription still needs its later movements forwarded). Feeds
+    /// `build_forward_signals`, below.
+    pub trains_id_by_tracked_train_id: HashMap<i64, i64>,
 }
 
 /// Cross-batch memory the processing loop accumulates as it observes the
@@ -232,8 +237,12 @@ pub fn apply_reference_reload(
 ) {
     let mut pending = Vec::new();
     let mut by_train_uid = HashMap::new();
+    let mut trains_id_by_tracked_train_id = HashMap::new();
 
     for tracked in refs {
+        if let Some(trains_id) = tracked.trains_id {
+            trains_id_by_tracked_train_id.insert(tracked.id, trains_id);
+        }
         match tracked.resolution_status.as_str() {
             // `schedule_matched` is treated exactly like `pending` here --
             // it already carries a `train_uid` (now consulted FIRST, via
@@ -265,6 +274,7 @@ pub fn apply_reference_reload(
 
     reference.pending = pending;
     reference.by_train_uid = by_train_uid;
+    reference.trains_id_by_tracked_train_id = trains_id_by_tracked_train_id;
 }
 
 /// Drops parked Activations whose schedule has already ended. Pure, so the
@@ -315,6 +325,38 @@ pub fn apply_stanox_crs_reload(
             .increment(1);
         }
     }
+}
+
+/// Pure by design (see this module's own doc comment on why `run_once`
+/// itself returns only `Vec<TrainMovementEventMessage>`, untouched by this
+/// task): building a forwarding signal is a separate concern from
+/// resolving/deriving movement state, and keeping it out of `run_once`
+/// means none of that function's own 25+ existing tests need updating for
+/// this feature. Filters out any event whose `tracked_train_id` has no
+/// known `trains_id` yet -- exactly the same accepted gap named throughout
+/// this plan (a subscription whose identity, and therefore trains_id, is
+/// still unknown has nothing to forward a signal about).
+pub fn build_forward_signals(
+    events: &[common::TrainMovementEventMessage],
+    trains_id_by_tracked_train_id: &HashMap<i64, i64>,
+) -> Vec<common::TrainForwardSignalMessage> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let trains_id = *trains_id_by_tracked_train_id.get(&event.tracked_train_id)?;
+            Some(common::TrainForwardSignalMessage {
+                trains_id,
+                event_summary: format!(
+                    "{} at {}",
+                    event.status,
+                    event
+                        .last_reported_location
+                        .as_deref()
+                        .unwrap_or("an unknown location")
+                ),
+            })
+        })
+        .collect()
 }
 
 /// One full cycle: pull whatever the feed has, parse it, resolve/derive
@@ -750,6 +792,7 @@ mod tests {
                 pin_scheduled_departure: scheduled.parse().unwrap(),
             }],
             by_train_uid: HashMap::new(),
+            trains_id_by_tracked_train_id: HashMap::new(),
         }
     }
 
@@ -987,6 +1030,7 @@ mod tests {
             resolution_status: status.to_string(),
             train_uid: None,
             train_id: train_id.map(str::to_string),
+            trains_id: None,
         }
     }
 
@@ -1006,6 +1050,7 @@ mod tests {
         let mut reference = Reference {
             pending: Vec::new(),
             by_train_uid: HashMap::new(),
+            trains_id_by_tracked_train_id: HashMap::new(),
         };
         let mut state = ProcessorState::default();
 
@@ -1045,6 +1090,7 @@ mod tests {
         let mut reference = Reference {
             pending: Vec::new(),
             by_train_uid: HashMap::new(),
+            trains_id_by_tracked_train_id: HashMap::new(),
         };
         let mut state = ProcessorState::default();
 
@@ -1380,6 +1426,7 @@ mod tests {
         let mut reference = Reference {
             pending: Vec::new(),
             by_train_uid: HashMap::new(),
+            trains_id_by_tracked_train_id: HashMap::new(),
         };
         reference.by_train_uid.insert("C88888".to_string(), 1);
         let mut state = ProcessorState::default();
@@ -1418,6 +1465,7 @@ mod tests {
         let mut reference = Reference {
             pending: Vec::new(),
             by_train_uid: HashMap::new(),
+            trains_id_by_tracked_train_id: HashMap::new(),
         };
         reference.by_train_uid.insert("C88888".to_string(), 1);
         let mut state = ProcessorState::default();
@@ -1444,5 +1492,89 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second_events[0].resolved_train_id, None);
+    }
+
+    // --- Notifier-forwarding queue write side (Task 17) ---
+
+    #[test]
+    fn build_forward_signals_only_forwards_events_with_a_known_trains_id() {
+        let mut trains_id_by_tracked_train_id = HashMap::new();
+        trains_id_by_tracked_train_id.insert(1i64, 42i64);
+
+        let events = vec![
+            common::TrainMovementEventMessage {
+                tracked_train_id: 1,
+                resolved_train_uid: None,
+                resolved_train_id: None,
+                dedup_key: "d1".to_string(),
+                msg_type: "0003".to_string(),
+                event_type: Some("DEPARTURE".to_string()),
+                loc_stanox: None,
+                loc_crs: None,
+                planned_timestamp: None,
+                actual_timestamp: None,
+                variation_status: None,
+                raw_body: serde_json::json!({}),
+                status: "en_route".to_string(),
+                last_reported_location: Some("WAT".to_string()),
+                last_event_type: Some("DEPARTURE".to_string()),
+                delay_minutes: Some(3),
+                next_calling_point: None,
+                eta_next: None,
+                eta_source: None,
+            },
+            common::TrainMovementEventMessage {
+                tracked_train_id: 2, // no trains_id known for this one
+                resolved_train_uid: None,
+                resolved_train_id: None,
+                dedup_key: "d2".to_string(),
+                msg_type: "0003".to_string(),
+                event_type: None,
+                loc_stanox: None,
+                loc_crs: None,
+                planned_timestamp: None,
+                actual_timestamp: None,
+                variation_status: None,
+                raw_body: serde_json::json!({}),
+                status: "en_route".to_string(),
+                last_reported_location: None,
+                last_event_type: None,
+                delay_minutes: None,
+                next_calling_point: None,
+                eta_next: None,
+                eta_source: None,
+            },
+        ];
+
+        let signals = build_forward_signals(&events, &trains_id_by_tracked_train_id);
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].trains_id, 42);
+        assert!(signals[0].event_summary.contains("WAT"));
+    }
+
+    /// `apply_reference_reload` must seed `trains_id_by_tracked_train_id`
+    /// from every active ref that carries a `trains_id`, regardless of
+    /// `resolution_status` -- an already-`resolved` subscription still
+    /// needs its later movements forwarded (see `Reference`'s own doc
+    /// comment on this field).
+    #[test]
+    fn apply_reference_reload_seeds_trains_id_by_tracked_train_id_for_resolved_refs() {
+        let mut reference = Reference {
+            pending: Vec::new(),
+            by_train_uid: HashMap::new(),
+            trains_id_by_tracked_train_id: HashMap::new(),
+        };
+        let mut state = ProcessorState::default();
+
+        let mut resolved_ref = tracked_ref(7, "resolved", Some("221832406"));
+        resolved_ref.trains_id = Some(99);
+
+        apply_reference_reload(vec![resolved_ref], &mut reference, &mut state);
+
+        assert_eq!(
+            reference.trains_id_by_tracked_train_id.get(&7),
+            Some(&99),
+            "an already-resolved ref's trains_id must still be seeded for forwarding"
+        );
     }
 }

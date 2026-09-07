@@ -37,3 +37,15 @@ pub async fn post_train_events(
     }
     common::ingest::post_batch(client, url, tokens, events, "train events").await
 }
+
+pub async fn post_train_forward_signals(
+    client: &Client,
+    url: &str,
+    tokens: &OAuthTokenCache,
+    signals: &[common::TrainForwardSignalMessage],
+) -> anyhow::Result<()> {
+    if signals.is_empty() {
+        return Ok(());
+    }
+    common::ingest::post_batch(client, url, tokens, signals, "train forward signals").await
+}

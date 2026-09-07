@@ -62,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
     let mut reference = process::Reference {
         pending: Vec::new(),
         by_train_uid: std::collections::HashMap::new(),
+        trains_id_by_tracked_train_id: std::collections::HashMap::new(),
     };
     let reload_interval = Duration::from_secs(config.reference_reload_secs);
     let mut last_reference_reload = tokio::time::Instant::now() - reload_interval;
@@ -154,7 +155,20 @@ async fn main() -> anyhow::Result<()> {
             &stanox_crs,
             async |events| {
                 queries::post_train_events(&http, &config.api_ingest_url, &internal_oauth, events)
-                    .await
+                    .await?;
+                let signals =
+                    process::build_forward_signals(events, &reference.trains_id_by_tracked_train_id);
+                if let Err(err) = queries::post_train_forward_signals(
+                    &http,
+                    &config.forward_signals_url,
+                    &internal_oauth,
+                    &signals,
+                )
+                .await
+                {
+                    tracing::warn!(error = ?err, "failed to post train forward signals");
+                }
+                Ok(())
             },
         )
         .await;
@@ -285,6 +299,7 @@ mod tests {
                 pin_scheduled_departure: "2026-08-28T18:32:00Z".parse().unwrap(),
             }],
             by_train_uid: std::collections::HashMap::new(),
+            trains_id_by_tracked_train_id: std::collections::HashMap::new(),
         }
     }
 

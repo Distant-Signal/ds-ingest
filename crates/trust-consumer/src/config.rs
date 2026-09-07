@@ -47,6 +47,17 @@ pub struct Config {
     #[arg(long, env, default_value = "http://api:8080/private/tracked-trains")]
     pub api_tracked_trains_url: String,
 
+    /// The `api` crate's ingestion endpoint for the notifier-forwarding
+    /// queue (Task 17) -- fast-path signals so `notifier` can poll for
+    /// newly-arrived shared-store events sooner than its existing slower
+    /// poll of `train_movement_events`.
+    #[arg(
+        long,
+        env,
+        default_value = "http://api:8080/private/train-forward-signals"
+    )]
+    pub forward_signals_url: String,
+
     /// Shared, non-secret OAuth2 client-credentials config (same value
     /// across all 9 real callers).
     #[command(flatten)]
