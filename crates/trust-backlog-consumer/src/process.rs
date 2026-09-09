@@ -15,12 +15,26 @@
 //!   reasoning.
 //!
 //! `service_date` for a bare Movement/Cancellation (neither carries a
-//! date field) is sourced from a parked Activation's own
-//! `schedule_start_date` when one has been observed for this `train_id`
-//! in-process, falling back to the current Europe/London rail day
-//! otherwise -- an accepted approximation identical in kind to
-//! `trust-consumer::process.rs`'s own pre-existing "an Activation this
-//! process never saw" gap, not a new one this module invents.
+//! date field) is sourced from a parked Activation's own `service_date`
+//! when one has been observed for this `train_id` in-process, falling
+//! back to the current Europe/London rail day otherwise -- an accepted
+//! approximation identical in kind to `trust-consumer::process.rs`'s own
+//! pre-existing "an Activation this process never saw" gap, not a new
+//! one this module invents.
+//!
+//! An Activation's own `service_date` is the Europe/London rail day this
+//! process was on when it handled the Activation message (`today`,
+//! passed in by the caller) -- NOT `schedule_start_date`. That field is
+//! the CIF schedule's own multi-month validity-window start (the CIF
+//! `BS` record's Date-From field), not the calendar date this specific
+//! train instance is running today; using it as `service_date` was a
+//! real, confirmed live-production bug (every `trust_event_backlog` row
+//! for a permanent CIF schedule ended up filed under the schedule's
+//! validity-window start date instead of the day it actually ran,
+//! silently breaking `api::data::trust_event_backlog_match`'s
+//! `service_date = '<today>'` filter). TRUST delivers an Activation in
+//! real time for the specific day's running, so the day it's processed
+//! on is the correct service_date.
 
 use std::collections::{HashMap, HashSet};
 
@@ -62,10 +76,15 @@ pub fn process_message(
 ) -> Option<common::TrustBacklogEventMessage> {
     match message {
         TrustMessage::Activation(activation) => {
-            let service_date = activation
-                .schedule_start_date
-                .parse::<NaiveDate>()
-                .unwrap_or(today);
+            // `schedule_start_date` is the CIF schedule's own multi-month
+            // validity-window start (the CIF `BS` record's Date-From
+            // field), not the calendar date this specific train instance
+            // is running today -- see this module's own doc comment.
+            // `today` (the day this Activation is actually being
+            // processed) is the correct service_date: TRUST delivers an
+            // Activation in real time, for the specific day's running, so
+            // the processing day and the running day are the same.
+            let service_date = today;
             state
                 .pending_service_dates
                 .insert(activation.train_id.clone(), service_date);
@@ -367,10 +386,45 @@ mod tests {
             today(),
         )
         .unwrap();
-        assert_eq!(
-            result.service_date,
-            "2026-09-04".parse::<NaiveDate>().unwrap()
-        );
+        // The Activation was parked while processing `today()`
+        // (2026-09-05), so that's the service_date a later Movement for
+        // the same train_id must reuse -- NOT `schedule_start_date`
+        // ("2026-09-04" here), which is the CIF schedule's own multi-month
+        // validity-window start, not the date this specific instance is
+        // running. See `an_activations_service_date_is_todays_date_not_the_schedules_validity_window_start`
+        // below for the direct regression test against the Activation's
+        // own emitted `service_date`.
+        assert_eq!(result.service_date, today());
+    }
+
+    /// Regression test for a live-production bug: `schedule_start_date` on
+    /// a real TRUST Activation is the CIF schedule's own multi-month
+    /// validity-window start (the same value as the CIF `BS` record's
+    /// Date-From field), NOT "the calendar date this specific train
+    /// instance is running today". Confirmed against a real, currently
+    /// running SWR Kingston-loop service (`train_uid=L83673`, CIF STP=P,
+    /// valid 2026-07-27 through 2026-12-11, Mon-Fri): every
+    /// `trust_event_backlog` row recorded on 2026-09-09 for real,
+    /// same-day movements was stamped `service_date=2026-07-27` -- the
+    /// schedule's validity-window start -- instead of 2026-09-09, the
+    /// actual date those movements happened. That silently broke
+    /// `api::data::trust_event_backlog_match`'s `service_date = '<today>'`
+    /// filter for every tracked pin relying on the backlog fallback match.
+    #[test]
+    fn an_activations_service_date_is_todays_date_not_the_schedules_validity_window_start() {
+        let activation_msg =
+            TrustMessage::Activation(activation("221832406", "L83673", "2026-07-27"));
+        let mut state = ProcessorState::default();
+        let today = "2026-09-09".parse::<NaiveDate>().unwrap();
+        let result = process_message(
+            &activation_msg,
+            &mut state,
+            &stanox_table(),
+            &crs_index_with(&["WAT"]),
+            today,
+        )
+        .unwrap();
+        assert_eq!(result.service_date, today);
     }
 
     #[test]
