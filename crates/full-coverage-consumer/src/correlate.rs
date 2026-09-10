@@ -81,7 +81,17 @@ pub fn apply_movement(
                 .derived
                 .entry(key.clone())
                 .or_insert_with(DerivedState::awaiting_activation);
-            *previous = trust_schema::journey::apply_movement(previous, movement, loc_crs);
+            // `None`: this per-`(line_id, uid)` correlation state has no
+            // notion of a train's own schedule/destination at all (see this
+            // module's own doc comment -- it's a pure STANOX/tiploc/
+            // population match, not schedule-aware). Confirmed-arrival
+            // detection (`apply_movement`'s new `destination_crs` param) is
+            // scoped to the per-train public journey page
+            // (`trust-consumer`/`crates/api`'s shared `trains` table), not
+            // line-level correlation -- passing `None` here preserves this
+            // module's exact pre-existing behavior (status only ever
+            // "en_route"/"cancelled").
+            *previous = trust_schema::journey::apply_movement(previous, movement, loc_crs, None);
             matched.push(key);
         }
     }

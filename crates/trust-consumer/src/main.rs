@@ -63,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
         pending: Vec::new(),
         by_train_uid: std::collections::HashMap::new(),
         trains_id_by_tracked_train_id: std::collections::HashMap::new(),
+        destination_crs_by_trains_id: std::collections::HashMap::new(),
     };
     let reload_interval = Duration::from_secs(config.reference_reload_secs);
     let mut last_reference_reload = tokio::time::Instant::now() - reload_interval;
@@ -302,6 +303,7 @@ mod tests {
             }],
             by_train_uid: std::collections::HashMap::new(),
             trains_id_by_tracked_train_id: std::collections::HashMap::new(),
+            destination_crs_by_trains_id: std::collections::HashMap::new(),
         }
     }
 

@@ -152,6 +152,16 @@ pub struct Reference {
     /// subscription still needs its later movements forwarded). Feeds
     /// `build_forward_signals`, below.
     pub trains_id_by_tracked_train_id: HashMap<i64, i64>,
+    /// `trains_id -> the shared trains row's own known destination CRS`,
+    /// for every active ref whose `trains_id` is known AND whose schedule
+    /// match resolved a destination (`common::TrackedTrainRef::destination_crs`).
+    /// Feeds `process_message`'s confirmed-terminus-ARRIVAL detection
+    /// (`trust_schema::journey::apply_movement`'s `destination_crs` param)
+    /// -- a `trains_id` absent from this map means "destination genuinely
+    /// unknown," not "no destination," so confirmed-arrival detection is
+    /// simply unavailable for it (the same honest-gap posture as every
+    /// other `None` in this module).
+    pub destination_crs_by_trains_id: HashMap<i64, String>,
 }
 
 /// Cross-batch memory the processing loop accumulates as it observes the
@@ -262,10 +272,19 @@ pub fn apply_reference_reload(
     let mut pending = Vec::new();
     let mut by_train_uid: HashMap<String, Vec<i64>> = HashMap::new();
     let mut trains_id_by_tracked_train_id = HashMap::new();
+    let mut destination_crs_by_trains_id = HashMap::new();
 
     for tracked in refs {
         if let Some(trains_id) = tracked.trains_id {
             trains_id_by_tracked_train_id.insert(tracked.id, trains_id);
+            // Same "regardless of resolution_status" posture as
+            // `trains_id_by_tracked_train_id` just above -- an
+            // already-`resolved` subscription's later movements still need
+            // to recognize a confirmed terminus ARRIVAL, not just a freshly
+            // schedule-matched one.
+            if let Some(destination_crs) = &tracked.destination_crs {
+                destination_crs_by_trains_id.insert(trains_id, destination_crs.clone());
+            }
         }
         match tracked.resolution_status.as_str() {
             // `schedule_matched` is treated exactly like `pending` here --
@@ -325,6 +344,7 @@ pub fn apply_reference_reload(
     reference.pending = pending;
     reference.by_train_uid = by_train_uid;
     reference.trains_id_by_tracked_train_id = trains_id_by_tracked_train_id;
+    reference.destination_crs_by_trains_id = destination_crs_by_trains_id;
 }
 
 /// Drops parked Activations whose schedule has already ended. Pure, so the
@@ -699,9 +719,28 @@ fn process_message(
                     }
                 };
 
+            // Destination lookup: any of this message's `tracked_train_ids`
+            // sharing the same physical train also share the same
+            // `trains_id` (they're the SAME train), so the first one with a
+            // known `trains_id` -> `destination_crs` mapping supplies it --
+            // there is no need to check every one of them. `None` when the
+            // `trains_id` itself is unknown yet (this Movement is the very
+            // one resolving it, so the reference reload hasn't seen it) or
+            // when no schedule has ever matched this train -- both honest
+            // "destination genuinely unknown" cases, not bugs.
+            let destination_crs: Option<String> = tracked_train_ids
+                .iter()
+                .find_map(|id| reference.trains_id_by_tracked_train_id.get(id))
+                .and_then(|trains_id| reference.destination_crs_by_trains_id.get(trains_id))
+                .cloned();
+
             let previous = previous_state(state, &movement.train_id);
-            let mut derived =
-                trust_schema::journey::apply_movement(&previous, movement, loc_crs.as_deref());
+            let mut derived = trust_schema::journey::apply_movement(
+                &previous,
+                movement,
+                loc_crs.as_deref(),
+                destination_crs.as_deref(),
+            );
             if let (Some(p), Some(a), Some("LATE")) =
                 (planned, actual, movement.variation_status.as_deref())
             {
@@ -932,6 +971,7 @@ mod tests {
             }],
             by_train_uid: HashMap::new(),
             trains_id_by_tracked_train_id: HashMap::new(),
+            destination_crs_by_trains_id: HashMap::new(),
         }
     }
 
@@ -1054,6 +1094,88 @@ mod tests {
         assert_eq!(second[0].resolved_train_id, None);
     }
 
+    /// The headline scenario this feature exists for, exercised through the
+    /// real `run_once` loop end to end (not just `journey::apply_movement`
+    /// in isolation): once the reference reload has told this process a
+    /// train's own known destination CRS (`Reference::destination_crs_by_trains_id`,
+    /// seeded by `apply_reference_reload` from `TrackedTrainRef::destination_crs`),
+    /// a later ARRIVAL translating to that SAME CRS produces an event whose
+    /// `status` is `"completed"`, not the usual `"en_route"`.
+    #[tokio::test]
+    async fn an_arrival_at_the_known_destination_produces_a_completed_event() {
+        // ARRIVAL at WOK (86031 -- see this test module's own real
+        // `reference-data/stanox-crs.csv` STANOX->CRS translations).
+        let arrival_at_destination = r#"[{"header":{"msg_type":"0003"},"body":{
+            "train_id":"221832406","event_type":"ARRIVAL",
+            "planned_timestamp":"1787943000000","actual_timestamp":"1787943000000",
+            "loc_stanox":"86031","variation_status":"ON TIME"
+        }}]"#;
+        let mut feed = FakeMovementFeed::new(vec![vec![arrival_at_destination.to_string()]]);
+        let mut reference = Reference {
+            pending: Vec::new(),
+            by_train_uid: HashMap::new(),
+            trains_id_by_tracked_train_id: HashMap::new(),
+            destination_crs_by_trains_id: HashMap::new(),
+        };
+        let mut state = ProcessorState::default();
+
+        let mut resolved_ref = tracked_ref(1, "resolved", Some("221832406"));
+        resolved_ref.trains_id = Some(42);
+        resolved_ref.destination_crs = Some("WOK".to_string());
+        apply_reference_reload(vec![resolved_ref], &mut reference, &mut state);
+
+        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS)
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].status, "completed",
+            "an ARRIVAL translating to the train's own known destination CRS is confirmed \
+             evidence the journey finished"
+        );
+        assert_eq!(events[0].last_reported_location, Some("WOK".to_string()));
+    }
+
+    /// The distinction that matters most, exercised the same end-to-end way:
+    /// an ARRIVAL at an INTERMEDIATE calling point (a real, translated CRS,
+    /// just not this train's own destination) must NOT be reported as
+    /// `"completed"`, even though the train's destination IS known.
+    #[tokio::test]
+    async fn an_arrival_at_an_intermediate_stop_with_a_known_destination_stays_en_route() {
+        // ARRIVAL at PAD (73000), not this train's destination (WOK).
+        let arrival_at_intermediate_stop = r#"[{"header":{"msg_type":"0003"},"body":{
+            "train_id":"221832406","event_type":"ARRIVAL",
+            "planned_timestamp":"1787943000000","actual_timestamp":"1787943000000",
+            "loc_stanox":"73000","variation_status":"ON TIME"
+        }}]"#;
+        let mut feed = FakeMovementFeed::new(vec![vec![arrival_at_intermediate_stop.to_string()]]);
+        let mut reference = Reference {
+            pending: Vec::new(),
+            by_train_uid: HashMap::new(),
+            trains_id_by_tracked_train_id: HashMap::new(),
+            destination_crs_by_trains_id: HashMap::new(),
+        };
+        let mut state = ProcessorState::default();
+
+        let mut resolved_ref = tracked_ref(1, "resolved", Some("221832406"));
+        resolved_ref.trains_id = Some(42);
+        resolved_ref.destination_crs = Some("WOK".to_string());
+        apply_reference_reload(vec![resolved_ref], &mut reference, &mut state);
+
+        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS)
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].status, "en_route",
+            "an ARRIVAL at an intermediate stop must not be mistaken for a finished journey, \
+             even when the train's real destination is known"
+        );
+        assert_eq!(events[0].last_reported_location, Some("PAD".to_string()));
+    }
+
     #[tokio::test]
     async fn a_cancellation_after_a_movement_preserves_the_last_known_location() {
         let cancellation = r#"[{"header":{"msg_type":"0002"},"body":{
@@ -1170,6 +1292,7 @@ mod tests {
             train_uid: None,
             train_id: train_id.map(str::to_string),
             trains_id: None,
+            destination_crs: None,
         }
     }
 
@@ -1190,6 +1313,7 @@ mod tests {
             pending: Vec::new(),
             by_train_uid: HashMap::new(),
             trains_id_by_tracked_train_id: HashMap::new(),
+            destination_crs_by_trains_id: HashMap::new(),
         };
         let mut state = ProcessorState::default();
 
@@ -1230,6 +1354,7 @@ mod tests {
             pending: Vec::new(),
             by_train_uid: HashMap::new(),
             trains_id_by_tracked_train_id: HashMap::new(),
+            destination_crs_by_trains_id: HashMap::new(),
         };
         let mut state = ProcessorState::default();
 
@@ -1567,6 +1692,7 @@ mod tests {
             pending: Vec::new(),
             by_train_uid: HashMap::new(),
             trains_id_by_tracked_train_id: HashMap::new(),
+            destination_crs_by_trains_id: HashMap::new(),
         };
         reference.by_train_uid.insert("C88888".to_string(), vec![1]);
         let mut state = ProcessorState::default();
@@ -1606,6 +1732,7 @@ mod tests {
             pending: Vec::new(),
             by_train_uid: HashMap::new(),
             trains_id_by_tracked_train_id: HashMap::new(),
+            destination_crs_by_trains_id: HashMap::new(),
         };
         reference.by_train_uid.insert("C88888".to_string(), vec![1]);
         let mut state = ProcessorState::default();
@@ -1703,6 +1830,7 @@ mod tests {
             pending: Vec::new(),
             by_train_uid: HashMap::new(),
             trains_id_by_tracked_train_id: HashMap::new(),
+            destination_crs_by_trains_id: HashMap::new(),
         };
         let mut state = ProcessorState::default();
 
@@ -1725,6 +1853,7 @@ mod tests {
             pending: Vec::new(),
             by_train_uid: HashMap::from([(train_uid.to_string(), ids)]),
             trains_id_by_tracked_train_id: HashMap::new(),
+            destination_crs_by_trains_id: HashMap::new(),
         }
     }
 
@@ -1893,6 +2022,7 @@ mod tests {
                 train_uid: train_uid.map(str::to_string),
                 train_id: None,
                 trains_id: Some(99),
+                destination_crs: None,
             }
         }
 
@@ -1900,6 +2030,7 @@ mod tests {
             pending: Vec::new(),
             by_train_uid: HashMap::new(),
             trains_id_by_tracked_train_id: HashMap::new(),
+            destination_crs_by_trains_id: HashMap::new(),
         };
         let mut state = ProcessorState::default();
 
@@ -1944,6 +2075,7 @@ mod tests {
                 train_uid: Some("C88888".to_string()),
                 train_id: Some("221832406".to_string()),
                 trains_id: Some(99),
+                destination_crs: None,
             }
         }
 
@@ -1951,6 +2083,7 @@ mod tests {
             pending: Vec::new(),
             by_train_uid: HashMap::new(),
             trains_id_by_tracked_train_id: HashMap::new(),
+            destination_crs_by_trains_id: HashMap::new(),
         };
         let mut state = ProcessorState::default();
         apply_reference_reload(vec![resolved(1), resolved(2)], &mut reference, &mut state);
