@@ -127,6 +127,7 @@ mod tests {
             booked_departure: None,
             is_half_minute_arrival: false,
             is_half_minute_departure: false,
+            day_offset: 0,
         }
     }
 
