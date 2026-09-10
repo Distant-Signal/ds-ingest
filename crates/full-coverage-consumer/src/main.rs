@@ -87,10 +87,15 @@ async fn main() -> anyhow::Result<()> {
     let redis_gap_check_interval = Duration::from_secs(config.redis_gap_check_secs);
     let mut last_redis_gap_check = tokio::time::Instant::now() - redis_gap_check_interval;
 
-    // Built once, before the loop: purely static-catalogue-derived, so it
-    // only needs rebuilding when config.lines changes, which doesn't
-    // happen at runtime.
-    let tiploc_index = population::build_tiploc_index(&config.lines);
+    // Rebuilt every stanox_crs reload cycle (step 2, below), alongside
+    // `stanox` itself: as of the 2026-09-09 tiploc-schedule-matching-gap
+    // fix, this index resolves each catalogued station's real TIPLOC(s)
+    // from the live, CIF-derived stanox_crs snapshot via its CRS, not
+    // from the (mostly absent) `lines/*.toml` `tiploc` field -- so, unlike
+    // before, it can no longer be built once, purely from `config.lines`,
+    // before the loop. Starts empty until the first reload below
+    // succeeds, same as `stanox` itself starting as `StanoxTable::default()`.
+    let mut tiploc_index: HashMap<String, Vec<String>> = HashMap::new();
     let shadow_line_ids = config.shadow_line_ids();
     let defaults = common::Defaults::default();
 
@@ -143,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
                 Ok(records) => {
                     let table = stanox_tiploc::StanoxTable::from_records(&records);
                     *stanox.write().expect("stanox lock poisoned") = table;
+                    tiploc_index = population::build_tiploc_index(&config.lines, &records);
                 }
                 Err(err) => {
                     tracing::error!(error = ?err, "failed to reload stanox/crs table; keeping previous snapshot");
