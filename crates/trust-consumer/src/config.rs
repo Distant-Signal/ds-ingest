@@ -163,6 +163,25 @@ pub struct Config {
     pub metrics_port: u16,
     #[command(flatten)]
     pub metrics: common::service_args::MetricsArgs,
+
+    /// Global kill switch for
+    /// `common::trust_timestamp::parse_trust_epoch_millis_pair`'s
+    /// Europe/London-mislabelling correction (Finding #2 of the
+    /// TRUST-timestamp-correction fix). The hypothesis this correction
+    /// applies is well-evidenced but NOT vendor-confirmed, and the
+    /// plausibility guard it's built on can only catch under-correction,
+    /// never over-correction (a real, wrong-direction failure mode if the
+    /// upstream feed vendor silently fixes their own bug tomorrow -- see
+    /// that function's own module doc). Default `true` (correction on,
+    /// since this codebase is choosing to ship it) mirrors
+    /// `crates/aggregator/src/config.rs`'s `full_coverage_enabled_default`
+    /// pattern exactly: a config struct field, an env var read at startup,
+    /// defaulting to today's chosen behavior so nothing changes for a
+    /// deployment that doesn't explicitly set it, with an operator able to
+    /// flip it to `false` the instant the correction itself becomes the
+    /// suspect, without a rebuild.
+    #[arg(long, env, default_value_t = true)]
+    pub trust_timestamp_correction_enabled: bool,
 }
 
 #[cfg(test)]

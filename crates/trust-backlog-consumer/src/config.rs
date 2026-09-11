@@ -89,4 +89,15 @@ pub struct Config {
     pub metrics_port: u16,
     #[command(flatten)]
     pub metrics: common::service_args::MetricsArgs,
+
+    /// Global kill switch for
+    /// `common::trust_timestamp::parse_trust_epoch_millis_pair`'s
+    /// Europe/London-mislabelling correction. Identical field, reasoning,
+    /// and default (`true`) as `crates/trust-consumer/src/config.rs`'s own
+    /// `trust_timestamp_correction_enabled` -- see that field's doc
+    /// comment for the full rationale, mirrored from
+    /// `crates/aggregator/src/config.rs`'s `full_coverage_enabled_default`
+    /// pattern.
+    #[arg(long, env, default_value_t = true)]
+    pub trust_timestamp_correction_enabled: bool,
 }
