@@ -64,7 +64,10 @@ pub struct Config {
     pub stats_write_interval_secs: u64,
 
     /// Decision 4 -- comma-separated line ids to shadow-compute, or "*"
-    /// (default) for every catalogued line with at least one tiploc.
+    /// (default) for every catalogued line with at least one station
+    /// resolving to a real, CIF-derived TIPLOC via `stanox_crs` (see
+    /// `shadow_line_ids`'s own doc for why this is no longer the
+    /// hand-curated `lines/*.toml` `tiploc` field).
     /// Does NOT gate whether a line's stats are ever shown/escalated --
     /// that's `LineDefinition.full_coverage_enabled`, unchanged, in
     /// `aggregator`.
@@ -112,19 +115,41 @@ pub struct Config {
 
 impl Config {
     /// Resolves `shadow_lines` against the real catalogue: `"*"` means
-    /// every line `lines_to_publish`-equivalent would touch (this crate's
-    /// own analog is "has at least one tiploc"); otherwise, only the
+    /// every line with at least one station resolving to a real,
+    /// CIF-derived TIPLOC via `stanox_crs_records`; otherwise, only the
     /// comma-separated ids named, intersected with the real catalogue (an
     /// unknown id in the list is silently ignored, not an error -- an
     /// operator typo here should degrade to "shadow fewer lines than
     /// intended", never crash-loop the consumer).
     ///
-    pub fn shadow_line_ids(&self) -> Vec<String> {
+    /// As of the 2026-09-11 tiploc-schedule-matching-gap fix, the `"*"`
+    /// branch no longer gates on the hand-curated `lines/*.toml`
+    /// `Station.tiploc` field (`.is_some()`): that field is optional and
+    /// mostly absent (40 of 109 `lines/*.toml` files have ZERO manually-
+    /// filled `tiploc` entries at all), so gating on it silently excluded
+    /// ~37% of the line catalogue from shadow/full-coverage computation
+    /// entirely at startup -- this crate's fifth independent copy of the
+    /// same bug already fixed (fourth time, in this very crate) in
+    /// `population::build_tiploc_index`. A line's real TIPLOC coverage is
+    /// now determined by whether any of its stations' CRS codes appear in
+    /// a live `stanox_crs` snapshot (always present for a real station,
+    /// unlike the TOML field), mirroring `population::crs_to_tiploc_map`'s
+    /// reasoning. Callers must fetch `stanox_crs_records` before relying on
+    /// this for `"*"` resolution -- see `main.rs`'s startup sequencing.
+    pub fn shadow_line_ids(&self, stanox_crs_records: &[common::StanoxCrsRecord]) -> Vec<String> {
         if self.shadow_lines.trim() == "*" {
+            let known_crs: std::collections::HashSet<String> = stanox_crs_records
+                .iter()
+                .map(|r| r.crs.to_uppercase())
+                .collect();
             return self
                 .lines
                 .iter()
-                .filter(|l| l.stations.iter().any(|s| s.tiploc.is_some()))
+                .filter(|l| {
+                    l.stations
+                        .iter()
+                        .any(|s| known_crs.contains(&s.crs.to_uppercase()))
+                })
                 .map(|l| l.id.clone())
                 .collect();
         }
@@ -149,6 +174,14 @@ mod tests {
     use super::*;
 
     fn fixture_line(id: &str, tiploc: Option<&str>) -> LineDefinition {
+        fixture_line_with_crs(id, "ZZZ", tiploc)
+    }
+
+    /// Like `fixture_line`, but with a caller-chosen CRS -- needed to
+    /// exercise `stanox_crs_records`-based wildcard resolution, where
+    /// different lines must resolve to different real/no-real CIF
+    /// coverage outcomes.
+    fn fixture_line_with_crs(id: &str, crs: &str, tiploc: Option<&str>) -> LineDefinition {
         LineDefinition {
             id: id.to_string(),
             name: id.to_string(),
@@ -156,7 +189,7 @@ mod tests {
             category: "national-rail".to_string(),
             operators: vec![],
             stations: vec![common::Station {
-                crs: "ZZZ".to_string(),
+                crs: crs.to_string(),
                 tiploc: tiploc.map(str::to_string),
                 role: "minor".to_string(),
                 segment: None,
@@ -169,6 +202,16 @@ mod tests {
             destination_crs_filter: vec![],
             headcode_prefixes: vec![],
             full_coverage_enabled: false,
+        }
+    }
+
+    fn fixture_stanox_crs_record(crs: &str) -> common::StanoxCrsRecord {
+        common::StanoxCrsRecord {
+            stanox: format!("STANOX-{crs}"),
+            crs: crs.to_string(),
+            tiploc: format!("{crs}TPL"),
+            station_name: format!("{crs} STATION"),
+            source_sequence: 1,
         }
     }
 
@@ -210,16 +253,33 @@ mod tests {
         }
     }
 
+    /// The regression test for this crate's fifth independent instance of
+    /// the tiploc-schedule-matching-gap bug (2026-09-11): `"*"` wildcard
+    /// resolution used to gate on the hand-curated `lines/*.toml`
+    /// `Station.tiploc` field (`.is_some()`), which 40 of 109
+    /// `lines/*.toml` files never fill in for even one station -- so this
+    /// startup gate silently excluded them from shadow/full-coverage
+    /// computation entirely, even though the (already-fixed)
+    /// `population::build_tiploc_index` matching logic underneath would
+    /// have worked correctly for them once selected. A line with no TOML
+    /// `tiploc` on any station, but real CIF-confirmed TIPLOC coverage via
+    /// `stanox_crs`, must now be included; a line with genuinely no
+    /// matching `stanox_crs` record for any of its stations' CRS codes
+    /// must still be excluded.
     #[test]
-    fn wildcard_shadow_lines_includes_every_tiploc_bearing_line() {
+    fn wildcard_shadow_lines_includes_a_line_with_no_toml_tiploc_via_real_cif_data() {
         let config = base_config(
             vec![
-                fixture_line("with-tiploc", Some("ZZZTPL")),
-                fixture_line("without-tiploc", None),
+                fixture_line_with_crs("with-cif-coverage", "ZNT", None),
+                fixture_line_with_crs("without-cif-coverage", "ZZZ", None),
             ],
             "*",
         );
-        assert_eq!(config.shadow_line_ids(), vec!["with-tiploc".to_string()]);
+        let records = vec![fixture_stanox_crs_record("ZNT")];
+        assert_eq!(
+            config.shadow_line_ids(&records),
+            vec!["with-cif-coverage".to_string()]
+        );
     }
 
     #[test]
@@ -231,7 +291,7 @@ mod tests {
             ],
             "line-b, line-unknown",
         );
-        assert_eq!(config.shadow_line_ids(), vec!["line-b".to_string()]);
+        assert_eq!(config.shadow_line_ids(&[]), vec!["line-b".to_string()]);
     }
 
     /// The concrete regression test for "Deploy A changes nothing about

@@ -96,7 +96,17 @@ async fn main() -> anyhow::Result<()> {
     // before the loop. Starts empty until the first reload below
     // succeeds, same as `stanox` itself starting as `StanoxTable::default()`.
     let mut tiploc_index: HashMap<String, Vec<String>> = HashMap::new();
-    let shadow_line_ids = config.shadow_line_ids();
+    // As of the 2026-09-11 tiploc-schedule-matching-gap fix (this crate's
+    // fifth independent copy of the bug, see `Config::shadow_line_ids`'s
+    // own doc), `"*"` wildcard resolution is based on real, CIF-derived
+    // TIPLOC coverage via `stanox_crs`, the same data `tiploc_index` above
+    // is built from -- so, like `tiploc_index`, this can no longer be
+    // resolved once from `config.lines` alone before the loop. Starts
+    // empty and is (re)computed every stanox_crs reload cycle below (step
+    // 1), which now runs before step 2's population reload uses it, so
+    // even the very first loop iteration sees real coverage once that
+    // first reload succeeds.
+    let mut shadow_line_ids: Vec<String> = Vec::new();
     let defaults = common::Defaults::default();
 
     let mut population = population::Population::default();
@@ -127,28 +137,20 @@ async fn main() -> anyhow::Result<()> {
             station_state = station_correlate::StationCorrelationState::default();
         }
 
-        // 1. population reload (Decision 2b: today's AND tomorrow's, to
-        // avoid a gap at the rail-day rollover boundary).
-        if last_population_reload.elapsed() >= population_reload_interval {
-            reload_population(
-                &http,
-                &config,
-                &internal_oauth,
-                &shadow_line_ids,
-                &mut population,
-                service_date,
-            )
-            .await;
-            last_population_reload = tokio::time::Instant::now();
-        }
-
-        // 2. stanox_crs reload.
+        // 1. stanox_crs reload -- deliberately runs BEFORE step 2's
+        // population reload (2026-09-11 fix): population reload needs
+        // `shadow_line_ids`, which (as of that same fix) is itself
+        // resolved from these same `stanox_crs` records rather than the
+        // static `lines/*.toml` catalogue, so it must be refreshed here
+        // first. Previously this ran second, which didn't matter because
+        // `shadow_line_ids` was a static, pre-loop value; now it does.
         if last_stanox_crs_reload.elapsed() >= stanox_crs_reload_interval {
             match queries::fetch_stanox_crs(&http, &config.stanox_crs_url, &internal_oauth).await {
                 Ok(records) => {
                     let table = stanox_tiploc::StanoxTable::from_records(&records);
                     *stanox.write().expect("stanox lock poisoned") = table;
                     tiploc_index = population::build_tiploc_index(&config.lines, &records);
+                    shadow_line_ids = config.shadow_line_ids(&records);
                 }
                 Err(err) => {
                     tracing::error!(error = ?err, "failed to reload stanox/crs table; keeping previous snapshot");
@@ -162,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
             last_stanox_crs_reload = tokio::time::Instant::now();
         }
 
-        // 2b. redis-stream gap check -- a no-op under the Kafka backend
+        // 1b. redis-stream gap check -- a no-op under the Kafka backend
         // (ActiveFeed::check_gap returns Ok(None) immediately for that
         // variant). See docs/superpowers/specs/2026-09-04-movement-relay-design.md
         // Decision 2's "definitive gap detection."
@@ -185,6 +187,24 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             last_redis_gap_check = tokio::time::Instant::now();
+        }
+
+        // 2. population reload (Decision 2b: today's AND tomorrow's, to
+        // avoid a gap at the rail-day rollover boundary). Runs after step
+        // 1 above so it always sees this cycle's freshly-resolved
+        // `shadow_line_ids`, not a stale value from before this cycle's
+        // stanox_crs reload.
+        if last_population_reload.elapsed() >= population_reload_interval {
+            reload_population(
+                &http,
+                &config,
+                &internal_oauth,
+                &shadow_line_ids,
+                &mut population,
+                service_date,
+            )
+            .await;
+            last_population_reload = tokio::time::Instant::now();
         }
 
         // 3. consume + correlate.
