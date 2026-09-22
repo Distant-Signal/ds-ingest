@@ -1104,9 +1104,15 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tracked_train_id, 1);
@@ -1124,9 +1130,15 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert!(events.is_empty());
     }
 
@@ -1135,9 +1147,15 @@ mod tests {
         let mut feed = FakeMovementFeed::new(vec![vec![]]);
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
-        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert!(events.is_empty());
     }
 
@@ -1155,17 +1173,29 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let activation_events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let activation_events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert!(
             activation_events.is_empty(),
             "an Activation alone posts nothing"
         );
 
-        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].resolved_train_uid, Some("C21373".to_string()));
         assert_eq!(events[0].resolved_train_id, Some("221832406".to_string()));
@@ -1188,14 +1218,26 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let first = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let first = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert_eq!(first[0].resolved_train_id, Some("221832406".to_string()));
 
-        let second = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let second = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(
             second[0].tracked_train_id, 1,
@@ -1239,9 +1281,15 @@ mod tests {
         resolved_ref.destination_crs = Some("WOK".to_string());
         apply_reference_reload(vec![resolved_ref], &mut reference, &mut state);
 
-        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(
@@ -1278,9 +1326,15 @@ mod tests {
         resolved_ref.destination_crs = Some("WOK".to_string());
         apply_reference_reload(vec![resolved_ref], &mut reference, &mut state);
 
-        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(
@@ -1303,17 +1357,29 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let movement_events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let movement_events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             movement_events[0].last_reported_location,
             Some("WAT".to_string())
         );
 
-        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tracked_train_id, 1);
         assert_eq!(events[0].msg_type, "0002");
@@ -1334,9 +1400,15 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert!(
             events.is_empty(),
             "nothing to attribute the cancellation to"
@@ -1354,12 +1426,24 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
-        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].msg_type, "0006");
@@ -1376,9 +1460,15 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert!(events.is_empty());
     }
 
@@ -1389,9 +1479,15 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert!(events.is_empty());
     }
 
@@ -1442,9 +1538,15 @@ mod tests {
             "a resolved ref is not a matchable pin"
         );
 
-        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             events.len(),
             1,
@@ -1486,9 +1588,15 @@ mod tests {
             "a schedule_matched ref must be rehydrated as a matchable pending pin"
         );
 
-        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tracked_train_id, 1);
         assert_eq!(
@@ -1514,9 +1622,15 @@ mod tests {
         let mut reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let first = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let first = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert_eq!(first[0].tracked_train_id, 1);
 
         apply_reference_reload(
@@ -1525,9 +1639,15 @@ mod tests {
             &mut state,
         );
 
-        let second = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let second = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             second[0].tracked_train_id, 1,
             "the in-process resolution wins over the reload row"
@@ -1607,15 +1727,27 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let first = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let first = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert_eq!(first[0].tracked_train_id, 1);
         assert_eq!(first[0].resolved_train_id, Some("221832406".to_string()));
 
-        let second = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let second = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert!(
             second.is_empty(),
             "the only pin is already claimed by 221832406; 221832407 must not take it too",
@@ -1647,9 +1779,15 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert!(events.is_empty(), "an arrival is not an origin departure");
         assert!(
             !state.resolved.contains_key("221832499"),
@@ -1657,9 +1795,15 @@ mod tests {
         );
 
         // The pin must still be there for the train that really departs.
-        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tracked_train_id, 1);
         assert_eq!(events[0].resolved_train_id, Some("221832406".to_string()));
@@ -1678,9 +1822,15 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert!(events.is_empty());
         assert!(state.resolved.is_empty(), "the pin stays unclaimed");
     }
@@ -1743,9 +1893,15 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             state
                 .pending_activations
@@ -1760,9 +1916,15 @@ mod tests {
             "2099-01-01".parse().unwrap(),
         );
 
-        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert_eq!(events[0].resolved_train_uid, Some("C21373".to_string()));
     }
 
@@ -1777,9 +1939,15 @@ mod tests {
         let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
         let mut state = ProcessorState::default();
 
-        run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert_eq!(state.pending_activations.len(), 1);
 
         prune_expired_activations(
@@ -1812,9 +1980,15 @@ mod tests {
         reference.by_train_uid.insert("C88888".to_string(), vec![1]);
         let mut state = ProcessorState::default();
 
-        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert!(
             events.is_empty(),
             "an Activation never posts an event of its own"
@@ -1852,12 +2026,24 @@ mod tests {
         reference.by_train_uid.insert("C88888".to_string(), vec![1]);
         let mut state = ProcessorState::default();
 
-        run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
-        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tracked_train_id, 1);
         assert_eq!(events[0].resolved_train_uid, Some("C88888".to_string()));
@@ -1870,9 +2056,15 @@ mod tests {
             "loc_stanox":"86031","variation_status":"ON TIME"
         }}]"#;
         let mut feed2 = FakeMovementFeed::new(vec![vec![second_arrival.to_string()]]);
-        let second_events = run_once(&mut feed2, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let second_events = run_once(
+            &mut feed2,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert_eq!(second_events[0].resolved_train_id, None);
     }
 
@@ -2003,9 +2195,15 @@ mod tests {
         let reference = shared_ref("C88888", vec![1, 2]);
         let mut state = ProcessorState::default();
 
-        let activation_events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let activation_events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert!(activation_events.is_empty());
         assert_eq!(
             state.resolved.get("221832406"),
@@ -2013,9 +2211,15 @@ mod tests {
             "BOTH subscriptions sharing this train_uid must be attributed, not just one"
         );
 
-        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             events.len(),
             2,
@@ -2063,15 +2267,33 @@ mod tests {
         let reference = shared_ref("C88888", vec![1, 2]);
         let mut state = ProcessorState::default();
 
-        run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
-        run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
-        let later = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+        run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+        let later = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(later.len(), 2, "both subscribers keep receiving movements");
         for event in &later {
@@ -2101,15 +2323,33 @@ mod tests {
         let reference = shared_ref("C88888", vec![7, 8]);
         let mut state = ProcessorState::default();
 
-        run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
-        run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
-        let events = run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, test_received_at())
-            .await
-            .unwrap();
+        run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+        run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(events.len(), 2);
         let mut ids: Vec<i64> = events.iter().map(|e| e.tracked_train_id).collect();
