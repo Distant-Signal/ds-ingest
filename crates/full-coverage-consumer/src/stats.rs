@@ -19,6 +19,12 @@ pub(crate) fn synthesize_departure(uid: &str, derived: &DerivedState) -> Station
         delay_reason: None,
         headcode: None,
         skipped_stations: vec![], // Decision 2g -- PASS-to-skipped mapping unresolved; left empty, not guessed
+        // TRUST carries no platform signal at all -- Darwin/LDBWS is the
+        // only source of platform data in this codebase (see
+        // `StationDeparture.platform`'s own doc comment), and this is a
+        // TRUST-derived synthesis, not a real LDBWS sample.
+        platform: None,
+        planned_platform: None,
     }
 }
 
@@ -57,6 +63,8 @@ pub fn build_line_row(
                     delay_reason: None,
                     headcode: None,
                     skipped_stations: vec![],
+                    platform: None,
+                    planned_platform: None,
                 },
             },
         )
