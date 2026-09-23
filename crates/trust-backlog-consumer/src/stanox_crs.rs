@@ -300,6 +300,7 @@ mod tests {
             tiploc: "EUSTON".to_string(),
             station_name: "LONDON EUSTON".to_string(),
             source_sequence: 942,
+            change_time_minutes: None,
         }];
         let table = StanoxCrsTable::from_records(records);
         assert_eq!(table.stanox_to_crs("72410"), Some("EUS".to_string()));

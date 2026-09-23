@@ -212,6 +212,7 @@ mod tests {
             tiploc: format!("{crs}TPL"),
             station_name: format!("{crs} STATION"),
             source_sequence: 1,
+            change_time_minutes: None,
         }
     }
 

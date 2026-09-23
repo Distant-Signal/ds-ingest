@@ -1664,6 +1664,7 @@ mod tests {
             tiploc: "EUSTON".to_string(),
             station_name: "LONDON EUSTON".to_string(),
             source_sequence: 940,
+            change_time_minutes: None,
         }]);
         let cell = std::sync::RwLock::new(initial);
 
@@ -1673,6 +1674,7 @@ mod tests {
             tiploc: "EUSTON".to_string(),
             station_name: "LONDON EUSTON".to_string(),
             source_sequence: 942,
+            change_time_minutes: None,
         }];
         apply_stanox_crs_reload(Ok(fresh), &cell);
 
@@ -1690,6 +1692,7 @@ mod tests {
             tiploc: "EUSTON".to_string(),
             station_name: "LONDON EUSTON".to_string(),
             source_sequence: 940,
+            change_time_minutes: None,
         }]);
         let cell = std::sync::RwLock::new(initial);
 

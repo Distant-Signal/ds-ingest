@@ -152,6 +152,7 @@ mod tests {
             tiploc: "WATRLMN".to_string(),
             station_name: "LONDON WATERLOO".to_string(),
             source_sequence: 1,
+            change_time_minutes: None,
         }])
     }
 

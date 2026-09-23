@@ -51,6 +51,7 @@ mod tests {
                 tiploc: "WATRLMN".to_string(),
                 station_name: "LONDON WATERLOO".to_string(),
                 source_sequence: 1,
+                change_time_minutes: None,
             },
             common::StanoxCrsRecord {
                 stanox: "87701".to_string(),
@@ -58,6 +59,7 @@ mod tests {
                 tiploc: "WOKINGM".to_string(),
                 station_name: "WOKING".to_string(),
                 source_sequence: 1,
+                change_time_minutes: None,
             },
         ]
     }

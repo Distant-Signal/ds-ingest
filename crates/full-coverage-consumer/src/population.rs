@@ -213,6 +213,7 @@ mod tests {
             tiploc: tiploc.to_string(),
             station_name: format!("{crs} STATION"),
             source_sequence: 1,
+            change_time_minutes: None,
         }
     }
 
@@ -269,6 +270,7 @@ mod tests {
                 tiploc: "ZNOTIPLOC".to_string(),
                 station_name: "TEST STATION".to_string(),
                 source_sequence: 1,
+                change_time_minutes: None,
             },
             common::StanoxCrsRecord {
                 stanox: "S2".to_string(),
@@ -276,6 +278,7 @@ mod tests {
                 tiploc: "ZNOTIPLOC2".to_string(),
                 station_name: "TEST STATION".to_string(),
                 source_sequence: 1,
+                change_time_minutes: None,
             },
         ];
         let map = crs_to_tiploc_map(&records);
