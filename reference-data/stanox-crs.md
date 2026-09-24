@@ -151,6 +151,35 @@ by hand (the recipe above) is still valid and still occasionally useful for
 spot-checking the live table's output, but is no longer this crate's only
 path to a working STANOX/CRS table.
 
+## A second, TIPLOC-primary table since 2026-09-24
+
+As of docs/superpowers/plans/2026-09-24-tiploc-crs-crosswalk-plan.md, `api`
+also has a second table, `tiploc_crs` (`PRIMARY KEY (tiploc)`,
+`crates/api/migrations/20260924130000_tiploc_crs.sql`), populated by
+`crates/schedule-reference`'s new `parser::resolve_tiploc_crs`. It exists
+**alongside** the live `stanox_crs` table described above, not in place of
+it: `stanox_crs` keeps its one-row-per-STANOX shape and keeps serving the
+callers that genuinely need exactly one CRS per STANOX (`trust-consumer`'s
+STANOX-keyed reload), while `tiploc_crs` keeps EVERY TIPLOC with its own
+resolvable CRS as its own row, with no STANOX-based grouping or exclusion at
+all. `api`'s TIPLOC->CRS read paths (`queries::crs_for_tiploc`,
+`crs_for_tiplocs_batch`, `list_stanox_crs_for_crs`) now read the union of
+both tables, preferring a `tiploc_crs` row when a TIPLOC appears in both, so
+nothing that already resolved via `stanox_crs` alone stops resolving.
+
+This closes a real gap `stanox_crs`'s own STANOX-grouping model cannot close
+on its own: a STANOX covering more than one genuine calling-point TIPLOC.
+Vauxhall's two real TIPLOCs (`VAUXHLM`/`VAUXHLW`, both STANOX `87214`, both
+CRS `VXH`) and Clapham Junction's two real TIPLOCs (`CLPHMJM`/`CLPHMJW`,
+both STANOX `87219`, both CRS `CLJ`) each previously had only ONE of their
+two TIPLOCs survive into `stanox_crs`'s single row per STANOX -- the other
+silently failed to resolve, even on real, confirmed production journeys
+(`crates/api/src/data/journey.rs`'s `tiploc_key` doc comment documents the
+live example, train `L82877`). `tiploc_crs` keeps a row for each TIPLOC
+independently, so both now resolve. See
+docs/superpowers/plans/2026-09-24-tiploc-crs-crosswalk-plan.md for the full
+design, including why no STANOX-inheritance policy was needed to fix this.
+
 **A real discrepancy this transition surfaced**: this table's regeneration
 recipe above (step 2) reads `crs` directly off each `TI` line only -- it
 never fills a blank `TI` `crs` from the `MSN` file's `A` records before the
