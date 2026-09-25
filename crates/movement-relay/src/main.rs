@@ -73,6 +73,16 @@ enum Cycle {
 /// durably XADDed -- mirrors trust-consumer's own never-commit-on-a-
 /// failed-downstream-write discipline, substituting "every XADD in this
 /// record succeeded" for "the HTTP POST succeeded".
+///
+/// "Doesn't commit" is not on its own enough to keep a record: a bare
+/// `Cycle::Failed` used to leave the record behind entirely, because the
+/// next cycle's `consumer.recv()` advances librdkafka's fetch position and
+/// overwrites `last_received`, so the next SUCCESSFUL commit stored an
+/// offset PAST the record whose XADD had failed. Every failure path that
+/// happens after a batch was received therefore hands that batch back via
+/// `RawKafkaSource::retain_for_retry`, which makes the next `next_batch`
+/// re-deliver exactly it before fetching anything new. The one deliberate
+/// exception is a classification failure -- see its own comment below.
 async fn run_cycle<S, K>(source: &mut S, sink: &mut K) -> Cycle
 where
     S: RawKafkaSource,
@@ -91,34 +101,29 @@ where
         }
     };
 
-    for raw in &batch {
-        let envelopes = match trust_schema::schema::confirmed_envelope_bodies(raw) {
-            Ok(envelopes) => envelopes,
-            Err(err) => {
-                tracing::error!(error = ?err, raw = %raw, "failed to classify Kafka record; not committing this record's offset");
-                metrics::counter!(
-                    common::metrics::metric_name("movement_relay_errors_total"),
-                    "operation" => "classify_record"
-                )
-                .increment(1);
-                return Cycle::Failed;
-            }
-        };
-        for (msg_type, payload) in &envelopes {
-            if let Err(err) = sink.publish(msg_type, payload).await {
-                tracing::error!(error = ?err, msg_type, "failed to XADD envelope; not committing this record's offset");
-                metrics::counter!(
-                    common::metrics::metric_name("movement_relay_errors_total"),
-                    "operation" => "publish_event"
-                )
-                .increment(1);
-                return Cycle::Failed;
-            }
-            metrics::counter!(
-                common::metrics::metric_name("movement_relay_events_published_total"),
-                "msg_type" => msg_type.clone()
-            )
-            .increment(1);
+    match publish_batch(sink, &batch).await {
+        BatchOutcome::Published => {}
+        BatchOutcome::PublishFailed => {
+            // The downstream write failed, so this record has NOT reached
+            // `movement-events` in full. Hand it back so the next cycle
+            // re-delivers exactly it: without this, the next `recv()`
+            // advances past it and the next successful commit silently
+            // commits over it -- one permanently dropped record per retry
+            // cycle for the whole duration of a Redis outage.
+            source.retain_for_retry(batch);
+            return Cycle::Failed;
+        }
+        BatchOutcome::Unclassifiable => {
+            // Deliberately NOT retained. A record that
+            // `confirmed_envelope_bodies` rejects is unprocessable by
+            // construction -- the bytes are fixed, so every retry fails
+            // identically and can never produce an envelope to publish.
+            // Retaining it would wedge the sole movement feed forever on a
+            // single malformed record (a far larger outage than the record
+            // itself). It is logged with its raw payload and counted under
+            // `operation = "classify_record"` above, and the next cycle
+            // moves on past it.
+            return Cycle::Failed;
         }
     }
 
@@ -129,9 +134,65 @@ where
             "operation" => "commit_offsets"
         )
         .increment(1);
+        // Published but uncommitted: retained too, so the record is
+        // re-published on the next cycle rather than being skipped by the
+        // following commit. That re-publish is a duplicate `movement-events`
+        // entry, which is the at-least-once posture every consumer of that
+        // stream already handles (`MovementFeed`'s own doc: redelivery "is
+        // made safe by the `dedup_key` path") -- a duplicate is recoverable
+        // downstream, a dropped movement is not.
+        source.retain_for_retry(batch);
         return Cycle::Failed;
     }
     Cycle::Committed
+}
+
+/// Whether every envelope in `batch` made it downstream -- split out of
+/// `run_cycle` so the failing paths there can hand the owned `batch` back to
+/// the source (they cannot while a `&batch` iteration is still live).
+enum BatchOutcome {
+    Published,
+    /// A downstream XADD failed: transient, and the record must be retried.
+    PublishFailed,
+    /// The record could not be classified at all: permanent for these bytes.
+    Unclassifiable,
+}
+
+async fn publish_batch<K>(sink: &mut K, batch: &[String]) -> BatchOutcome
+where
+    K: EventSink,
+{
+    for raw in batch {
+        let envelopes = match trust_schema::schema::confirmed_envelope_bodies(raw) {
+            Ok(envelopes) => envelopes,
+            Err(err) => {
+                tracing::error!(error = ?err, raw = %raw, "failed to classify Kafka record; not committing this record's offset");
+                metrics::counter!(
+                    common::metrics::metric_name("movement_relay_errors_total"),
+                    "operation" => "classify_record"
+                )
+                .increment(1);
+                return BatchOutcome::Unclassifiable;
+            }
+        };
+        for (msg_type, payload) in &envelopes {
+            if let Err(err) = sink.publish(msg_type, payload).await {
+                tracing::error!(error = ?err, msg_type, "failed to XADD envelope; not committing this record's offset, and holding it for redelivery");
+                metrics::counter!(
+                    common::metrics::metric_name("movement_relay_errors_total"),
+                    "operation" => "publish_event"
+                )
+                .increment(1);
+                return BatchOutcome::PublishFailed;
+            }
+            metrics::counter!(
+                common::metrics::metric_name("movement_relay_events_published_total"),
+                "msg_type" => msg_type.clone()
+            )
+            .increment(1);
+        }
+    }
+    BatchOutcome::Published
 }
 
 /// Leading-indicator lag gauge (design doc Decision 2) -- polls `XINFO
@@ -320,6 +381,191 @@ mod tests {
         // recorder is installed in this unit test, matching how
         // full-coverage-consumer/src/main.rs's own existing tests already
         // treat their metrics::counter! calls.
+    }
+
+    /// One confirmed (`0003`) movement record, distinguishable from the
+    /// next by its `train_id` -- so a test can prove WHICH record reached
+    /// `movement-events`, not merely how many did.
+    fn movement_record(train_id: &str) -> String {
+        format!(
+            r#"[{{"header":{{"msg_type":"0003"}},"body":{{
+                "train_id":"{train_id}","event_type":"DEPARTURE",
+                "planned_timestamp":"1756400000000","actual_timestamp":"1756400060000",
+                "loc_stanox":"87701","variation_status":"LATE"
+            }}}}]"#
+        )
+    }
+
+    fn published_train_ids(published: &[(String, String)]) -> Vec<String> {
+        published
+            .iter()
+            .map(|(_, payload)| {
+                serde_json::from_str::<serde_json::Value>(payload).expect("payload is JSON")["body"]
+                    ["train_id"]
+                    .as_str()
+                    .expect("train_id is a string")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// A sink that fails its first `fails_remaining` publishes, modelling a
+    /// Redis outage that spans several retry cycles rather than exactly one.
+    struct OutageSink {
+        fails_remaining: usize,
+        published: Vec<(String, String)>,
+    }
+
+    #[async_trait::async_trait]
+    impl EventSink for OutageSink {
+        async fn publish(&mut self, msg_type: &str, payload: &str) -> anyhow::Result<()> {
+            if self.fails_remaining > 0 {
+                self.fails_remaining -= 1;
+                return Err(anyhow::anyhow!("simulated Redis outage"));
+            }
+            self.published
+                .push((msg_type.to_string(), payload.to_string()));
+            Ok(())
+        }
+    }
+
+    /// Regression test for the dropped-record bug: a record whose
+    /// downstream XADD failed must be RE-DELIVERED by the next cycle, not
+    /// stepped over.
+    ///
+    /// Before the fix, `Cycle::Failed` left the record behind entirely:
+    /// `next_batch` called `consumer.recv()` again on the next cycle, which
+    /// advanced librdkafka's fetch position to the FOLLOWING record and
+    /// overwrote `last_received`, so cycle 2 published record B and then
+    /// committed B's offset -- implicitly committing past record A, which
+    /// never reached `movement-events` and could never be re-read. This
+    /// test asserts on the published train_ids and the committed offsets,
+    /// both of which pinned that skip precisely: it used to see
+    /// `["B"]` / `[1]` instead of `["A", "B"]` / `[0, 1]`.
+    #[tokio::test]
+    async fn a_record_whose_xadd_failed_is_redelivered_not_skipped() {
+        let mut source = FakeRawSource::new(vec![
+            vec![movement_record("AAA")],
+            vec![movement_record("BBB")],
+        ]);
+        let mut sink = OutageSink {
+            fails_remaining: 1,
+            published: Vec::new(),
+        };
+
+        assert_eq!(run_cycle(&mut source, &mut sink).await, Cycle::Failed);
+        assert!(
+            sink.published.is_empty(),
+            "the XADD failed, so nothing left"
+        );
+        assert_eq!(source.committed_count, 0);
+
+        // Redis is back. This cycle must re-deliver AAA, NOT fetch BBB.
+        assert_eq!(run_cycle(&mut source, &mut sink).await, Cycle::Committed);
+        assert_eq!(
+            published_train_ids(&sink.published),
+            vec!["AAA".to_string()],
+            "the record whose XADD failed must be the one re-delivered"
+        );
+        assert_eq!(
+            source.committed_offsets,
+            vec![0],
+            "the commit must store the RETRIED record's own offset, never the next record's"
+        );
+
+        assert_eq!(run_cycle(&mut source, &mut sink).await, Cycle::Committed);
+        assert_eq!(
+            published_train_ids(&sink.published),
+            vec!["AAA".to_string(), "BBB".to_string()],
+            "and only then does the feed move on to the following record"
+        );
+        assert_eq!(source.committed_offsets, vec![0, 1]);
+    }
+
+    /// The same failure sustained across several retry cycles -- the real
+    /// shape of a Redis outage, which used to lose roughly one record per
+    /// `ERROR_BACKOFF` interval for as long as it lasted. Every record must
+    /// survive, in order, with no gap in the committed offsets.
+    #[tokio::test]
+    async fn a_multi_cycle_downstream_outage_loses_no_record_at_all() {
+        let ids = ["R0", "R1", "R2", "R3"];
+        let mut source =
+            FakeRawSource::new(ids.iter().map(|id| vec![movement_record(id)]).collect());
+        // Fails the first three publish attempts: R0 is refused three times
+        // over three consecutive cycles before the outage clears.
+        let mut sink = OutageSink {
+            fails_remaining: 3,
+            published: Vec::new(),
+        };
+
+        for _ in 0..3 {
+            assert_eq!(run_cycle(&mut source, &mut sink).await, Cycle::Failed);
+        }
+        assert!(sink.published.is_empty());
+        assert_eq!(source.committed_count, 0);
+
+        for _ in 0..ids.len() {
+            assert_eq!(run_cycle(&mut source, &mut sink).await, Cycle::Committed);
+        }
+
+        assert_eq!(
+            published_train_ids(&sink.published),
+            ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+            "every record touched during the outage must still be published, in order"
+        );
+        assert_eq!(
+            source.committed_offsets,
+            vec![0, 1, 2, 3],
+            "and every offset must be committed in sequence -- no skipped offset"
+        );
+    }
+
+    /// A record that published but whose OFFSET commit failed is also
+    /// retained: the following cycle re-publishes it (an accepted duplicate
+    /// on an at-least-once stream) and commits its own offset. Before the
+    /// fix, that record's offset was overwritten by the next `recv()` and
+    /// the record's own offset was never committed, so a restart replayed
+    /// from an older position -- and, worse, a failed publish in the same
+    /// window was lost outright.
+    #[tokio::test]
+    async fn a_record_whose_offset_commit_failed_is_republished_then_committed() {
+        let mut source = FakeRawSource::new(vec![vec![movement_record("AAA")]]);
+        source.fail_next_commit = true;
+        let mut sink = FakeEventSink::default();
+
+        assert_eq!(run_cycle(&mut source, &mut sink).await, Cycle::Failed);
+        assert_eq!(source.committed_offsets, Vec::<i64>::new());
+
+        assert_eq!(run_cycle(&mut source, &mut sink).await, Cycle::Committed);
+        assert_eq!(
+            published_train_ids(&sink.published),
+            vec!["AAA".to_string(), "AAA".to_string()],
+            "a duplicate XADD is the accepted at-least-once outcome here"
+        );
+        assert_eq!(source.committed_offsets, vec![0]);
+    }
+
+    /// The deliberate exception: an unclassifiable record is NOT retained,
+    /// because its bytes can never yield an envelope to publish -- retrying
+    /// it forever would wedge the sole movement feed. The feed must make
+    /// progress onto the next record instead.
+    #[tokio::test]
+    async fn an_unclassifiable_record_does_not_wedge_the_feed() {
+        let mut source = FakeRawSource::new(vec![
+            vec![r#"{"not_an_envelope": true}"#.to_string()],
+            vec![movement_record("BBB")],
+        ]);
+        let mut sink = FakeEventSink::default();
+
+        assert_eq!(run_cycle(&mut source, &mut sink).await, Cycle::Failed);
+        assert_eq!(source.committed_count, 0);
+
+        assert_eq!(run_cycle(&mut source, &mut sink).await, Cycle::Committed);
+        assert_eq!(
+            published_train_ids(&sink.published),
+            vec!["BBB".to_string()],
+            "the poison record must not be re-delivered forever"
+        );
     }
 
     #[tokio::test]

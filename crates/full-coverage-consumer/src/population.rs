@@ -29,6 +29,23 @@ impl Population {
             .insert(service_date, by_uid);
     }
 
+    /// Drops every stored date strictly older than `service_date`, and any
+    /// line left with no dates at all.
+    ///
+    /// Without this, nothing ever removed a past date: `insert` is called
+    /// for today AND tomorrow on every reload cycle (300s by default), so a
+    /// long-lived process accumulated one full per-line, per-UID
+    /// calling-point map per rail day forever -- data no longer read by
+    /// anything, since `uids_for`/`calling_points` are only ever asked about
+    /// the current `service_date`. Called at each rail-day rollover and at
+    /// the end of each reload, so the resident set stays at today+tomorrow.
+    pub fn retain_from(&mut self, service_date: chrono::NaiveDate) {
+        self.by_line.retain(|_line_id, by_date| {
+            by_date.retain(|date, _| *date >= service_date);
+            !by_date.is_empty()
+        });
+    }
+
     /// Every UID this line's population contains for `service_date`,
     /// empty if nothing has been published yet (Decision 2e's Pending
     /// case, upstream of the rail-day gate).
