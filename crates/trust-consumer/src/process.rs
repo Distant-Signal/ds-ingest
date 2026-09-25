@@ -2447,11 +2447,13 @@ mod tests {
                     tracked_train_id: 1, // created first, 13 minutes away
                     pin_origin_crs: "WAT".to_string(),
                     pin_scheduled_departure: "2026-08-28T18:32:00Z".parse().unwrap(),
+                    train_uid: None,
                 },
                 PendingPin {
                     tracked_train_id: 2, // created second, 1 minute away
                     pin_origin_crs: "WAT".to_string(),
                     pin_scheduled_departure: "2026-08-28T18:46:00Z".parse().unwrap(),
+                    train_uid: None,
                 },
             ],
             by_train_uid: HashMap::new(),
@@ -3625,14 +3627,16 @@ mod tests {
         "schedule_start_date":"2026-08-28","schedule_end_date":"2026-08-28"
     }}]"#;
 
-    /// An origin DEPARTURE at WAT 14 minutes BEFORE the pin every test here
-    /// builds is scheduled to leave -- well inside `common::MATCH_TOLERANCE`
-    /// (20 minutes), so the CRS+time heuristic alone says "claim it". Raw
-    /// wire value is one hour later than the true instant, per this test
-    /// module's own timestamp convention (see `ORIGIN_DEPARTURE`).
+    /// An origin DEPARTURE at WAT 3 minutes BEFORE the pin every test here
+    /// builds is scheduled to leave -- well inside
+    /// `matching::SCHEDULED_DEPARTURE_TOLERANCE` (5 minutes, matched on
+    /// `planned_timestamp` -- the booked time -- since this crate's own
+    /// 2026-09-25 fix), so the CRS+time heuristic alone says "claim it".
+    /// Raw wire value is one hour later than the true instant, per this
+    /// test module's own timestamp convention (see `ORIGIN_DEPARTURE`).
     const EARLIER_ORIGIN_DEPARTURE: &str = r#"[{"header":{"msg_type":"0003"},"body":{
         "train_id":"221832406","event_type":"DEPARTURE",
-        "planned_timestamp":"1787944680000","actual_timestamp":"1787944680000",
+        "planned_timestamp":"1787945340000","actual_timestamp":"1787945340000",
         "loc_stanox":"87212","variation_status":"ON TIME"
     }}]"#;
 
@@ -3653,8 +3657,8 @@ mod tests {
     /// THE REGRESSION TEST for the confirmed production bug: a pin that
     /// already knows its own schedule identity must not be claimed by
     /// another train's origin departure just because the two leave the same
-    /// station inside the +/-20-minute window. Before the contradiction
-    /// filter this produced a `freshly_resolved` event, bound
+    /// station inside the CRS+time heuristic's tolerance window. Before the
+    /// contradiction filter this produced a `freshly_resolved` event, bound
     /// `state.resolved` for the life of the process, and made the user's
     /// not-yet-departed train read "en_route" with a different train's
     /// movements behind it.
@@ -3834,7 +3838,13 @@ mod tests {
         );
         assert_eq!(
             reference.by_train_uid.get("Y80926").map(Vec::as_slice),
-            Some([9i64].as_slice()),
+            Some(
+                [SharingSubscription {
+                    tracked_train_id: 9,
+                    service_date: "2026-08-28".parse().unwrap(),
+                }]
+                .as_slice()
+            ),
             "and must still be reachable by the Activation direct match"
         );
     }
