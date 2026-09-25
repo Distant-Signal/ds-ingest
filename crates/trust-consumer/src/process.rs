@@ -357,6 +357,11 @@ pub fn apply_reference_reload(
                         tracked_train_id: tracked.id,
                         pin_origin_crs,
                         pin_scheduled_departure,
+                        // Carried so `process_message`'s contradiction
+                        // filter can refuse a CRS+time claim that a parked
+                        // Activation already proves is for a different
+                        // schedule -- see that filter's own comment.
+                        train_uid: tracked.train_uid,
                     });
                 }
             }
@@ -761,10 +766,81 @@ fn process_message(
                         // keeps that module a pure function of its arguments.
                         let claimed: HashSet<i64> =
                             state.resolved.values().flatten().copied().collect();
+
+                        // CONTRADICTION FILTER -- the fix for a confirmed
+                        // production mis-attribution (2026-09-25). A pin
+                        // that already knows its own CIF identity
+                        // (`PendingPin::train_uid`, set for every
+                        // `schedule_matched`/NR-primary subscription) is
+                        // still offered to this ±20-minute CRS+time
+                        // heuristic, deliberately, as a fallback for
+                        // whichever pins the Activation direct match
+                        // (`by_train_uid`) didn't catch -- see
+                        // `apply_reference_reload`'s own comment and
+                        // Decision 3 of
+                        // docs/superpowers/specs/2026-09-05-schedule-first-train-tracking-design.md.
+                        // But when this process has ALSO parked an
+                        // Activation for the `train_id` now trying to claim
+                        // a pin, it already knows -- for certain, from
+                        // TRUST's own `0001` message -- which `train_uid`
+                        // that `train_id` is. A pin naming a DIFFERENT
+                        // `train_uid` is then provably not this train, and
+                        // must not be claimed however well the location and
+                        // the ±20-minute window happen to line up.
+                        //
+                        // The real case this closes: London Euston, 2026-09-25.
+                        // A user tracked `Y80926` (the 18:56 to Birmingham
+                        // New Street, `pin_scheduled_departure` 17:56:00Z).
+                        // TRUST reported `train_id` `721F34MX25` -- whose
+                        // own Activation names `train_uid` `W34058`, the
+                        // 18:43 Euston to Liverpool Lime Street -- departing
+                        // EUSTON at 17:42:00Z. That is 14 minutes from the
+                        // pin's scheduled departure, comfortably inside
+                        // `common::MATCH_TOLERANCE`, so the heuristic
+                        // claimed the pin, and every subsequent movement of
+                        // the Liverpool train (Wembley Central, Harrow &
+                        // Wealdstone, Watford Junction) was written onto the
+                        // Birmingham train's shared row. The user's journey
+                        // read "En route" -- via `trust_schema::journey::
+                        // apply_movement`'s `en_route`, faithfully rendered
+                        // by `frontend/components/TrackedTrainStatusBadge.tsx`
+                        // -- a quarter of an hour before their train had
+                        // left, with another train's calling points filled
+                        // in behind it.
+                        //
+                        // Filtered here, alongside the `claimed` filter
+                        // below, rather than inside `matching`, for the
+                        // reason that filter already gives: that module
+                        // stays a pure CRS+time function of its arguments.
+                        //
+                        // Known residual: `pending_activations` is in-memory
+                        // and one-shot, so this guard can only fire when
+                        // THIS process saw the Activation for this
+                        // `train_id` and no Movement has claimed it yet. A
+                        // restart between Activation and origin departure
+                        // leaves the old behavior exactly as it was -- this
+                        // narrows the mis-attribution window, it does not
+                        // close it, and nothing here weakens any path that
+                        // resolved correctly before.
+                        let movement_train_uid = state
+                            .pending_activations
+                            .get(&movement.train_id)
+                            .map(|activation| activation.train_uid.as_str());
+
                         let unclaimed: Vec<crate::matching::PendingPin> = reference
                             .pending
                             .iter()
                             .filter(|pin| !claimed.contains(&pin.tracked_train_id))
+                            .filter(|pin| match (pin.train_uid.as_deref(), movement_train_uid) {
+                                // Both identities known and different: a
+                                // provable mismatch, never a claim.
+                                (Some(pin_uid), Some(movement_uid)) => {
+                                    pin_uid.eq_ignore_ascii_case(movement_uid)
+                                }
+                                // Either side unknown -- the heuristic is
+                                // all there is, exactly as before.
+                                _ => true,
+                            })
                             .cloned()
                             .collect();
 
@@ -1068,6 +1144,7 @@ mod tests {
                 tracked_train_id: id,
                 pin_origin_crs: crs.to_string(),
                 pin_scheduled_departure: scheduled.parse().unwrap(),
+                train_uid: None,
             }],
             by_train_uid: HashMap::new(),
             trains_id_by_tracked_train_id: HashMap::new(),
@@ -2492,5 +2569,234 @@ mod tests {
         let signals = build_forward_signals(&[event(1), event(2)], &trains_id_by_tracked_train_id);
         assert_eq!(signals.len(), 1, "one shared train, one forwarding signal");
         assert_eq!(signals[0].trains_id, 42);
+    }
+
+    // --- Contradiction filter: a parked Activation's own train_uid vetoes a
+    // CRS+time claim on a pin that names a different schedule (the
+    // 2026-09-25 London Euston mis-attribution; see `process_message`'s own
+    // comment on the filter for the full production case) ---
+
+    /// An Activation binding `train_id` `221832406` to `train_uid`
+    /// `"W34058"` -- the schedule that train_id REALLY is. Deliberately a
+    /// different `train_uid` from `SHARED_ACTIVATION`'s `"C88888"`, so a
+    /// test using this one can't accidentally satisfy `by_train_uid` too.
+    const OTHER_SCHEDULES_ACTIVATION: &str = r#"[{"header":{"msg_type":"0001"},"body":{
+        "train_id":"221832406","train_uid":"W34058","toc_id":"VT",
+        "train_service_code":"22345000","schedule_wtt_id":"WTT1",
+        "schedule_start_date":"2026-08-28","schedule_end_date":"2026-08-28"
+    }}]"#;
+
+    /// An origin DEPARTURE at WAT 14 minutes BEFORE the pin every test here
+    /// builds is scheduled to leave -- well inside `common::MATCH_TOLERANCE`
+    /// (20 minutes), so the CRS+time heuristic alone says "claim it". Raw
+    /// wire value is one hour later than the true instant, per this test
+    /// module's own timestamp convention (see `ORIGIN_DEPARTURE`).
+    const EARLIER_ORIGIN_DEPARTURE: &str = r#"[{"header":{"msg_type":"0003"},"body":{
+        "train_id":"221832406","event_type":"DEPARTURE",
+        "planned_timestamp":"1787944680000","actual_timestamp":"1787944680000",
+        "loc_stanox":"87212","variation_status":"ON TIME"
+    }}]"#;
+
+    fn reference_with_one_schedule_matched_pin(train_uid: Option<&str>) -> Reference {
+        Reference {
+            pending: vec![PendingPin {
+                tracked_train_id: 1,
+                pin_origin_crs: "WAT".to_string(),
+                pin_scheduled_departure: "2026-08-28T18:32:00Z".parse().unwrap(),
+                train_uid: train_uid.map(str::to_string),
+            }],
+            by_train_uid: HashMap::new(),
+            trains_id_by_tracked_train_id: HashMap::new(),
+            destination_crs_by_trains_id: HashMap::new(),
+        }
+    }
+
+    /// THE REGRESSION TEST for the confirmed production bug: a pin that
+    /// already knows its own schedule identity must not be claimed by
+    /// another train's origin departure just because the two leave the same
+    /// station inside the +/-20-minute window. Before the contradiction
+    /// filter this produced a `freshly_resolved` event, bound
+    /// `state.resolved` for the life of the process, and made the user's
+    /// not-yet-departed train read "en_route" with a different train's
+    /// movements behind it.
+    #[tokio::test]
+    async fn a_parked_activation_for_a_different_schedule_cannot_claim_a_pin_by_crs_and_time() {
+        let mut feed = FakeMovementFeed::new(vec![vec![
+            OTHER_SCHEDULES_ACTIVATION.to_string(),
+            EARLIER_ORIGIN_DEPARTURE.to_string(),
+        ]]);
+        // The pin tracks `Y80926`; the Activation says this train_id is
+        // `W34058`. Nothing in `by_train_uid`, so the direct match can't
+        // fire and the CRS+time heuristic is the only path left.
+        let reference = reference_with_one_schedule_matched_pin(Some("Y80926"));
+        let mut state = ProcessorState::default();
+
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            events.is_empty(),
+            "a train TRUST itself says is W34058 must not claim a pin tracking Y80926, however              well its origin departure lines up: got {events:?}"
+        );
+        assert!(
+            !state.resolved.contains_key("221832406"),
+            "the claim must not be recorded either -- state.resolved has no unwind path, so a              wrong binding here locks the pin out for the life of the process"
+        );
+    }
+
+    /// The other side of the same filter: when the parked Activation names
+    /// the SAME schedule the pin is tracking, the CRS+time fallback must
+    /// still resolve it. This is the real path for a subscription created
+    /// AFTER its train's Activation was already parked -- `by_train_uid`
+    /// never saw it at Activation time, so the heuristic is what rescues it.
+    #[tokio::test]
+    async fn a_parked_activation_for_the_same_schedule_still_allows_the_crs_and_time_claim() {
+        let mut feed = FakeMovementFeed::new(vec![vec![
+            OTHER_SCHEDULES_ACTIVATION.to_string(),
+            EARLIER_ORIGIN_DEPARTURE.to_string(),
+        ]]);
+        let reference = reference_with_one_schedule_matched_pin(Some("W34058"));
+        let mut state = ProcessorState::default();
+
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(events.len(), 1, "the matching pin must still be claimed");
+        assert_eq!(events[0].tracked_train_id, 1);
+        assert_eq!(events[0].resolved_train_id, Some("221832406".to_string()));
+        assert_eq!(events[0].resolved_train_uid, Some("W34058".to_string()));
+        assert_eq!(events[0].status, "en_route");
+    }
+
+    /// The comparison is case-insensitive on both sides, same posture as
+    /// every other identity comparison in this codebase -- a lowercased
+    /// `train_uid` must not read as a contradiction.
+    #[tokio::test]
+    async fn the_contradiction_filter_compares_train_uids_case_insensitively() {
+        let mut feed = FakeMovementFeed::new(vec![vec![
+            OTHER_SCHEDULES_ACTIVATION.to_string(),
+            EARLIER_ORIGIN_DEPARTURE.to_string(),
+        ]]);
+        let reference = reference_with_one_schedule_matched_pin(Some("w34058"));
+        let mut state = ProcessorState::default();
+
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(events.len(), 1, "casing alone is not a contradiction");
+        assert_eq!(events[0].tracked_train_id, 1);
+    }
+
+    /// A pin that genuinely has no schedule identity of its own is
+    /// unaffected: the heuristic is all it has ever had, and this filter
+    /// must not take it away.
+    #[tokio::test]
+    async fn a_pin_with_no_known_train_uid_is_still_claimable_when_an_activation_names_one() {
+        let mut feed = FakeMovementFeed::new(vec![vec![
+            OTHER_SCHEDULES_ACTIVATION.to_string(),
+            EARLIER_ORIGIN_DEPARTURE.to_string(),
+        ]]);
+        let reference = reference_with_one_schedule_matched_pin(None);
+        let mut state = ProcessorState::default();
+
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tracked_train_id, 1);
+        assert_eq!(events[0].resolved_train_uid, Some("W34058".to_string()));
+    }
+
+    /// With NO Activation parked at all (this process started after it was
+    /// delivered, or the feed never sent one), there is nothing to
+    /// contradict and the pre-fix behavior is preserved exactly -- the
+    /// filter's named residual limitation, pinned by a test so a future
+    /// change to it is deliberate.
+    #[tokio::test]
+    async fn without_a_parked_activation_the_heuristic_is_unchanged_even_for_a_named_pin() {
+        let mut feed = FakeMovementFeed::new(vec![vec![EARLIER_ORIGIN_DEPARTURE.to_string()]]);
+        let reference = reference_with_one_schedule_matched_pin(Some("Y80926"));
+        let mut state = ProcessorState::default();
+
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tracked_train_id, 1);
+        assert_eq!(
+            events[0].resolved_train_uid, None,
+            "no Activation was ever parked for this train_id"
+        );
+    }
+
+    /// `apply_reference_reload` must actually carry a ref's `train_uid` onto
+    /// the `PendingPin` it builds -- without this the filter above can never
+    /// fire in production, however correct it is in isolation.
+    #[test]
+    fn apply_reference_reload_carries_a_refs_train_uid_onto_its_pending_pin() {
+        let tracked = common::TrackedTrainRef {
+            id: 9,
+            service_date: "2026-08-28".parse().unwrap(),
+            pin_origin_crs: Some("WAT".to_string()),
+            pin_scheduled_departure: Some("2026-08-28T18:32:00Z".parse().unwrap()),
+            resolution_status: "schedule_matched".to_string(),
+            train_uid: Some("Y80926".to_string()),
+            train_id: None,
+            trains_id: None,
+            destination_crs: None,
+        };
+        let mut reference = Reference {
+            pending: Vec::new(),
+            by_train_uid: HashMap::new(),
+            trains_id_by_tracked_train_id: HashMap::new(),
+            destination_crs_by_trains_id: HashMap::new(),
+        };
+        let mut state = ProcessorState::default();
+
+        apply_reference_reload(vec![tracked], &mut reference, &mut state);
+
+        assert_eq!(reference.pending.len(), 1);
+        assert_eq!(
+            reference.pending[0].train_uid,
+            Some("Y80926".to_string()),
+            "the pin must remember the schedule it is tracking"
+        );
+        assert_eq!(
+            reference.by_train_uid.get("Y80926").map(Vec::as_slice),
+            Some([9i64].as_slice()),
+            "and must still be reachable by the Activation direct match"
+        );
     }
 }

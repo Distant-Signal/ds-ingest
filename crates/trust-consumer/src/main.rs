@@ -312,6 +312,7 @@ mod tests {
                 tracked_train_id: 1,
                 pin_origin_crs: "WAT".to_string(),
                 pin_scheduled_departure: "2026-08-28T18:32:00Z".parse().unwrap(),
+                train_uid: None,
             }],
             by_train_uid: std::collections::HashMap::new(),
             trains_id_by_tracked_train_id: std::collections::HashMap::new(),

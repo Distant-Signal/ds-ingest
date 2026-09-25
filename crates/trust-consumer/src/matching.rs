@@ -13,6 +13,20 @@ pub struct PendingPin {
     pub tracked_train_id: i64,
     pub pin_origin_crs: String,
     pub pin_scheduled_departure: DateTime<Utc>,
+    /// The CIF schedule identity this pin ALREADY knows it is tracking
+    /// (`common::TrackedTrainRef::train_uid`), when it has one -- a
+    /// `schedule_matched` subscription, or an NR-primary one created via
+    /// `POST /Train/by-uid/.../track`. `None` for a plain `pending` pin that
+    /// genuinely only knows an origin CRS and a scheduled departure time.
+    ///
+    /// Deliberately NOT consulted by [`resolve_origin_departure`] below,
+    /// which stays a pure CRS+time heuristic. It exists for
+    /// `process::process_message`'s own contradiction filter, which drops a
+    /// pin from the candidate set entirely when a parked Activation has
+    /// already told this process that the claiming Movement's `train_id`
+    /// belongs to a DIFFERENT `train_uid` -- see that filter's own comment
+    /// for the production mis-attribution it closes.
+    pub train_uid: Option<String>,
 }
 
 /// `loc_crs` is the origin-departure Movement event's location, already
@@ -81,6 +95,10 @@ mod tests {
             tracked_train_id: id,
             pin_origin_crs: crs.to_string(),
             pin_scheduled_departure: scheduled.parse().unwrap(),
+            // This function never reads `train_uid` (see its own doc
+            // comment) -- the contradiction filter that does lives in
+            // `process`, and is covered by that module's own tests.
+            train_uid: None,
         }
     }
 
