@@ -14,13 +14,23 @@
 //!   themselves a real journey event (Cancellation), per the plan's own
 //!   reasoning.
 //!
-//! `service_date` for a bare Movement/Cancellation (neither carries a
-//! date field) is sourced from a parked Activation's own `service_date`
-//! when one has been observed for this `train_id` in-process, falling
-//! back to the current Europe/London rail day otherwise -- an accepted
-//! approximation identical in kind to `trust-consumer::process.rs`'s own
-//! pre-existing "an Activation this process never saw" gap, not a new
-//! one this module invents.
+//! `service_date` for a Movement/Cancellation is sourced from a parked
+//! Activation's own `service_date` when one has been observed for this
+//! `train_id` in-process; failing that (Low finding #3 of the 2026-09-25
+//! review's own fix), from the Europe/London rail day the message's OWN
+//! timestamp falls in -- a Movement's `actual`/`planned` timestamp, or a
+//! Cancellation's `canx_timestamp` -- and only as a last resort, when this
+//! message carries no parseable timestamp of its own either, the current
+//! processing-time rail day (`today`, passed in by the caller). Before this
+//! fix that last resort was the ONLY fallback, which misfiled a message
+//! under the wrong rail day whenever processing lagged the message's own
+//! real-world time across the 02:00 cutover (a restart, a catch-up
+//! backlog) -- see `process_message`'s own comments on the Movement/
+//! Cancellation arms for the detail. An accepted approximation remains for
+//! Activation only (which carries no usable timestamp of its own at all,
+//! `schedule_start_date` deliberately excluded -- see below), identical in
+//! kind to `trust-consumer::process.rs`'s own pre-existing "an Activation
+//! this process never saw" gap, not a new one this module invents.
 //!
 //! An Activation's own `service_date` is the Europe/London rail day this
 //! process was on when it handled the Activation message (`today`,
@@ -239,11 +249,52 @@ pub fn process_message(
                 _ => None,
             };
 
+            // **Low finding #3 of the 2026-09-25 review.** The parked
+            // Activation's own `service_date` is preferred first, unchanged
+            // -- it is the authoritative, already-established running day
+            // for this `train_id`. But the OLD fallback here was `today`,
+            // the rail day this BATCH happened to be processed on
+            // (`main.rs`'s `chrono::Utc::now()` at `next_batch` time, passed
+            // in as `today`/`received_at`) -- wall-clock time, not this
+            // Movement's own event time. Under any processing delay or
+            // catch-up backlog that spans the 02:00 Europe/London rail-day
+            // cutover (a restart, a slow consumer falling behind, a burst of
+            // queued messages worked through after 02:00), a Movement whose
+            // REAL `actual`/`planned` timestamp falls in the earlier rail day
+            // was filed under the LATER one instead -- exactly the "late-night
+            // event misfiled under the wrong day" class of bug
+            // `common::rail_day::current_rail_day`'s own doc comment already
+            // warns a bare wall-clock read causes. This consumer already has
+            // a real per-event timestamp in scope for a Movement (`actual`,
+            // falling back to `planned`) whenever this `train_id`'s
+            // Activation was never parked, so deriving the rail day from
+            // that -- not the processing clock -- is a strictly better
+            // fallback: it dates the event by when it actually happened,
+            // just like the parked-Activation path already does.
+            //
+            // `today` remains the LAST-resort fallback, for the rare case
+            // this Movement itself carries no parseable timestamp either
+            // (both `planned_timestamp`/`actual_timestamp` missing or
+            // corrupted) -- there is genuinely nothing else to date it by.
+            //
+            // Deliberately NOT applied to `dedup`'s own `event_date` below:
+            // `trust_schema::dedup::dedup_key`'s doc comment makes that date
+            // a hard cross-consumer invariant (it MUST be "the rail day the
+            // message was processed on," in every caller, so this consumer
+            // and `trust-consumer` agree on the same key for the same live
+            // message) -- changing it here would desync the two and defeat
+            // `ON CONFLICT (trains_id, dedup_key)`'s de-duplication instead
+            // of fixing a bug.
             let service_date = state
                 .pending_service_dates
                 .get(&movement.train_id)
                 .copied()
-                .unwrap_or(today);
+                .unwrap_or_else(|| {
+                    actual
+                        .or(planned)
+                        .map(common::rail_day::current_rail_day)
+                        .unwrap_or(today)
+                });
 
             let dedup = trust_schema::dedup::dedup_key(
                 &movement.train_id,
@@ -270,11 +321,6 @@ pub fn process_message(
         }
 
         TrustMessage::Cancellation(cancellation) => {
-            let service_date = state
-                .pending_service_dates
-                .get(&cancellation.train_id)
-                .copied()
-                .unwrap_or(today);
             // Same decision function as a Movement's fields, with
             // `planned: None` (a Cancellation has no companion field) --
             // keeps this path under the same guard, kill switch, and
@@ -296,6 +342,25 @@ pub fn process_message(
                 .increment(1);
             }
             let actual = canx_pair.actual;
+
+            // Low finding #3, same fix and same reasoning as the Movement
+            // arm above: prefer the parked Activation's own `service_date`,
+            // then this Cancellation's own `canx_timestamp` (`actual`,
+            // computed just above -- this is why it's computed before this
+            // line rather than after, unlike the pre-fix ordering), and only
+            // fall back to the processing-time `today` when neither is
+            // available. `dedup`'s `event_date` below is deliberately left
+            // as `today` for the same cross-consumer-invariant reason
+            // documented on the Movement arm.
+            let service_date = state
+                .pending_service_dates
+                .get(&cancellation.train_id)
+                .copied()
+                .unwrap_or_else(|| {
+                    actual
+                        .map(common::rail_day::current_rail_day)
+                        .unwrap_or(today)
+                });
 
             // A Cancellation's key carries nothing but `(train_id, msg_type)`
             // otherwise, and `api`'s `trust_event_backlog` enforces a GLOBAL
@@ -574,14 +639,66 @@ mod tests {
         assert_eq!(result.service_date, today);
     }
 
+    /// **Low finding #3 of the 2026-09-25 review, this fix's own regression
+    /// test.** `movement()`'s fixture timestamp (`1787941920000` millis) is
+    /// deliberately 2026-08-28 -- a different DAY from `today()`
+    /// (2026-09-05, standing in here for "whatever rail day this batch
+    /// happens to be processed on"). Before this fix, a Movement with no
+    /// parked Activation fell back to `today` unconditionally, so this
+    /// exact fixture would have come back service_date-2026-09-05 -- the
+    /// PROCESSING day, not the day the event actually happened. After the
+    /// fix, it must come back dated by its own `actual_timestamp` (run
+    /// through the same Europe/London correction every other caller
+    /// applies) instead: 2026-08-28.
     #[test]
-    fn a_movement_with_no_parked_activation_falls_back_to_today() {
+    fn a_movement_with_no_parked_activation_uses_its_own_event_timestamps_rail_day() {
         let message = TrustMessage::Movement(movement(
             "999999999",
             "DEPARTURE",
             Some("87212"),
             Some("ON TIME"),
         ));
+        let mut state = ProcessorState::default();
+        let result = process_message(
+            &message,
+            &mut state,
+            &stanox_table(),
+            &crs_index_with(&["WAT"]),
+            today(),
+            test_received_at(),
+        )
+        .unwrap();
+        assert_ne!(
+            result.service_date,
+            today(),
+            "the fixture's own event timestamp and `today()` are deliberately different days -- \
+             this proves the fix actually consults the event's own timestamp rather than \
+             coincidentally matching `today` anyway"
+        );
+        assert_eq!(
+            result.service_date,
+            "2026-08-28".parse::<NaiveDate>().unwrap(),
+            "the rail day `1787941920000` millis (Europe/London-corrected) actually falls in"
+        );
+    }
+
+    /// The genuine last-resort case: no parked Activation AND no parseable
+    /// timestamp of its own either (both fields missing) -- there is
+    /// nothing left to date the event by except the processing-time
+    /// fallback, so `today` is still the right answer here.
+    #[test]
+    fn a_movement_with_no_parked_activation_and_no_parseable_timestamp_falls_back_to_today() {
+        let message = TrustMessage::Movement(trust_schema::schema::Movement {
+            train_id: "999999999".to_string(),
+            event_type: "DEPARTURE".to_string(),
+            gbtt_timestamp: None,
+            planned_timestamp: None,
+            actual_timestamp: None,
+            reporting_stanox: None,
+            loc_stanox: Some("87212".to_string()),
+            toc_id: None,
+            variation_status: Some("ON TIME".to_string()),
+        });
         let mut state = ProcessorState::default();
         let result = process_message(
             &message,
@@ -677,8 +794,9 @@ mod tests {
     /// train makes every Movement of the NEXT train to reuse that `train_id`
     /// -- when this process missed that train's own Activation -- get filed
     /// under the old train's `service_date` and stamped with the old train's
-    /// `train_uid`. After pruning, the same Movement falls back to `today`
-    /// and carries no uid: honestly approximate instead of confidently wrong.
+    /// `train_uid`. After pruning, the same Movement falls back to its own
+    /// event timestamp's rail day (Low finding #3's fix) and carries no uid:
+    /// honestly approximate instead of confidently wrong.
     #[test]
     fn a_recycled_train_id_is_not_misfiled_under_the_previous_trains_service_date() {
         let mut state = ProcessorState::default();
@@ -725,13 +843,67 @@ mod tests {
         .unwrap();
         assert_eq!(
             result.service_date,
-            today(),
-            "with the stale entry gone, the movement is filed under the day it actually happened"
+            "2026-08-28".parse::<NaiveDate>().unwrap(),
+            "with the stale entry gone, the movement is filed under the day it actually \
+             happened -- this fixture's own event timestamp's rail day, not the processing \
+             day `today()`"
         );
         assert_eq!(
             result.train_uid, None,
             "and carries no uid rather than a completely unrelated train's"
         );
+    }
+
+    /// The Cancellation-arm twin of
+    /// `a_movement_with_no_parked_activation_uses_its_own_event_timestamps_rail_day`:
+    /// a Cancellation with no parked Activation must date itself by its own
+    /// `canx_timestamp`, not by the processing-time `today`.
+    #[test]
+    fn a_cancellation_with_no_parked_activation_uses_its_own_event_timestamps_rail_day() {
+        let cancellation = TrustMessage::Cancellation(trust_schema::schema::Cancellation {
+            train_id: "999999999".to_string(),
+            canx_timestamp: Some("1787941920000".to_string()),
+            canx_reason_code: None,
+            canx_type: None,
+        });
+        let mut state = ProcessorState::default();
+        let result = process_message(
+            &cancellation,
+            &mut state,
+            &stanox_table(),
+            &crs_index_with(&["WAT"]),
+            today(),
+            test_received_at(),
+        )
+        .unwrap();
+        assert_eq!(
+            result.service_date,
+            "2026-08-28".parse::<NaiveDate>().unwrap(),
+            "must be dated by its own canx_timestamp's rail day, not the processing day `today()`"
+        );
+    }
+
+    /// And the Cancellation-arm last resort: no parked Activation AND no
+    /// parseable `canx_timestamp` either -- `today` remains the only option.
+    #[test]
+    fn a_cancellation_with_no_parked_activation_and_no_timestamp_falls_back_to_today() {
+        let cancellation = TrustMessage::Cancellation(trust_schema::schema::Cancellation {
+            train_id: "999999999".to_string(),
+            canx_timestamp: None,
+            canx_reason_code: None,
+            canx_type: None,
+        });
+        let mut state = ProcessorState::default();
+        let result = process_message(
+            &cancellation,
+            &mut state,
+            &stanox_table(),
+            &crs_index_with(&["WAT"]),
+            today(),
+            test_received_at(),
+        )
+        .unwrap();
+        assert_eq!(result.service_date, today());
     }
 
     // --- Dedup keys (finding #6) ---

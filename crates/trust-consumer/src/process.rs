@@ -54,6 +54,23 @@
 //! restructuring when this module mutates its maps relative to the batch's
 //! HTTP post -- is now done, see the next section.
 //!
+//! **One sub-case of the above IS now closed (Low finding #2 of the
+//! 2026-09-25 review): a Cancellation.** A `TrustMessage::Cancellation`
+//! below never carries `resolved_train_uid`/`resolved_train_id` either --
+//! there is no new identity to report, only the fact the journey is over --
+//! so it hits this exact gap even when this process DID observe the
+//! Activation (`state.resolved` already attributed the subscription, just
+//! never through a resolving Movement). Left alone, a subscription whose
+//! train was cancelled before ever departing its origin stayed
+//! `resolution_status = 'pending'` forever. `crates/api`'s
+//! `upsert_train_event` now reads this module's own `derived.status ==
+//! "cancelled"` (already sent on every event below, unchanged) to flip such
+//! a subscription to `'unresolved'` instead -- see
+//! `train_tracking::mark_subscription_unresolved_on_cancellation`. The
+//! general "Activation this process never saw" gap above is unaffected: it
+//! is specifically about a resolving MOVEMENT going out without an identity,
+//! which a Cancellation was never going to supply anyway.
+//!
 //! **Every in-memory mutation this module makes is undone if the batch's
 //! downstream POST fails (finding #4 of the 2026-09-25 review).**
 //! `process_message` still mutates `state.resolved`,
