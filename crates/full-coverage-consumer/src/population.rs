@@ -128,6 +128,9 @@ mod tests {
             is_half_minute_arrival: false,
             is_half_minute_departure: false,
             day_offset: 0,
+            activity: String::new(),
+            public_arrival: None,
+            public_departure: None,
         }
     }
 
