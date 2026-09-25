@@ -73,15 +73,45 @@ pub struct KafkaRawSource {
     pending_retry: Option<Vec<String>>,
 }
 
+/// Worst-case time `run_cycle` can spend doing inline downstream work
+/// between one `consumer.recv()` and the next, so librdkafka's own
+/// `max.poll.interval.ms` liveness timeout is set to comfortably outlast it
+/// instead of quietly relying on the library's raw 300_000ms (5 minute)
+/// default being enough.
+///
+/// **The shape of the risk**: `next_batch` fetches exactly ONE Kafka record
+/// per call, but that record's body is a JSON array of individual TRUST
+/// envelopes -- `main.rs::publish_batch` then issues one synchronous Redis
+/// `XADD` per surviving envelope, sequentially, with no batching, all before
+/// `run_cycle` returns control to the outer loop and `next_batch` (and so
+/// `consumer.recv()`, which is this consumer's only "I'm alive" signal to
+/// librdkafka) is called again. A real TRUST batch has been observed
+/// containing on the order of ~218 envelopes in a single Kafka record. At a
+/// (deliberately pessimistic, not average-case) 2 seconds per XADD under a
+/// genuinely degraded-but-not-fully-down Redis -- a full outage instead
+/// fails each XADD fast and is handled by `retain_for_retry`, not this path
+/// -- that is ~436 seconds (~7.3 minutes) of inline work with no intervening
+/// poll, which already exceeds librdkafka's stock 300_000ms
+/// `max.poll.interval.ms`. Once that timeout is exceeded mid-batch, the
+/// broker considers this consumer dead and triggers a group rebalance,
+/// which both interrupts the in-flight batch and briefly stops movement
+/// data from flowing to every downstream consumer group.
+///
+/// 900_000ms (15 minutes) is set explicitly here -- roughly double the
+/// pessimistic worst-case estimate above -- so there is headroom for an even
+/// slower downstream without depending on the library default happening to
+/// be enough, and so the reasoning is visible next to the value rather than
+/// left implicit.
+const MAX_POLL_INTERVAL_MS: &str = "900000";
+
 impl KafkaRawSource {
-    /// Readiness is entirely owned by `RelayContext`'s rebalance callback
-    /// (Task 5), NOT by an `Err` path in this module's own `next_batch` the
-    /// way `trust-consumer`'s `KafkaMovementFeed` uses its
-    /// `connection_state` flag -- the one structural divergence from that
-    /// crate's copy beyond the return-shape difference.
-    pub fn connect(config: &Config, ready: health_http::ConnectionState) -> anyhow::Result<Self> {
-        let context = RelayContext { ready };
-        let consumer: StreamConsumer<RelayContext> = ClientConfig::new()
+    /// Split out from `connect` so the config values themselves --
+    /// `max.poll.interval.ms` in particular -- are unit-testable without a
+    /// broker: `ClientConfig::set`/`get` only ever touch an in-memory map,
+    /// and only `create_with_context` below actually talks to librdkafka.
+    fn client_config(config: &Config) -> ClientConfig {
+        let mut client_config = ClientConfig::new();
+        client_config
             .set("bootstrap.servers", &config.kafka.kafka_brokers)
             .set("group.id", &config.kafka_consumer_group)
             .set("security.protocol", "SASL_SSL")
@@ -90,7 +120,19 @@ impl KafkaRawSource {
             .set("sasl.password", &config.kafka.kafka_sasl_password)
             .set("enable.auto.commit", "false")
             .set("enable.auto.offset.store", "false")
-            .create_with_context(context)?;
+            .set("max.poll.interval.ms", MAX_POLL_INTERVAL_MS);
+        client_config
+    }
+
+    /// Readiness is entirely owned by `RelayContext`'s rebalance callback
+    /// (Task 5), NOT by an `Err` path in this module's own `next_batch` the
+    /// way `trust-consumer`'s `KafkaMovementFeed` uses its
+    /// `connection_state` flag -- the one structural divergence from that
+    /// crate's copy beyond the return-shape difference.
+    pub fn connect(config: &Config, ready: health_http::ConnectionState) -> anyhow::Result<Self> {
+        let context = RelayContext { ready };
+        let consumer: StreamConsumer<RelayContext> =
+            Self::client_config(config).create_with_context(context)?;
 
         consumer.subscribe(&[&config.kafka.kafka_topic])?;
 
@@ -139,6 +181,53 @@ impl RawKafkaSource for KafkaRawSource {
         self.last_received = None;
         Ok(())
     }
+}
+
+#[cfg(test)]
+fn test_config() -> Config {
+    Config {
+        kafka: common::service_args::KafkaConnectionArgs {
+            kafka_brokers: "kafka.example:9094".to_string(),
+            kafka_topic: "test-topic".to_string(),
+            kafka_sasl_username: "user".to_string(),
+            kafka_sasl_password: "pass".to_string(),
+            kafka_sasl_mechanism: "PLAIN".to_string(),
+        },
+        kafka_consumer_group: "test-group".to_string(),
+        redis_url: "redis://localhost:6379".to_string(),
+        health_bind_url: "0.0.0.0:8083".to_string(),
+        metrics_port: 9094,
+        metrics_enabled: false,
+        stream_lag_poll_secs: 30,
+    }
+}
+
+/// Regression test for the Signal Box Audit's "no poll-interval override"
+/// finding: no `max.poll.interval.ms` override meant this consumer relied
+/// entirely on librdkafka's stock 300_000ms default, which
+/// `MAX_POLL_INTERVAL_MS`'s own doc comment shows a single slow-downstream
+/// batch can plausibly exceed.
+#[test]
+fn max_poll_interval_is_configured_with_headroom_over_the_librdkafka_default() {
+    let config = test_config();
+    let client_config = KafkaRawSource::client_config(&config);
+
+    assert_eq!(
+        client_config.get("max.poll.interval.ms"),
+        Some(MAX_POLL_INTERVAL_MS),
+        "must be set explicitly, not left to librdkafka's 300_000ms default"
+    );
+
+    let configured_ms: u64 = client_config
+        .get("max.poll.interval.ms")
+        .unwrap()
+        .parse()
+        .unwrap();
+    const LIBRDKAFKA_DEFAULT_MS: u64 = 300_000;
+    assert!(
+        configured_ms > LIBRDKAFKA_DEFAULT_MS,
+        "the override must be more generous than the default it replaces"
+    );
 }
 
 /// Test double modelling librdkafka's real position semantics, not a

@@ -133,6 +133,45 @@ async fn ensure_group(
     }
 }
 
+/// Splits a raw `XREAD`/`XREADGROUP` reply into entries with a usable
+/// `payload` field and the ids of entries that don't have one.
+///
+/// **Bug this fixes**: an entry missing the expected `"payload"` field (or
+/// whose value isn't a UTF-8 string) used to be silently dropped by a
+/// `filter_map` in `next_batch`, with no XACK ever sent for its id. That left
+/// it in the consumer group's pending-entries list forever: it is delivered
+/// under the startup/XAUTOCLAIM PEL-replay path (`next_batch`'s `id = "0"`
+/// read) exactly like any other pending entry, hits the same missing-field
+/// case, and gets dropped again -- an infinite loop that never advances,
+/// relying on an operator noticing or a Redis-version-specific trim
+/// side-effect to ever clear it.
+///
+/// This is the same "poison message must not wedge the consumer" principle
+/// `movement-relay::main::run_cycle` already applies to its own Kafka source
+/// (`BatchOutcome::Unclassifiable` is logged and NOT retried, versus
+/// `BatchOutcome::PublishFailed` which IS retried) -- just applied here to a
+/// genuinely-can-never-succeed malformed entry rather than a transient
+/// downstream failure. The caller (`next_batch`) XACKs `malformed_ids` right
+/// after calling this, once a warning has been logged, so the entry is
+/// permanently retired instead of retried.
+fn split_deliverable_and_malformed(
+    ids: Vec<redis::streams::StreamId>,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut entries = Vec::new();
+    let mut malformed_ids = Vec::new();
+    for entry in ids {
+        match entry
+            .map
+            .get("payload")
+            .and_then(|v| redis::from_redis_value::<String>(v).ok())
+        {
+            Some(payload) => entries.push((entry.id, payload)),
+            None => malformed_ids.push(entry.id),
+        }
+    }
+    (entries, malformed_ids)
+}
+
 #[async_trait]
 impl MovementFeed for RedisStreamMovementFeed {
     async fn next_batch(&mut self) -> anyhow::Result<Vec<String>> {
@@ -159,18 +198,24 @@ impl MovementFeed for RedisStreamMovementFeed {
             )
             .await?;
 
-        let entries: Vec<(String, String)> = reply
-            .keys
-            .into_iter()
-            .flat_map(|k| k.ids)
-            .filter_map(|entry| {
-                let payload: String = entry
-                    .map
-                    .get("payload")
-                    .and_then(|v| redis::from_redis_value(v).ok())?;
-                Some((entry.id, payload))
-            })
-            .collect();
+        let (entries, malformed_ids) =
+            split_deliverable_and_malformed(reply.keys.into_iter().flat_map(|k| k.ids).collect());
+
+        // A malformed entry can never become processable -- see
+        // `split_deliverable_and_malformed`'s own doc for why it is XACKed
+        // here rather than left for a future PEL replay.
+        if !malformed_ids.is_empty() {
+            tracing::warn!(
+                ids = ?malformed_ids,
+                stream = %self.stream,
+                group = %self.group,
+                "stream entry missing expected `payload` field; acknowledging so it does not linger in the pending-entries list forever"
+            );
+            let _: i64 = self
+                .conn
+                .xack(&self.stream, &self.group, &malformed_ids)
+                .await?;
+        }
 
         // The PEL replay pass (id `0`) returns however many pending
         // entries this consumer name left unacked last time -- possibly
@@ -358,6 +403,73 @@ fn stream_id_less_than(a: &str, b: &str) -> bool {
     parts(a) < parts(b)
 }
 
+/// Pure-logic tests for `split_deliverable_and_malformed` -- no Redis
+/// connection needed, unlike everything in `redis_tests` below.
+#[cfg(test)]
+mod split_deliverable_and_malformed_tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn stream_id(id: &str, map: HashMap<String, redis::Value>) -> redis::streams::StreamId {
+        redis::streams::StreamId {
+            id: id.to_string(),
+            map,
+        }
+    }
+
+    #[test]
+    fn entries_with_a_payload_field_are_deliverable() {
+        let mut map = HashMap::new();
+        map.insert(
+            "payload".to_string(),
+            redis::Value::BulkString(b"hello".to_vec()),
+        );
+        let (entries, malformed_ids) = split_deliverable_and_malformed(vec![stream_id("1-0", map)]);
+
+        assert_eq!(entries, vec![("1-0".to_string(), "hello".to_string())]);
+        assert!(malformed_ids.is_empty());
+    }
+
+    #[test]
+    fn an_entry_missing_the_payload_field_is_reported_malformed_not_dropped() {
+        let mut map = HashMap::new();
+        map.insert(
+            "not_payload".to_string(),
+            redis::Value::BulkString(b"whatever".to_vec()),
+        );
+        let (entries, malformed_ids) = split_deliverable_and_malformed(vec![stream_id("2-0", map)]);
+
+        assert!(
+            entries.is_empty(),
+            "an entry with no payload field yields no deliverable payload"
+        );
+        assert_eq!(
+            malformed_ids,
+            vec!["2-0".to_string()],
+            "the entry's id must still be surfaced so the caller can XACK it -- \
+             this is the fix: it used to be silently dropped by a filter_map \
+             with no id ever reaching an XACK, leaving it pending forever"
+        );
+    }
+
+    #[test]
+    fn a_mixed_batch_keeps_the_good_entry_and_flags_only_the_bad_one() {
+        let mut good = HashMap::new();
+        good.insert(
+            "payload".to_string(),
+            redis::Value::BulkString(b"ok".to_vec()),
+        );
+        let bad = HashMap::new(); // no fields at all -- e.g. a corrupted write.
+
+        let (entries, malformed_ids) =
+            split_deliverable_and_malformed(vec![stream_id("1-0", good), stream_id("2-0", bad)]);
+
+        assert_eq!(entries, vec![("1-0".to_string(), "ok".to_string())]);
+        assert_eq!(malformed_ids, vec!["2-0".to_string()]);
+    }
+}
+
 #[cfg(test)]
 mod redis_tests {
     use super::*;
@@ -395,6 +507,63 @@ mod redis_tests {
             .query_async(&mut conn)
             .await
             .unwrap();
+    }
+
+    /// Regression test for the pending-forever bug: a stream entry with no
+    /// `payload` field must be XACKed by `next_batch` itself, not left
+    /// dangling in the pending-entries list for a future PEL replay to trip
+    /// over again.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn a_malformed_entry_missing_payload_is_acked_not_left_pending_forever() {
+        let stream = unique_stream("malformed-entry");
+
+        let mut feed = RedisStreamMovementFeed::connect_for_test(
+            &redis_url(),
+            &stream,
+            "test-group",
+            "test-consumer",
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+
+        // An entry with no "payload" field at all -- e.g. a corrupted write,
+        // or a producer bug that used the wrong field name. This is
+        // deliberately written with a raw XADD rather than this module's own
+        // `xadd` helper, which always sets "payload".
+        let client = redis::Client::open(redis_url()).unwrap();
+        let mut raw_conn = client.get_connection_manager().await.unwrap();
+        let _: String = redis::cmd("XADD")
+            .arg(&stream)
+            .arg("*")
+            .arg("not_payload")
+            .arg("whatever")
+            .query_async(&mut raw_conn)
+            .await
+            .unwrap();
+
+        feed.next_batch().await.unwrap(); // drain empty startup PEL
+        let batch = feed.next_batch().await.unwrap();
+        assert!(
+            batch.is_empty(),
+            "a malformed entry yields no deliverable payload"
+        );
+
+        let pending: redis::streams::StreamPendingCountReply = feed
+            .conn
+            .xpending_count(&stream, "test-group", "-", "+", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.ids.len(),
+            0,
+            "the malformed entry must be XACKed by next_batch itself, not left \
+             pending forever -- before the fix, this stayed pending even across \
+             the PEL replay a fresh connect below would trigger"
+        );
+
+        cleanup(&stream).await;
     }
 
     /// `XGROUP CREATE ... $ MKSTREAM` starts a fresh group's
