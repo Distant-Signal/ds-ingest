@@ -173,11 +173,11 @@ mod tests {
         Activation {
             train_id: train_id.to_string(),
             train_uid: train_uid.to_string(),
-            toc_id: "SW".to_string(),
-            train_service_code: "22345000".to_string(),
-            schedule_wtt_id: "".to_string(),
-            schedule_start_date: "2026-09-04".to_string(),
-            schedule_end_date: "2026-09-04".to_string(),
+            toc_id: Some("SW".to_string()),
+            train_service_code: Some("22345000".to_string()),
+            schedule_wtt_id: None,
+            schedule_start_date: Some("2026-09-04".to_string()),
+            schedule_end_date: Some("2026-09-04".to_string()),
         }
     }
 

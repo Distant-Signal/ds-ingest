@@ -79,6 +79,13 @@ async fn main() -> anyhow::Result<()> {
 
     let stanox_crs_reload_interval = Duration::from_secs(config.stanox_crs_reload_secs);
     let mut last_stanox_crs_reload = tokio::time::Instant::now() - stanox_crs_reload_interval;
+    // Which rail day the parked-Activation maps were last aged out for
+    // (finding #5). Pruning is a retain over two maps that can hold the whole
+    // day's national Activation stream, so it runs when the rail day actually
+    // rolls over rather than on every cycle -- within one rail day those maps
+    // only grow by that day's own activations, which is exactly what they are
+    // for.
+    let mut last_pruned_rail_day: Option<chrono::NaiveDate> = None;
     let redis_gap_check_interval = Duration::from_secs(config.redis_gap_check_secs);
     let mut last_redis_gap_check = tokio::time::Instant::now() - redis_gap_check_interval;
 
@@ -136,6 +143,25 @@ async fn main() -> anyhow::Result<()> {
             Ok(batch) => {
                 let now = chrono::Utc::now();
                 let today = current_rail_day(now);
+                // Age out parked Activations once per rail day (finding #5):
+                // before this, `pending_service_dates`/`pending_train_uids`
+                // were never pruned at all, so they grew without bound AND
+                // could misfile a recycled `train_id`'s movements under a
+                // long-dead train's service_date/train_uid. See
+                // `process::prune_stale_activations`.
+                if last_pruned_rail_day != Some(today) {
+                    let before = process_state.pending_service_dates.len();
+                    process::prune_stale_activations(&mut process_state, today);
+                    let dropped = before - process_state.pending_service_dates.len();
+                    if dropped > 0 {
+                        tracing::info!(
+                            dropped,
+                            retained = process_state.pending_service_dates.len(),
+                            "pruned parked Activations that no live train can still be matched to"
+                        );
+                    }
+                    last_pruned_rail_day = Some(today);
+                }
                 let snapshot = stanox.read().expect("stanox lock poisoned").clone();
                 let mut events = Vec::new();
                 for raw in &batch {
@@ -225,24 +251,19 @@ const ERROR_BACKOFF: Duration = Duration::from_secs(2);
 /// current Europe/London rail day"), NOT a bare UTC calendar date. Using
 /// `chrono::Utc::now().date_naive()` directly would be plain UTC and
 /// ignore both the Europe/London timezone offset AND this codebase's own
-/// established 02:00 rail-day cutoff convention
-/// (`common::rail_day::next_rail_day_boundary`, extracted specifically so
-/// more than one crate could share this exact DST-transition-safe logic).
-/// This function is the inverse of `next_rail_day_boundary`: a small,
-/// crate-local, pure duplication of the same "before/after local 02:00"
-/// check, not a call into `common::rail_day` itself, because that module
-/// only exposes the *next boundary*, not *which rail day `at` currently
-/// falls in* -- adding the latter to `common::rail_day` instead is a
-/// reasonable follow-up, but out of scope for this plan to also change a
-/// shared crate's public surface.
+/// established 02:00 rail-day cutoff convention.
+///
+/// Now a one-line delegation to `common::rail_day::current_rail_day`. This
+/// used to be a crate-local duplication of that 02:00 cutoff, with its own
+/// doc comment naming "add it to `common::rail_day` instead" as the right
+/// follow-up; the 2026-09-25 review's findings #2 and #5 gave
+/// `trust-consumer` the same need (dating an Activation, and ageing parked
+/// Activations out against the current rail day), so the shared version now
+/// exists and a third copy would be indefensible. Kept as a named wrapper
+/// rather than inlined at the call site purely so this module's own
+/// `rail_day_tests` keep testing the behaviour this crate depends on.
 fn current_rail_day(at: chrono::DateTime<chrono::Utc>) -> chrono::NaiveDate {
-    let local = at.with_timezone(&chrono_tz::Europe::London);
-    let cutoff = chrono::NaiveTime::from_hms_opt(2, 0, 0).expect("2:00:00 is a valid time");
-    if local.time() < cutoff {
-        local.date_naive() - chrono::Duration::days(1)
-    } else {
-        local.date_naive()
-    }
+    common::rail_day::current_rail_day(at)
 }
 
 #[cfg(test)]

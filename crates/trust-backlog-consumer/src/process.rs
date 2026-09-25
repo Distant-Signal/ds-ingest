@@ -88,6 +88,51 @@ impl Default for ProcessorState {
     }
 }
 
+/// How many rail days a parked Activation's `(service_date, train_uid)` pair
+/// is kept for. Mirrors `trust-consumer`'s own
+/// `process::MAX_PARKED_ACTIVATION_AGE_DAYS`, and for the same reason: an
+/// overnight working activated late on rail day D still emits Movements into
+/// rail day D+1, so one day is too tight and three buys nothing.
+pub const MAX_PARKED_ACTIVATION_AGE_DAYS: i64 = 2;
+
+/// Ages out parked Activation state. Pure, so the caller supplies `today`
+/// (the current Europe/London rail day) rather than this reading the clock,
+/// exactly like `trust-consumer`'s `prune_expired_activations`.
+///
+/// # Why this exists at all (finding #5 of the 2026-09-25 review)
+///
+/// `pending_service_dates`/`pending_train_uids` were NEVER pruned -- not on
+/// a weak signal like `trust-consumer`'s old `schedule_end_date` rule, but
+/// not at all. Two consequences, and the second is worse than the unbounded
+/// growth:
+///
+/// 1. Both maps are fed by the whole national Activation stream and this
+///    process is designed to run indefinitely, so they grew without bound.
+/// 2. TRUST RECYCLES `train_id`s, roughly monthly. A stale entry that
+///    outlived its train meant a later, completely unrelated train reusing
+///    that `train_id` -- whose own fresh Activation this process happened to
+///    miss (a restart, a trimmed stream, a dropped payload) -- had every one
+///    of its Movements filed under the OLD train's `service_date` and
+///    stamped with the OLD train's `train_uid`. That is silent
+///    cross-contamination of the backlog `api` matches late-tracking pins
+///    against, not merely wasted memory. `unwrap_or(today)` (the
+///    no-parked-Activation fallback) is strictly better than a stale hit:
+///    it is honestly approximate, where the stale hit is confidently wrong.
+pub fn prune_stale_activations(state: &mut ProcessorState, today: NaiveDate) {
+    let oldest_kept = today - chrono::Duration::days(MAX_PARKED_ACTIVATION_AGE_DAYS);
+    state
+        .pending_service_dates
+        .retain(|_, service_date| *service_date >= oldest_kept);
+    // Kept in lockstep: both maps are written by the same Activation, keyed
+    // by the same `train_id`, so `pending_service_dates` is the one source of
+    // truth for how old an entry is (`pending_train_uids` carries no date of
+    // its own). A uid whose service_date has been dropped must go with it --
+    // otherwise the worse half of the bug above survives the prune.
+    state
+        .pending_train_uids
+        .retain(|train_id, _| state.pending_service_dates.contains_key(train_id));
+}
+
 /// `received_at` is the wall-clock time this message is being processed
 /// at (`main.rs` passes `chrono::Utc::now()`), threaded through to
 /// `common::trust_timestamp::parse_trust_epoch_millis_pair` for every
@@ -122,8 +167,21 @@ pub fn process_message(
                 .pending_train_uids
                 .insert(activation.train_id.clone(), activation.train_uid.clone());
 
-            let dedup =
-                trust_schema::dedup::dedup_key(&activation.train_id, "0001", None, None, None);
+            // `today` (the processing rail day), not `service_date`, as the
+            // key's date component -- see `trust_schema::dedup::dedup_key`'s
+            // own doc comment for why every live consumer must use the same
+            // rule. They are the same value on this path anyway (an
+            // Activation's `service_date` IS `today`); passing `today`
+            // explicitly keeps that a property of the call, not a
+            // coincidence a later change could quietly break.
+            let dedup = trust_schema::dedup::dedup_key(
+                &activation.train_id,
+                "0001",
+                None,
+                None,
+                None,
+                today,
+            );
             Some(common::TrustBacklogEventMessage {
                 crs: None,
                 train_uid: Some(activation.train_uid.clone()),
@@ -193,6 +251,7 @@ pub fn process_message(
                 Some(&movement.event_type),
                 movement.loc_stanox.as_deref(),
                 movement.planned_timestamp.as_deref(),
+                today,
             );
 
             Some(common::TrustBacklogEventMessage {
@@ -238,8 +297,20 @@ pub fn process_message(
             }
             let actual = canx_pair.actual;
 
-            let dedup =
-                trust_schema::dedup::dedup_key(&cancellation.train_id, "0002", None, None, None);
+            // A Cancellation's key carries nothing but `(train_id, msg_type)`
+            // otherwise, and `api`'s `trust_event_backlog` enforces a GLOBAL
+            // unique `dedup_key` across a 90-day retention -- so without this
+            // date a recycled `train_id`'s genuinely new cancellation was
+            // silently dropped as a duplicate of the previous month's
+            // unrelated train. See `trust_schema::dedup::dedup_key`.
+            let dedup = trust_schema::dedup::dedup_key(
+                &cancellation.train_id,
+                "0002",
+                None,
+                None,
+                None,
+                today,
+            );
 
             Some(common::TrustBacklogEventMessage {
                 crs: None,
@@ -326,11 +397,11 @@ mod tests {
         trust_schema::schema::Activation {
             train_id: train_id.to_string(),
             train_uid: train_uid.to_string(),
-            toc_id: "SW".to_string(),
-            train_service_code: "22345000".to_string(),
-            schedule_wtt_id: "WTT1".to_string(),
-            schedule_start_date: schedule_start_date.to_string(),
-            schedule_end_date: schedule_start_date.to_string(),
+            toc_id: Some("SW".to_string()),
+            train_service_code: Some("22345000".to_string()),
+            schedule_wtt_id: Some("WTT1".to_string()),
+            schedule_start_date: Some(schedule_start_date.to_string()),
+            schedule_end_date: Some(schedule_start_date.to_string()),
         }
     }
 
@@ -554,6 +625,181 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.train_uid, Some("C21373".to_string()));
+    }
+
+    // --- Parked-activation pruning (finding #5) ---
+
+    /// The growth half of finding #5: entries older than
+    /// `MAX_PARKED_ACTIVATION_AGE_DAYS` go, current ones stay, and both maps
+    /// move together.
+    #[test]
+    fn pruning_drops_parked_activations_older_than_the_retention_window() {
+        let mut state = ProcessorState::default();
+        for (train_id, service_date) in [
+            ("today", "2026-09-05"),
+            ("yesterday", "2026-09-04"),
+            ("two_days_ago", "2026-09-03"),
+            ("last_month", "2026-08-05"),
+        ] {
+            state
+                .pending_service_dates
+                .insert(train_id.to_string(), service_date.parse().unwrap());
+            state
+                .pending_train_uids
+                .insert(train_id.to_string(), format!("UID-{train_id}"));
+        }
+
+        prune_stale_activations(&mut state, today());
+
+        assert!(state.pending_service_dates.contains_key("today"));
+        assert!(
+            state.pending_service_dates.contains_key("yesterday"),
+            "an overnight working's Movements can still arrive a day later"
+        );
+        assert!(
+            state.pending_service_dates.contains_key("two_days_ago"),
+            "exactly at the retention boundary, still kept"
+        );
+        assert!(
+            !state.pending_service_dates.contains_key("last_month"),
+            "a month-old parked Activation can no longer belong to any live train"
+        );
+        assert!(
+            !state.pending_train_uids.contains_key("last_month"),
+            "the train_uid map must be pruned in lockstep, or the misfiling half of the bug \
+             survives"
+        );
+        assert_eq!(state.pending_train_uids.len(), 3);
+    }
+
+    /// The correctness half of finding #5, which is the worse half: TRUST
+    /// recycles `train_id`s monthly. A stale parked entry that outlives its
+    /// train makes every Movement of the NEXT train to reuse that `train_id`
+    /// -- when this process missed that train's own Activation -- get filed
+    /// under the old train's `service_date` and stamped with the old train's
+    /// `train_uid`. After pruning, the same Movement falls back to `today`
+    /// and carries no uid: honestly approximate instead of confidently wrong.
+    #[test]
+    fn a_recycled_train_id_is_not_misfiled_under_the_previous_trains_service_date() {
+        let mut state = ProcessorState::default();
+        let last_month: NaiveDate = "2026-08-05".parse().unwrap();
+        state
+            .pending_service_dates
+            .insert("221832406".to_string(), last_month);
+        state
+            .pending_train_uids
+            .insert("221832406".to_string(), "OLD001".to_string());
+
+        // Before pruning: the stale entry wins, and it is wrong.
+        let movement_msg = TrustMessage::Movement(movement(
+            "221832406",
+            "DEPARTURE",
+            Some("87212"),
+            Some("ON TIME"),
+        ));
+        let misfiled = process_message(
+            &movement_msg,
+            &mut state,
+            &stanox_table(),
+            &crs_index_with(&["WAT"]),
+            today(),
+            test_received_at(),
+        )
+        .unwrap();
+        assert_eq!(
+            misfiled.service_date, last_month,
+            "precondition: this is the misfiling the prune exists to stop"
+        );
+        assert_eq!(misfiled.train_uid, Some("OLD001".to_string()));
+
+        prune_stale_activations(&mut state, today());
+
+        let result = process_message(
+            &movement_msg,
+            &mut state,
+            &stanox_table(),
+            &crs_index_with(&["WAT"]),
+            today(),
+            test_received_at(),
+        )
+        .unwrap();
+        assert_eq!(
+            result.service_date,
+            today(),
+            "with the stale entry gone, the movement is filed under the day it actually happened"
+        );
+        assert_eq!(
+            result.train_uid, None,
+            "and carries no uid rather than a completely unrelated train's"
+        );
+    }
+
+    // --- Dedup keys (finding #6) ---
+
+    /// A recycled `train_id`'s Cancellation a month later must not hash as a
+    /// duplicate of the old month's one -- `api`'s `trust_event_backlog`
+    /// enforces `ON CONFLICT (dedup_key) DO NOTHING` globally over a 90-day
+    /// retention, so a collision silently discarded the newer event.
+    #[test]
+    fn a_recycled_train_ids_cancellation_gets_a_different_dedup_key_a_month_later() {
+        let cancellation = TrustMessage::Cancellation(trust_schema::schema::Cancellation {
+            train_id: "221832406".to_string(),
+            canx_timestamp: None,
+            canx_reason_code: None,
+            canx_type: Some("AT ORIGIN".to_string()),
+        });
+        let mut state = ProcessorState::default();
+        let august = process_message(
+            &cancellation,
+            &mut state,
+            &stanox_table(),
+            &crs_index_with(&["WAT"]),
+            "2026-08-05".parse().unwrap(),
+            test_received_at(),
+        )
+        .unwrap();
+        let september = process_message(
+            &cancellation,
+            &mut state,
+            &stanox_table(),
+            &crs_index_with(&["WAT"]),
+            "2026-09-05".parse().unwrap(),
+            test_received_at(),
+        )
+        .unwrap();
+        assert_ne!(august.dedup_key, september.dedup_key);
+    }
+
+    /// And the same real event processed twice on the same rail day still
+    /// dedupes -- at-least-once redelivery depends on it.
+    #[test]
+    fn the_same_cancellation_on_the_same_day_keeps_one_dedup_key() {
+        let cancellation = TrustMessage::Cancellation(trust_schema::schema::Cancellation {
+            train_id: "221832406".to_string(),
+            canx_timestamp: Some("1787941920000".to_string()),
+            canx_reason_code: None,
+            canx_type: None,
+        });
+        let mut state = ProcessorState::default();
+        let first = process_message(
+            &cancellation,
+            &mut state,
+            &stanox_table(),
+            &crs_index_with(&["WAT"]),
+            today(),
+            test_received_at(),
+        )
+        .unwrap();
+        let redelivered = process_message(
+            &cancellation,
+            &mut state,
+            &stanox_table(),
+            &crs_index_with(&["WAT"]),
+            today(),
+            test_received_at(),
+        )
+        .unwrap();
+        assert_eq!(first.dedup_key, redelivered.dedup_key);
     }
 
     #[test]

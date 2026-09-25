@@ -363,11 +363,22 @@ fn dispatch_message(
     match message {
         TrustMessage::Activation(activation) => {
             correlate::apply_activation(correlation_state, &activation);
-            station_correlate::apply_activation(
-                station_state,
-                &activation.train_uid,
-                &activation.toc_id,
-            );
+            // `toc_id` is `Option` as of the 2026-09-25 review's finding #7
+            // (a required field with no reader made one absent value drop the
+            // WHOLE Activation, costing its far more valuable
+            // train_id/train_uid binding). `None` simply means this uid
+            // learns no operator here -- `station_correlate` already treats
+            // "a UID absent from `activations_by_uid`" as a first-class case
+            // and skips station correlation for it, exactly as it does for a
+            // Movement whose Activation this process never saw.
+            if let Some(toc_id) = activation.toc_id.as_deref() {
+                station_correlate::apply_activation(station_state, &activation.train_uid, toc_id);
+            } else {
+                tracing::debug!(
+                    train_uid = %activation.train_uid,
+                    "Activation carries no toc_id; skipping station correlation for this uid"
+                );
+            }
         }
         TrustMessage::Movement(movement) => {
             let result = correlate::apply_movement(

@@ -82,10 +82,7 @@ async fn main() -> anyhow::Result<()> {
     // cancellation across many batches, so this state must survive every
     // `run_once` call, not be rebuilt per cycle. See
     // `process::ProcessorState`'s docs.
-    let mut state = process::ProcessorState {
-        trust_timestamp_correction_enabled: config.trust_timestamp_correction_enabled,
-        ..process::ProcessorState::default()
-    };
+    let mut state = process::ProcessorState::new(config.trust_timestamp_correction_enabled);
 
     loop {
         if last_reference_reload.elapsed() >= reload_interval {
@@ -102,11 +99,19 @@ async fn main() -> anyhow::Result<()> {
                     // whose origin departure has already been and gone.
                     process::apply_reference_reload(refs, &mut reference, &mut state);
                     // Same cadence, unrelated job: age out parked Activations
-                    // for schedules that have already ended, so the national
+                    // that no live Movement can still claim, so the national
                     // Activation stream can't grow this map without bound.
+                    //
+                    // The CURRENT rail day, not `Utc::now().date_naive()`
+                    // (finding #5): the pruning rule is now about how old an
+                    // Activation's own observed rail day is, so both sides of
+                    // that comparison have to be rail days on the same
+                    // Europe/London 02:00 convention, or an Activation
+                    // observed at 01:00 local would be compared against
+                    // tomorrow's date.
                     process::prune_expired_activations(
                         &mut state.pending_activations,
-                        chrono::Utc::now().date_naive(),
+                        common::rail_day::current_rail_day(chrono::Utc::now()),
                     );
                     last_reference_reload = tokio::time::Instant::now();
                 }
@@ -220,6 +225,19 @@ enum Cycle {
 /// `MovementFeed::commit`), so skipping it on failure genuinely means "leave
 /// this batch to be redelivered", and the `dedup_key` path makes that replay
 /// safe.
+///
+/// **This function also owns the in-memory state's transaction boundary**
+/// (finding #4 of the 2026-09-25 review): `process::run_once` journals every
+/// mutation it makes to `state`, and exactly one of
+/// `ProcessorState::confirm_batch` (the whole cycle succeeded) or
+/// `ProcessorState::roll_back_batch` (anything at all failed) is called
+/// before returning. Without the rollback, a redelivered batch -- which the
+/// Redis backend really does replay into this same process after 30 seconds,
+/// via `RedisStreamMovementFeed::reclaim_stale` -- would find its own
+/// half-applied state from the failed attempt, decide the train was
+/// "already resolved", and drop the one-time
+/// `resolved_train_uid`/`resolved_train_id` signal that is the only thing
+/// that ever flips a subscription to `'resolved'` in the database.
 async fn run_cycle<F, P>(
     feed: &mut F,
     reference: &process::Reference,
@@ -246,6 +264,7 @@ where
                 "operation" => "process_batch"
             )
             .increment(1);
+            state.roll_back_batch();
             return Cycle::Failed;
         }
     };
@@ -257,6 +276,7 @@ where
             "operation" => "post_train_events"
         )
         .increment(1);
+        state.roll_back_batch();
         return Cycle::Failed;
     }
 
@@ -267,9 +287,18 @@ where
             "operation" => "commit_offsets"
         )
         .increment(1);
+        // Rolled back even though the post itself succeeded: an uncommitted
+        // batch WILL be redelivered (Kafka: the seek-back in
+        // `feed::kafka`; Redis: `reclaim_stale`), and the replay must build
+        // the same events from the same pre-batch state. Re-posting them is
+        // harmless -- that is exactly what `dedup_key` and `api`'s
+        // `ON CONFLICT` clauses are for.
+        state.roll_back_batch();
         return Cycle::Failed;
     }
 
+    // Posted and committed: the batch's in-memory mutations are now facts.
+    state.confirm_batch();
     Cycle::Committed
 }
 
@@ -426,10 +455,19 @@ mod tests {
         );
     }
 
-    /// A feed that errors outright is a failed cycle too, and equally must
-    /// not confirm anything.
+    /// **Finding #8's regression test.** An unparseable payload is now
+    /// logged and dropped, NOT propagated as a cycle failure -- so the batch
+    /// carrying it is acknowledged instead of being replayed forever.
+    ///
+    /// This deliberately reverses the previous assertion of this test
+    /// (`a_batch_that_fails_to_parse_is_a_failed_cycle_and_commits_nothing`).
+    /// That contract was actively harmful: under the Redis backend a batch is
+    /// up to 100 entries, acked all-or-nothing, so one poison payload left
+    /// every good entry beside it unacked, to be reclaimed 30 seconds later
+    /// and fail identically, forever. No retry can fix a payload that does
+    /// not parse.
     #[tokio::test]
-    async fn a_batch_that_fails_to_parse_is_a_failed_cycle_and_commits_nothing() {
+    async fn an_unparseable_payload_is_dropped_and_the_cycle_still_commits() {
         let mut feed = FakeMovementFeed::new(vec![vec!["not json at all".to_string()]]);
         let reference = one_pending_pin();
         let mut state = process::ProcessorState::default();
@@ -439,11 +477,163 @@ mod tests {
             &reference,
             &mut state,
             &TEST_STANOX_CRS,
-            async |_| Ok(()),
+            async |events| {
+                assert!(events.is_empty(), "nothing parseable to post");
+                Ok(())
+            },
         )
         .await;
 
-        assert_eq!(outcome, Cycle::Failed);
-        assert_eq!(feed.committed_count, 0);
+        assert_eq!(outcome, Cycle::Committed);
+        assert_eq!(
+            feed.committed_count, 1,
+            "the poison payload must be acknowledged, not replayed forever"
+        );
+    }
+
+    /// The other half of finding #8, and the one that made it a data-loss
+    /// bug rather than just a stuck-batch bug: the GOOD entries sharing a
+    /// batch with a bad one must still be processed and posted. Before the
+    /// fix, the `?` on the first bad payload abandoned the whole batch --
+    /// including a pin's resolving origin departure.
+    #[tokio::test]
+    async fn one_bad_payload_does_not_trap_the_good_entries_sharing_its_batch() {
+        let mut feed = FakeMovementFeed::new(vec![vec![
+            "{ not json".to_string(),
+            ORIGIN_DEPARTURE.to_string(),
+            r#"{"header":{"msg_type":"0003"},"body":{"missing":"everything"}}"#.to_string(),
+        ]]);
+        let reference = one_pending_pin();
+        let mut state = process::ProcessorState::default();
+
+        let outcome = run_cycle(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            async |events| {
+                assert_eq!(
+                    events.len(),
+                    1,
+                    "the pinned train's origin departure must survive its batch-mates"
+                );
+                assert_eq!(events[0].tracked_train_id, 1);
+                assert_eq!(events[0].resolved_train_id, Some("221832406".to_string()));
+                Ok(())
+            },
+        )
+        .await;
+
+        assert_eq!(outcome, Cycle::Committed);
+        assert_eq!(feed.committed_count, 1);
+    }
+
+    /// **Finding #4's end-to-end regression test.** A batch whose POST fails
+    /// is redelivered (Redis `reclaim_stale` replays an unacked batch into
+    /// this same running process after 30 seconds; Kafka now seeks back to
+    /// it). The redelivered attempt MUST still carry the one-time
+    /// `resolved_train_uid`/`resolved_train_id` signal, because that is the
+    /// only thing that ever flips the subscription to `'resolved'` in the
+    /// database.
+    ///
+    /// Before the fix, `process_message` had already written
+    /// `state.resolved` during the FAILED attempt, so the replay took the
+    /// "already resolved" branch, `freshly_resolved` came back `false`, and
+    /// the subscription stayed `'pending'` forever while the train was
+    /// visibly running.
+    #[tokio::test]
+    async fn a_redelivered_batch_still_reports_the_resolution_after_a_failed_post() {
+        // The same payload twice: what a replay looks like from this
+        // module's point of view.
+        let mut feed = FakeMovementFeed::new(vec![
+            vec![ORIGIN_DEPARTURE.to_string()],
+            vec![ORIGIN_DEPARTURE.to_string()],
+        ]);
+        let reference = one_pending_pin();
+        let mut state = process::ProcessorState::default();
+
+        let failed = run_cycle(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            async |_| Err(anyhow::anyhow!("api is down")),
+        )
+        .await;
+        assert_eq!(failed, Cycle::Failed);
+        assert!(
+            state.resolved.is_empty(),
+            "a batch that never reached api must leave no resolution behind in memory either"
+        );
+
+        let retried = run_cycle(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            async |events| {
+                assert_eq!(events.len(), 1);
+                assert_eq!(
+                    events[0].resolved_train_id,
+                    Some("221832406".to_string()),
+                    "the redelivered batch must still announce the resolution"
+                );
+                assert_eq!(events[0].tracked_train_id, 1);
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(retried, Cycle::Committed);
+        assert_eq!(
+            state.resolved.get("221832406"),
+            Some(&vec![1]),
+            "and now it is a durable fact"
+        );
+    }
+
+    /// The confirmed case must NOT be rolled back, or a train would
+    /// re-announce its resolution on every later movement.
+    #[tokio::test]
+    async fn a_confirmed_batch_keeps_its_state_and_does_not_re_resolve() {
+        let later_arrival = r#"[{"header":{"msg_type":"0003"},"body":{
+            "train_id":"221832406","event_type":"ARRIVAL",
+            "planned_timestamp":"1787946600000","actual_timestamp":"1787946600000",
+            "loc_stanox":"86031","variation_status":"ON TIME"
+        }}]"#;
+        let mut feed = FakeMovementFeed::new(vec![
+            vec![ORIGIN_DEPARTURE.to_string()],
+            vec![later_arrival.to_string()],
+        ]);
+        let reference = one_pending_pin();
+        let mut state = process::ProcessorState::default();
+
+        assert_eq!(
+            run_cycle(
+                &mut feed,
+                &reference,
+                &mut state,
+                &TEST_STANOX_CRS,
+                async |_| Ok(())
+            )
+            .await,
+            Cycle::Committed
+        );
+
+        let outcome = run_cycle(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            async |events| {
+                assert_eq!(events.len(), 1);
+                assert_eq!(
+                    events[0].resolved_train_id, None,
+                    "a confirmed resolution is not re-announced by the next movement"
+                );
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(outcome, Cycle::Committed);
     }
 }
