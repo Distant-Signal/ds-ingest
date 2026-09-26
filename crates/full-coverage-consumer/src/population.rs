@@ -170,6 +170,7 @@ mod tests {
             activity: String::new(),
             public_arrival: None,
             public_departure: None,
+            platform: None,
         }
     }
 
