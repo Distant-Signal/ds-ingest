@@ -41,7 +41,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut source = KafkaRawSource::connect(&config, ready)?;
-    let mut sink = RedisEventSink::connect(&config.redis_url).await?;
+    let mut sink =
+        RedisEventSink::connect(&config.redis_url, config.movement_stream_maxlen).await?;
 
     tokio::spawn(stream_lag_loop::<redis::aio::ConnectionManager>(
         config.redis_url.clone(),

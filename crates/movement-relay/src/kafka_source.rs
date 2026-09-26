@@ -370,6 +370,7 @@ fn test_config() -> Config {
         metrics_port: 9094,
         metrics_enabled: false,
         stream_lag_poll_secs: 30,
+        movement_stream_maxlen: crate::config::DEFAULT_STREAM_MAXLEN,
     }
 }
 
