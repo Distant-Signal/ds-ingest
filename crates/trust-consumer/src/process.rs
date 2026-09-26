@@ -1373,7 +1373,31 @@ fn process_message(
             if let (Some(p), Some(a), Some("LATE")) =
                 (planned, actual, movement.variation_status.as_deref())
             {
-                derived.delay_minutes = Some((a - p).num_minutes() as i32);
+                // M11 finding (2026-09-26 review): this bare
+                // `(a - p).num_minutes() as i32` used to run unguarded, the
+                // exact truncating-cast shape
+                // `common::trust_timestamp::plausible_delay_minutes`'s own
+                // doc comment identifies as the confirmed bug -- one corrupt
+                // `actual_timestamp` (the same class of corruption
+                // `is_plausible_actual_timestamp` already guards against
+                // elsewhere in this same message's own timestamp parsing)
+                // could turn into a delay of literally millions of minutes,
+                // written straight into `train_current_state.delay_minutes`
+                // for every subscriber sharing this train. Both `api` write
+                // paths for the identical `TrustEventMessage`-derived
+                // `delay_minutes` computation
+                // (`api::data::trust_event_backlog`,
+                // `api::data::trust_event_backlog_match`) were already
+                // guarded this way; this live path -- computing the exact
+                // same value from the exact same kind of TRUST
+                // Movement -- was the one gap. `None` here (rather than a
+                // clamped, still-fabricated number) leaves `derived`'s
+                // coarser, `variation_status`-only estimate that
+                // `trust_schema::journey::apply_movement` already computed
+                // in place, same as both api paths do.
+                if let Some(delay) = common::trust_timestamp::plausible_delay_minutes(a, p) {
+                    derived.delay_minutes = Some(delay);
+                }
             }
             state.set_last_derived(&movement.train_id, derived.clone());
 
