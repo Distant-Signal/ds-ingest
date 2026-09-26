@@ -160,14 +160,14 @@ mod tests {
 
     fn fixture_calling_point(tiploc: &str) -> schedule_query::CallingPoint {
         schedule_query::CallingPoint {
-            tiploc: tiploc.to_string(),
+            tiploc: tiploc.into(),
             kind: schedule_query::CallingPointKind::Origin,
             booked_arrival: None,
             booked_departure: None,
             is_half_minute_arrival: false,
             is_half_minute_departure: false,
             day_offset: 0,
-            activity: String::new(),
+            activity: Default::default(),
             public_arrival: None,
             public_departure: None,
             platform: None,
