@@ -203,6 +203,17 @@ pub struct SharingSubscription {
     /// of the pinned/tracked departure, as the subscription was created
     /// with.
     pub service_date: NaiveDate,
+    /// `common::TrackedTrainRef::pin_scheduled_departure` verbatim -- `None`
+    /// for a subscription with no schedule/pin match yet (the design spec's
+    /// own accepted §1 gap; see `apply_reference_reload`'s own comment on
+    /// this same field name). Carried through so
+    /// `activation_is_for_service_date` can discriminate a legitimate
+    /// post-midnight D+1 subscription from an ordinary tomorrow-daytime one
+    /// sharing the same `train_uid` (the 2026-09-26 review's finding H3) --
+    /// `service_date` alone can't tell those apart, since both carry the
+    /// same "one calendar day ahead" relationship to the Activation's rail
+    /// day.
+    pub pin_scheduled_departure: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Cross-batch memory the processing loop accumulates as it observes the
@@ -617,12 +628,19 @@ pub fn apply_reference_reload(
                     // different days' running of the same uid, and the
                     // Activation fast path has to be able to tell them
                     // apart.
+                    // `pin_scheduled_departure` is carried through too (the
+                    // 2026-09-26 review's finding H3): `service_date` alone
+                    // can't tell a legitimate post-midnight D+1 subscription
+                    // from an ordinary tomorrow-daytime one sharing this
+                    // uid, and `activation_is_for_service_date` needs the
+                    // subscription's own booked time to do that.
                     by_train_uid
                         .entry(train_uid.clone())
                         .or_default()
                         .push(SharingSubscription {
                             tracked_train_id: tracked.id,
                             service_date: tracked.service_date,
+                            pin_scheduled_departure: tracked.pin_scheduled_departure,
                         });
                 }
                 // `pin_origin_crs`/`pin_scheduled_departure` are `None` for
@@ -938,12 +956,17 @@ fn msg_type_label(message: &TrustMessage) -> &'static str {
     }
 }
 
-/// Whether a subscription tracking `service_date` may be attributed to an
-/// Activation observed on `activation_rail_day` -- finding #2's date check.
+/// Whether a subscription tracking `service_date` (and, if known, its own
+/// `pin_scheduled_departure`) may be attributed to an Activation observed on
+/// `activation_rail_day` -- finding #2's date check, tightened by finding H3
+/// of the 2026-09-26 review.
 ///
 /// Two accepted dates, not one:
 ///
-/// - `service_date == activation_rail_day` is the ordinary case.
+/// - `service_date == activation_rail_day` is the ordinary case, accepted
+///   unconditionally: a CIF `train_uid` runs at most once per rail day, so
+///   agreement on the day alone already identifies the one running it can
+///   mean.
 /// - `service_date == activation_rail_day + 1 day` is the legitimate
 ///   post-midnight case, and it is not an edge case worth losing. A rail day
 ///   runs 02:00 to 02:00 Europe/London, so a service departing at (say)
@@ -952,17 +975,50 @@ fn msg_type_label(message: &TrustMessage) -> &'static str {
 ///   Activation, which TRUST emits before the train runs, lands in the
 ///   earlier rail day.
 ///
+///   **This is no longer accepted on the date arithmetic alone (finding
+///   H3).** `service_date + 1` is also exactly the shape of a completely
+///   different, not-yet-run recurring service -- e.g. a Mon-Fri commute's
+///   subscription for TOMORROW's ordinary daytime departure, already sitting
+///   in `by_train_uid` because `list_active_tracked_trains` has no upper
+///   date bound. Nothing about `service_date` distinguishes "one day ahead
+///   because it's an overnight service" from "one day ahead because it
+///   hasn't run yet", so the D+1 branch additionally requires the
+///   subscription's own `pin_scheduled_departure` to fall in the SAME rail
+///   day as the Activation (via `common::rail_day::current_rail_day`,
+///   the same 02:00 Europe/London cutoff this whole module already keys on)
+///   -- true for a genuine 00:12 departure, false for an ordinary 17:30 one.
+///   A subscription with no `pin_scheduled_departure` at all (no
+///   schedule/pin match yet) can't be checked this way, so it is rejected
+///   for D+1 rather than trusted -- it stays eligible for the ordinary
+///   pin-claim heuristic once it actually runs.
+///
 /// Everything else is rejected, and note the asymmetry is deliberate: a
 /// `service_date` BEHIND the Activation's rail day is never legitimate --
 /// that is precisely the stale-subscription shape finding #2 is about
 /// (yesterday's, or last week's, running of a daily-repeating uid) -- while
-/// one day AHEAD is an ordinary overnight service. Being wrong in the
-/// rejecting direction costs only the fast path for that subscription (the
-/// pin-claim heuristic still runs); being wrong in the accepting direction
-/// binds a subscription to the wrong day's train with no way back.
-fn activation_is_for_service_date(service_date: NaiveDate, activation_rail_day: NaiveDate) -> bool {
-    service_date == activation_rail_day
-        || service_date == activation_rail_day + chrono::Duration::days(1)
+/// one day AHEAD, once confirmed via `pin_scheduled_departure`, is an
+/// ordinary overnight service. Being wrong in the rejecting direction costs
+/// only the fast path for that subscription (the pin-claim heuristic still
+/// runs); being wrong in the accepting direction binds a subscription to the
+/// wrong day's train with no way back.
+fn activation_is_for_service_date(
+    service_date: NaiveDate,
+    pin_scheduled_departure: Option<chrono::DateTime<chrono::Utc>>,
+    activation_rail_day: NaiveDate,
+) -> bool {
+    if service_date == activation_rail_day {
+        return true;
+    }
+    if service_date != activation_rail_day + chrono::Duration::days(1) {
+        return false;
+    }
+    // D+1 only: confirm it's a genuine post-midnight departure (same rail
+    // day as the Activation) rather than an arbitrary tomorrow-daytime
+    // running of the same uid.
+    match pin_scheduled_departure {
+        Some(departure) => common::rail_day::current_rail_day(departure) == activation_rail_day,
+        None => false,
+    }
 }
 
 /// Returns one event PER SUBSCRIPTION attributed to this message's train
@@ -1033,6 +1089,7 @@ fn process_message(
                     sharing.iter().partition(|subscription| {
                         activation_is_for_service_date(
                             subscription.service_date,
+                            subscription.pin_scheduled_departure,
                             activation_rail_day,
                         )
                     });
@@ -1589,11 +1646,14 @@ mod tests {
     }
 
     /// One subscription sharing a `train_uid`, dated to the rail day these
-    /// tests run in unless a test wants otherwise.
+    /// tests run in unless a test wants otherwise. No `pin_scheduled_departure`
+    /// -- callers that need finding H3's D+1 timing check exercised use
+    /// `sharing_on_with_departure` instead.
     fn sharing(tracked_train_id: i64) -> SharingSubscription {
         SharingSubscription {
             tracked_train_id,
             service_date: test_rail_day(),
+            pin_scheduled_departure: None,
         }
     }
 
@@ -1601,6 +1661,22 @@ mod tests {
         SharingSubscription {
             tracked_train_id,
             service_date: service_date.parse().unwrap(),
+            pin_scheduled_departure: None,
+        }
+    }
+
+    /// Same as `sharing_on`, but with a real `pin_scheduled_departure` --
+    /// for finding H3's tests, which need to distinguish a genuine
+    /// post-midnight D+1 subscription from an ordinary tomorrow-daytime one.
+    fn sharing_on_with_departure(
+        tracked_train_id: i64,
+        service_date: &str,
+        pin_scheduled_departure: &str,
+    ) -> SharingSubscription {
+        SharingSubscription {
+            tracked_train_id,
+            service_date: service_date.parse().unwrap(),
+            pin_scheduled_departure: Some(pin_scheduled_departure.parse().unwrap()),
         }
     }
 
@@ -2589,7 +2665,9 @@ mod tests {
     /// A post-midnight service (`service_date` one calendar day AFTER the
     /// Activation's rail day, because a rail day ends at 02:00) is a real,
     /// ordinary case and must still resolve -- the date check is deliberately
-    /// asymmetric about this.
+    /// asymmetric about this. Its own `pin_scheduled_departure` (00:15,
+    /// still inside the SAME rail day as the Activation) is what finding
+    /// H3 now requires to accept the D+1 branch at all.
     #[tokio::test]
     async fn an_activation_still_resolves_a_post_midnight_services_subscription() {
         let mut feed = FakeMovementFeed::new(vec![vec![SHARED_ACTIVATION.to_string()]]);
@@ -2600,10 +2678,17 @@ mod tests {
             destination_crs_by_trains_id: HashMap::new(),
         };
         // Activation handled inside 2026-08-28's rail day; the subscription
-        // is for a 00:1x departure, which the departure board dates 08-29.
-        reference
-            .by_train_uid
-            .insert("C88888".to_string(), vec![sharing_on(1, "2026-08-29")]);
+        // is for a 00:15 departure, which the departure board dates 08-29,
+        // and which is itself still inside 2026-08-28's rail day (before the
+        // 02:00 Europe/London cutoff).
+        reference.by_train_uid.insert(
+            "C88888".to_string(),
+            vec![sharing_on_with_departure(
+                1,
+                "2026-08-29",
+                "2026-08-29T00:15:00Z",
+            )],
+        );
         let mut state = ProcessorState::default();
 
         run_once(
@@ -2620,6 +2705,121 @@ mod tests {
             state.resolved.get("221832406"),
             Some(&vec![1]),
             "an overnight service's next-calendar-day service_date is legitimate"
+        );
+    }
+
+    // --- Finding H3 (2026-09-26 review): D+1 needs its own timing, not just its date ---
+
+    /// The false-positive case from finding H3: a same-uid subscription for
+    /// TOMORROW's ORDINARY DAYTIME running (e.g. a Mon-Fri commute's "track
+    /// tomorrow's departure" subscription, already sitting in `by_train_uid`
+    /// because `list_active_tracked_trains` has no upper date bound) must
+    /// NOT be claimed by TODAY's Activation just because its `service_date`
+    /// happens to be one day ahead. Before the fix, `activation_is_for_service_date`
+    /// accepted this on the date arithmetic alone and permanently bound the
+    /// wrong day's subscription to today's train.
+    #[tokio::test]
+    async fn an_activation_is_not_attributed_to_tomorrows_ordinary_daytime_subscription() {
+        let mut feed = FakeMovementFeed::new(vec![vec![SHARED_ACTIVATION.to_string()]]);
+        let mut reference = Reference {
+            pending: Vec::new(),
+            by_train_uid: HashMap::new(),
+            trains_id_by_tracked_train_id: HashMap::new(),
+            destination_crs_by_trains_id: HashMap::new(),
+        };
+        // Activation handled inside 2026-08-28's rail day; the subscription
+        // is for the SAME uid's 08-29 running, but booked at an ordinary
+        // 17:30 daytime departure -- not a post-midnight one.
+        reference.by_train_uid.insert(
+            "C88888".to_string(),
+            vec![sharing_on_with_departure(
+                1,
+                "2026-08-29",
+                "2026-08-29T16:30:00Z",
+            )],
+        );
+        let mut state = ProcessorState::default();
+
+        run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            state.resolved.is_empty(),
+            "tomorrow's ordinary daytime subscription must NOT be bound to today's train just \
+             because its service_date is one day ahead"
+        );
+        assert!(
+            state.activation_matched_awaiting_movement.is_empty(),
+            "and no resolution signal may be queued for it either"
+        );
+        // The Activation is still parked for the pin-claim heuristic, same
+        // as the other-day rejection case above.
+        assert_eq!(
+            state
+                .pending_activations
+                .get("221832406")
+                .map(|activation| activation.train_uid.as_str()),
+            Some("C88888")
+        );
+    }
+
+    /// The other half of finding H3: once the false positive above is
+    /// closed, tomorrow's REAL Activation (arriving on its own, correct
+    /// rail day) must still be able to claim that same subscription
+    /// normally, via the ordinary `service_date == activation_rail_day`
+    /// case -- this fix must not cost the subscription its eventual,
+    /// correct resolution.
+    #[tokio::test]
+    async fn an_activation_still_claims_tomorrows_subscription_when_tomorrow_actually_arrives() {
+        let mut feed = FakeMovementFeed::new(vec![vec![SHARED_ACTIVATION.to_string()]]);
+        let mut reference = Reference {
+            pending: Vec::new(),
+            by_train_uid: HashMap::new(),
+            trains_id_by_tracked_train_id: HashMap::new(),
+            destination_crs_by_trains_id: HashMap::new(),
+        };
+        reference.by_train_uid.insert(
+            "C88888".to_string(),
+            vec![sharing_on_with_departure(
+                1,
+                "2026-08-29",
+                "2026-08-29T16:30:00Z",
+            )],
+        );
+        let mut state = ProcessorState::default();
+
+        // A day later: this Activation is now handled inside 2026-08-29's
+        // rail day, which is exactly the subscription's own service_date.
+        let tomorrows_received_at: chrono::DateTime<chrono::Utc> =
+            "2026-08-30T00:00:00Z".parse().unwrap();
+        assert_eq!(
+            common::rail_day::current_rail_day(tomorrows_received_at),
+            "2026-08-29".parse::<NaiveDate>().unwrap(),
+            "sanity check on the fixture: this instant must fall in 2026-08-29's rail day"
+        );
+
+        run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            tomorrows_received_at,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            state.resolved.get("221832406"),
+            Some(&vec![1]),
+            "tomorrow's real Activation must still claim the subscription once it actually \
+             arrives, ordinary daytime booking and all"
         );
     }
 
@@ -3859,10 +4059,12 @@ mod tests {
                 [SharingSubscription {
                     tracked_train_id: 9,
                     service_date: "2026-08-28".parse().unwrap(),
+                    pin_scheduled_departure: Some("2026-08-28T18:32:00Z".parse().unwrap()),
                 }]
                 .as_slice()
             ),
-            "and must still be reachable by the Activation direct match"
+            "and must still be reachable by the Activation direct match, with its own \
+             pin_scheduled_departure carried through too (finding H3)"
         );
     }
 }
