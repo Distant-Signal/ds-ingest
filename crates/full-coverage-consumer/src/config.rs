@@ -168,7 +168,7 @@ impl Config {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use common::LineDefinition;
 
     use super::*;
@@ -215,7 +215,7 @@ mod tests {
         }
     }
 
-    fn base_config(lines: Vec<LineDefinition>, shadow_lines: &str) -> Config {
+    pub(crate) fn base_config(lines: Vec<LineDefinition>, shadow_lines: &str) -> Config {
         Config {
             kafka: common::service_args::KafkaConnectionArgs {
                 kafka_brokers: String::new(),

@@ -432,19 +432,50 @@ async fn reload_population(
     let dates = [service_date, service_date + chrono::Duration::days(1)];
     for line_id in shadow_line_ids {
         for &date in &dates {
+            // The ETag of what we already hold for this key, if `api` sent
+            // one: an unchanged population then costs a bodyless 304
+            // instead of a full re-download. See `Population::etags`.
+            let if_none_match = population.etag_for(line_id, date).map(str::to_string);
             match queries::fetch_line_population(
                 client,
                 &config.schedule_line_population_url,
                 internal_oauth,
                 line_id,
                 date,
+                if_none_match.as_deref(),
             )
             .await
             {
-                Ok(Some(value)) => {
-                    match serde_json::from_value::<Vec<schedule_query::LinePopulationEntry>>(value)
-                    {
-                        Ok(entries) => population.insert(line_id, date, entries),
+                Ok(queries::LinePopulationFetch::NotModified) => {
+                    metrics::counter!(
+                        common::metrics::metric_name(
+                            "full_coverage_consumer_population_reloads_total"
+                        ),
+                        "result" => "not_modified"
+                    )
+                    .increment(1);
+                }
+                Ok(queries::LinePopulationFetch::Fetched { body, etag }) => {
+                    metrics::counter!(
+                        common::metrics::metric_name(
+                            "full_coverage_consumer_population_reloads_total"
+                        ),
+                        "result" => "fetched"
+                    )
+                    .increment(1);
+                    // Straight from the body text into the typed entries --
+                    // no intermediate `serde_json::Value` tree.
+                    match serde_json::from_str::<Option<Vec<schedule_query::LinePopulationEntry>>>(
+                        &body,
+                    ) {
+                        Ok(Some(entries)) => {
+                            population.insert_with_etag(line_id, date, entries, etag)
+                        }
+                        Ok(None) => {
+                            // Nothing published yet for this (line, date) --
+                            // Decision 2e's Pending case, upstream of the
+                            // rail-day gate. Not an error.
+                        }
                         Err(err) => {
                             tracing::error!(error = ?err, line_id = %line_id, %date, "failed to deserialize schedule-line-population response");
                             metrics::counter!(
@@ -454,11 +485,6 @@ async fn reload_population(
                             .increment(1);
                         }
                     }
-                }
-                Ok(None) => {
-                    // Nothing published yet for this (line, date) --
-                    // Decision 2e's Pending case, upstream of the rail-day
-                    // gate. Not an error.
                 }
                 Err(err) => {
                     tracing::error!(error = ?err, line_id = %line_id, %date, "failed to fetch schedule line population; keeping previous snapshot");
@@ -658,6 +684,124 @@ async fn write_stats(
 mod tests {
     use super::*;
     use crate::feed::FakeMovementFeed;
+
+    /// Conditional reload, end to end through `reload_population`: the first
+    /// cycle downloads both dates and remembers their `ETag`s; the next
+    /// cycle sends them back, gets 304s, and keeps the snapshot it has.
+    /// The `.expect(n)` counts are the point -- they are what proves the
+    /// second cycle downloaded nothing.
+    #[tokio::test]
+    async fn reload_population_revalidates_with_etags_and_keeps_the_snapshot_on_304() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tokens = mock_token_cache(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/private/schedule-line-population"))
+            .and(header("if-none-match", "\"slp-7\""))
+            .respond_with(ResponseTemplate::new(304).insert_header("etag", "\"slp-7\""))
+            .with_priority(1)
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/private/schedule-line-population"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"slp-7\"")
+                    .set_body_string(r#"[{"uid": "C11052", "calling_points": []}]"#),
+            )
+            .with_priority(2)
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mut config = crate::config::tests::base_config(vec![], "");
+        config.schedule_line_population_url =
+            format!("{}/private/schedule-line-population", server.uri());
+        let client = reqwest::Client::new();
+        let lines = vec!["waterloo-reading".to_string()];
+        let today: chrono::NaiveDate = "2026-09-04".parse().unwrap();
+        let tomorrow = today + chrono::Duration::days(1);
+        let mut population = population::Population::default();
+
+        for _ in 0..2 {
+            reload_population(&client, &config, &tokens, &lines, &mut population, today).await;
+            for date in [today, tomorrow] {
+                assert_eq!(
+                    population.uids_for("waterloo-reading", date),
+                    vec!["C11052"]
+                );
+                assert_eq!(
+                    population.etag_for("waterloo-reading", date),
+                    Some("\"slp-7\"")
+                );
+            }
+        }
+        server.verify().await;
+    }
+
+    /// The other compatibility direction: an `api` predating conditional
+    /// GET sends no `ETag`, so every cycle is a plain full download, and
+    /// the population is still loaded exactly as before.
+    #[tokio::test]
+    async fn reload_population_against_an_api_without_etags_downloads_every_cycle() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tokens = mock_token_cache(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/private/schedule-line-population"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"[{"uid": "C11052", "calling_points": []}]"#),
+            )
+            .expect(4)
+            .mount(&server)
+            .await;
+
+        let mut config = crate::config::tests::base_config(vec![], "");
+        config.schedule_line_population_url =
+            format!("{}/private/schedule-line-population", server.uri());
+        let client = reqwest::Client::new();
+        let lines = vec!["waterloo-reading".to_string()];
+        let today: chrono::NaiveDate = "2026-09-04".parse().unwrap();
+        let mut population = population::Population::default();
+
+        for _ in 0..2 {
+            reload_population(&client, &config, &tokens, &lines, &mut population, today).await;
+            assert_eq!(
+                population.uids_for("waterloo-reading", today),
+                vec!["C11052"]
+            );
+            assert_eq!(population.etag_for("waterloo-reading", today), None);
+        }
+        server.verify().await;
+    }
+
+    async fn mock_token_cache(
+        server: &wiremock::MockServer,
+    ) -> common::oauth_client::OAuthTokenCache {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token/"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "fake-jwt",
+                    "expires_in": 300,
+                })),
+            )
+            .mount(server)
+            .await;
+        common::oauth_client::OAuthTokenCache::new(common::oauth_client::OAuthCredentials {
+            token_url: format!("{}/token/", server.uri()),
+            client_id: "test-client".to_string(),
+            scope: "groups".to_string(),
+            username: "test-user".to_string(),
+            password: "test-password".to_string(),
+        })
+    }
 
     const ACTIVATION_C11052: &str = r#"{"header":{"msg_type":"0001"},"body":{
         "train_id":"221832406","train_uid":"C11052","toc_id":"SW",

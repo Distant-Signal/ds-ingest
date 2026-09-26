@@ -26,3 +26,4 @@ trust-schema = { path = "../trust-schema" }
 [dev-dependencies]
 movement-feed = { path = "../movement-feed", features = ["test-util"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "test-util"] }
+wiremock = "0.6"
