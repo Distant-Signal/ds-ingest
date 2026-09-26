@@ -479,10 +479,16 @@ async fn reload_population(
 }
 
 /// Dispatches one parsed `TrustMessage` into both running correlation
-/// records. `ChangeOfOrigin`/`ChangeOfIdentity`/`Unknown` are deliberately
-/// ignored -- `correlate.rs`'s own scope (Decision 2d) only covers
-/// Activation/Movement/Cancellation, the same three message types
-/// `trust-consumer` itself keys real behaviour on.
+/// records. `ChangeOfOrigin`/`ChangeOfIdentity`/`Reinstatement`/`Unknown`
+/// are deliberately ignored -- `correlate.rs`'s own scope (Decision 2d) only
+/// covers Activation/Movement/Cancellation, the same three message types
+/// `trust-consumer` itself keys real behaviour on. `Reinstatement` (`0005`,
+/// confirmed by the H4 fix of the 2026-09-26 review) doesn't regress this
+/// consumer's own "cancelled" line-level state by being ignored here: this
+/// module's `apply_movement`/`apply_cancellation` already reuse
+/// `trust_schema::journey` directly, so that fix's own `status_rank` change
+/// (a fresh Movement can un-stick a `"cancelled"` per-line status without
+/// needing a Reinstatement message specifically) already applies here too.
 fn dispatch_message(
     message: TrustMessage,
     correlation_state: &mut correlate::CorrelationState,
@@ -556,6 +562,7 @@ fn dispatch_message(
         }
         TrustMessage::ChangeOfOrigin(_)
         | TrustMessage::ChangeOfIdentity(_)
+        | TrustMessage::Reinstatement(_)
         | TrustMessage::Unknown(_) => {}
     }
 }

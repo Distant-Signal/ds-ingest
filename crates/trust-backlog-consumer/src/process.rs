@@ -362,18 +362,30 @@ pub fn process_message(
                         .unwrap_or(today)
                 });
 
-            // A Cancellation's key carries nothing but `(train_id, msg_type)`
-            // otherwise, and `api`'s `trust_event_backlog` enforces a GLOBAL
-            // unique `dedup_key` across a 90-day retention -- so without this
-            // date a recycled `train_id`'s genuinely new cancellation was
-            // silently dropped as a duplicate of the previous month's
-            // unrelated train. See `trust_schema::dedup::dedup_key`.
+            // A Cancellation's key otherwise carries nothing but
+            // `(train_id, msg_type)`, and `api`'s `trust_event_backlog`
+            // enforces a GLOBAL unique `dedup_key` across a 90-day retention
+            // -- so without this date a recycled `train_id`'s genuinely new
+            // cancellation was silently dropped as a duplicate of the
+            // previous month's unrelated train. See
+            // `trust_schema::dedup::dedup_key`.
+            //
+            // **H4 finding, 2026-09-26 review.** The date alone doesn't
+            // distinguish two REAL cancellations for the same train on the
+            // SAME day (a cancel -> reinstate -> cancel-again sequence) --
+            // both used to hash identically and collapse to one row. Same
+            // fix as `trust-consumer::process.rs`'s own Cancellation arm:
+            // `canx_timestamp` (the one field TRUST's confirmed `0002` shape
+            // carries that actually differs between two such events) now
+            // fills the `planned_timestamp` key slot, while a genuine
+            // redelivery of the exact same message -- same `canx_timestamp`
+            // -- still hashes identically.
             let dedup = trust_schema::dedup::dedup_key(
                 &cancellation.train_id,
                 "0002",
                 None,
                 None,
-                None,
+                cancellation.canx_timestamp.as_deref(),
                 today,
             );
 
@@ -389,6 +401,52 @@ pub fn process_message(
                 event_type: None,
                 planned_timestamp: None,
                 actual_timestamp: actual,
+                variation_status: None,
+                delay_minutes: None,
+                dedup_key: dedup,
+            })
+        }
+
+        // **H4 finding, 2026-09-26 review.** A Reinstatement is now recorded
+        // into the backlog (previously dropped upstream, at `movement-relay`,
+        // as an unconfirmed `Unknown` type) so a subscription that only
+        // resolves AFTER a cancel -> reinstate sequence can still replay the
+        // reinstatement and land on the correct un-stuck status --
+        // `api::data::trust_event_backlog_match`'s own replay function has
+        // the matching `"0005"` arm for exactly this. This minimal, confirmed
+        // shape (see `schema::Reinstatement`'s own doc comment) carries no
+        // timestamp of any kind, so `service_date` can only ever come from a
+        // parked Activation's own `service_date`, falling back to `today`
+        // (the processing day) same as the last-resort fallback on every
+        // other arm above.
+        TrustMessage::Reinstatement(reinstatement) => {
+            let service_date = state
+                .pending_service_dates
+                .get(&reinstatement.train_id)
+                .copied()
+                .unwrap_or(today);
+
+            let dedup = trust_schema::dedup::dedup_key(
+                &reinstatement.train_id,
+                "0005",
+                None,
+                None,
+                None,
+                today,
+            );
+
+            Some(common::TrustBacklogEventMessage {
+                crs: None,
+                train_uid: state
+                    .pending_train_uids
+                    .get(&reinstatement.train_id)
+                    .cloned(),
+                train_id: reinstatement.train_id.clone(),
+                service_date,
+                msg_type: "0005".to_string(),
+                event_type: None,
+                planned_timestamp: None,
+                actual_timestamp: None,
                 variation_status: None,
                 delay_minutes: None,
                 dedup_key: dedup,
@@ -972,6 +1030,84 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first.dedup_key, redelivered.dedup_key);
+    }
+
+    /// **H4 finding, 2026-09-26 review.** The compounding half of the
+    /// finding: two DIFFERENT real cancellation events for the same train on
+    /// the SAME rail day (a cancel -> reinstate -> cancel-again sequence)
+    /// must not collapse to one dedup key either -- before this fix, both
+    /// hashed identically since neither the date nor anything else in the
+    /// key changed within the same day, so the second, genuinely new
+    /// cancellation would have been silently dropped as a "duplicate" of the
+    /// first by `trust_event_backlog`'s global `ON CONFLICT (dedup_key) DO
+    /// NOTHING`.
+    #[test]
+    fn two_distinct_cancellations_on_the_same_day_get_different_dedup_keys() {
+        let first_cancellation = TrustMessage::Cancellation(trust_schema::schema::Cancellation {
+            train_id: "221832406".to_string(),
+            canx_timestamp: Some("1787941920000".to_string()),
+            canx_reason_code: None,
+            canx_type: None,
+        });
+        // A later, genuinely different real-world cancellation for the SAME
+        // train on the SAME rail day -- e.g. after a Reinstatement -- must
+        // carry its own, later `canx_timestamp`.
+        let second_cancellation = TrustMessage::Cancellation(trust_schema::schema::Cancellation {
+            train_id: "221832406".to_string(),
+            canx_timestamp: Some("1787945520000".to_string()),
+            canx_reason_code: None,
+            canx_type: None,
+        });
+        let mut state = ProcessorState::default();
+        let first = process_message(
+            &first_cancellation,
+            &mut state,
+            &stanox_table(),
+            &crs_index_with(&["WAT"]),
+            today(),
+            test_received_at(),
+        )
+        .unwrap();
+        let second = process_message(
+            &second_cancellation,
+            &mut state,
+            &stanox_table(),
+            &crs_index_with(&["WAT"]),
+            today(),
+            test_received_at(),
+        )
+        .unwrap();
+        assert_ne!(
+            first.dedup_key, second.dedup_key,
+            "two distinct same-day cancellations for the same train must not collapse to one row"
+        );
+    }
+
+    /// The Reinstatement-arm twin of the Cancellation tests above: `0005`
+    /// is now recorded into the backlog rather than silently dropped
+    /// upstream (the H4 finding, 2026-09-26 review).
+    #[test]
+    fn a_reinstatement_is_recorded_into_the_backlog() {
+        let reinstatement = TrustMessage::Reinstatement(trust_schema::schema::Reinstatement {
+            train_id: "221832406".to_string(),
+        });
+        let mut state = ProcessorState::default();
+        let result = process_message(
+            &reinstatement,
+            &mut state,
+            &stanox_table(),
+            &crs_index_with(&["WAT"]),
+            today(),
+            test_received_at(),
+        )
+        .unwrap();
+        assert_eq!(result.msg_type, "0005");
+        assert_eq!(result.train_id, "221832406");
+        assert_eq!(
+            result.service_date,
+            today(),
+            "no parked Activation and no timestamp of its own -- falls back to the processing day"
+        );
     }
 
     #[test]

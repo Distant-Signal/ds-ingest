@@ -338,13 +338,17 @@ mod tests {
     use crate::event_sink::FakeEventSink;
     use crate::kafka_source::FakeRawSource;
 
+    // `0008` ("Change of Location"), not `0005`, is the still-genuinely-
+    // unconfirmed type here as of the H4 fix (2026-09-26 review): `0005`
+    // (Reinstatement) moved into the confirmed set, see
+    // `trust_schema::schema`'s own `CONFIRMED` list and module doc.
     const CONFIRMED_AND_UNKNOWN: &str = r#"[
         {"header":{"msg_type":"0003"},"body":{
             "train_id":"221832406","event_type":"DEPARTURE",
             "planned_timestamp":"1756400000000","actual_timestamp":"1756400060000",
             "loc_stanox":"87701","variation_status":"LATE"
         }},
-        {"header":{"msg_type":"0005"},"body":{"anything":"goes"}}
+        {"header":{"msg_type":"0008"},"body":{"anything":"goes"}}
     ]"#;
 
     #[tokio::test]

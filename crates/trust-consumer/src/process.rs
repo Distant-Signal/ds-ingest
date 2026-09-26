@@ -939,6 +939,7 @@ fn msg_type_label(message: &TrustMessage) -> &'static str {
         TrustMessage::Activation(_) => "0001",
         TrustMessage::Cancellation(_) => "0002",
         TrustMessage::Movement(_) => "0003",
+        TrustMessage::Reinstatement(_) => "0005",
         TrustMessage::ChangeOfOrigin(_) => "0006",
         TrustMessage::ChangeOfIdentity(_) => "0007",
         // Genuinely reachable under the Kafka backend (`process_message`'s
@@ -1443,17 +1444,35 @@ fn process_message(
             state.set_last_derived(&cancellation.train_id, derived.clone());
 
             // The rail day is load-bearing in this one especially: a
-            // Cancellation carries nothing else that distinguishes it, so
-            // without a date the key was just `(train_id, "0002")` -- and
-            // TRUST recycles `train_id`s monthly while `api`'s
-            // `trust_event_backlog` enforces a GLOBAL unique `dedup_key`
-            // over a 90-day retention. See `trust_schema::dedup::dedup_key`.
+            // Cancellation used to carry nothing else that distinguishes it
+            // from another one, so without a date the key was just
+            // `(train_id, "0002")` -- and TRUST recycles `train_id`s monthly
+            // while `api`'s `trust_event_backlog` enforces a GLOBAL unique
+            // `dedup_key` over a 90-day retention. See
+            // `trust_schema::dedup::dedup_key`.
+            //
+            // **H4 finding, 2026-09-26 review.** The date alone isn't
+            // enough within a SINGLE day either: a real cancel -> reinstate
+            // -> cancel-again sequence for the same train on the same rail
+            // day used to collapse to one stored row, because both
+            // Cancellations hashed `(train_id, "0002", None, None, None,
+            // rail_day)` identically -- the second, genuinely new
+            // cancellation was silently discarded as a "duplicate" of the
+            // first by `ON CONFLICT (dedup_key) DO NOTHING`. `canx_timestamp`
+            // is the one field TRUST's own confirmed `0002` shape carries
+            // that actually distinguishes two real cancellation events for
+            // the same train on the same day, so it now fills the
+            // `planned_timestamp` key slot here -- the same slot a Movement
+            // fills with its own real distinguishing timestamp. A genuine
+            // redelivery of the SAME cancellation message still carries the
+            // SAME `canx_timestamp`, so it still hashes identically (the
+            // redelivery-safety property this key must never lose).
             let dedup = trust_schema::dedup::dedup_key(
                 &cancellation.train_id,
                 "0002",
                 None,
                 None,
-                None,
+                cancellation.canx_timestamp.as_deref(),
                 common::rail_day::current_rail_day(received_at),
             );
 
@@ -1507,6 +1526,65 @@ fn process_message(
                 .collect()
         }
 
+        // **H4 finding, 2026-09-26 review.** A Reinstatement, like a
+        // Cancellation, carries no location to match a pin on -- it can
+        // only ever reach subscribers through `state.resolved`, same gate
+        // and same reasoning as the Cancellation arm above. Unlike
+        // `passthrough_event` below (used for `0006`/`0007`, which have no
+        // confirmed derivation rule at all), a Reinstatement DOES have one:
+        // `journey::apply_reinstatement` un-sticks a `"cancelled"` journey
+        // back to `"en_route"`, which is the entire point of modeling this
+        // message type instead of leaving it as `Unknown`.
+        TrustMessage::Reinstatement(reinstatement) => {
+            let Some(tracked_train_ids) = state.resolved.get(&reinstatement.train_id).cloned()
+            else {
+                return Vec::new();
+            };
+
+            let previous = previous_state(state, &reinstatement.train_id);
+            let derived = trust_schema::journey::apply_reinstatement(&previous);
+            state.set_last_derived(&reinstatement.train_id, derived.clone());
+
+            // No timestamp of any kind in this minimal, confirmed-by-name-
+            // only shape (see `schema::Reinstatement`'s own doc comment), so
+            // the key is just `(train_id, "0005", rail_day)` -- same
+            // no-extra-distinguishing-field shape as `0001`/`0006`/`0007`
+            // already have, per `dedup_key`'s own doc comment.
+            let dedup = trust_schema::dedup::dedup_key(
+                &reinstatement.train_id,
+                "0005",
+                None,
+                None,
+                None,
+                common::rail_day::current_rail_day(received_at),
+            );
+
+            tracked_train_ids
+                .into_iter()
+                .map(|tracked_train_id| common::TrainMovementEventMessage {
+                    tracked_train_id,
+                    resolved_train_uid: None,
+                    resolved_train_id: None,
+                    dedup_key: dedup.clone(),
+                    msg_type: "0005".to_string(),
+                    event_type: None,
+                    loc_stanox: None,
+                    loc_crs: None,
+                    planned_timestamp: None,
+                    actual_timestamp: None,
+                    variation_status: None,
+                    raw_body: serde_json::json!({}),
+                    status: derived.status.clone(),
+                    last_reported_location: derived.last_reported_location.clone(),
+                    last_event_type: derived.last_event_type.clone(),
+                    delay_minutes: derived.delay_minutes,
+                    next_calling_point: derived.next_calling_point.clone(),
+                    eta_next: None,
+                    eta_source: None,
+                })
+                .collect()
+        }
+
         TrustMessage::ChangeOfOrigin(change) => {
             passthrough_event(&change.train_id, "0006", state, received_at)
         }
@@ -1518,7 +1596,7 @@ fn process_message(
         // unconfirmed msg_type into `Unknown` always succeeds, so there's
         // no failure to warn about there) -- logged here instead, the one
         // place the captured msg_type is actually read, so a real RDM feed
-        // sending `0005`/`0008` (or anything else undocumented) shows up in
+        // sending `0008` (or anything else undocumented) shows up in
         // this crate's logs rather than vanishing silently. There is no
         // confirmed body shape to derive anything from either way.
         TrustMessage::Unknown(msg_type) => {
@@ -2031,6 +2109,109 @@ mod tests {
         assert!(
             events.is_empty(),
             "nothing to attribute the cancellation to"
+        );
+    }
+
+    /// **H4 finding, 2026-09-26 review.** Before this fix, `0005` parsed as
+    /// `Unknown` and was dropped at `movement-relay` before this crate ever
+    /// saw it -- so a real Reinstatement never reached this far, and the
+    /// terminal-state guard the 2026-09-25 review added made `"cancelled"`
+    /// permanently sticky on top of that. This proves the whole path now
+    /// works end to end: a Cancellation, then a genuine Reinstatement,
+    /// un-sticks the status immediately (before any further Movement even
+    /// arrives), and a real Movement afterward is reflected normally.
+    #[tokio::test]
+    async fn a_reinstatement_after_a_cancellation_unsticks_the_status() {
+        let cancellation = r#"[{"header":{"msg_type":"0002"},"body":{
+            "train_id":"221832406","canx_timestamp":"1787947200000","canx_type":"EN ROUTE"
+        }}]"#;
+        let reinstatement = r#"[{"header":{"msg_type":"0005"},"body":{"train_id":"221832406"}}]"#;
+        let later_movement = r#"[{"header":{"msg_type":"0003"},"body":{
+            "train_id":"221832406","event_type":"DEPARTURE",
+            "planned_timestamp":"1787949120000","actual_timestamp":"1787949120000",
+            "loc_stanox":"87212","variation_status":"ON TIME"
+        }}]"#;
+        let mut feed = FakeMovementFeed::new(vec![
+            vec![ORIGIN_DEPARTURE.to_string()],
+            vec![cancellation.to_string()],
+            vec![reinstatement.to_string()],
+            vec![later_movement.to_string()],
+        ]);
+        let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
+        let mut state = ProcessorState::default();
+
+        run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+
+        let cancel_events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cancel_events[0].status, "cancelled");
+
+        let reinstate_events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reinstate_events.len(), 1);
+        assert_eq!(reinstate_events[0].tracked_train_id, 1);
+        assert_eq!(reinstate_events[0].msg_type, "0005");
+        assert_eq!(
+            reinstate_events[0].status, "en_route",
+            "a genuine Reinstatement must un-stick a cancelled journey immediately"
+        );
+
+        let movement_events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            movement_events[0].status, "en_route",
+            "real movement data resuming after a reinstatement must be reflected normally"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reinstatement_for_an_unresolved_train_produces_no_event() {
+        let reinstatement = r#"[{"header":{"msg_type":"0005"},"body":{"train_id":"221832406"}}]"#;
+        let mut feed = FakeMovementFeed::new(vec![vec![reinstatement.to_string()]]);
+        let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
+        let mut state = ProcessorState::default();
+
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            events.is_empty(),
+            "nothing to attribute the reinstatement to"
         );
     }
 
