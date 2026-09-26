@@ -2,31 +2,72 @@
 //! tiploc->line index, built from `schedule_query::LinePopulationEntry`
 //! rows fetched via `GET /private/schedule-line-population`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use schedule_query::{CallingPoint, LinePopulationEntry};
+use schedule_query::LinePopulationEntry;
 
 #[derive(Debug, Clone, Default)]
 pub struct Population {
-    /// line_id -> service_date -> uid -> calling points
-    by_line: HashMap<String, HashMap<chrono::NaiveDate, HashMap<String, Vec<CallingPoint>>>>,
+    /// line_id -> service_date -> uid set.
+    ///
+    /// Deliberately just the UID, not the `Vec<CallingPoint>` each wire
+    /// entry (`schedule_query::LinePopulationEntry`) also carries -- see
+    /// `insert`'s own doc comment for why retaining it was a real
+    /// production memory-pressure bug (found during the 2026-09-26
+    /// crash-loop investigation), not a deliberate design choice.
+    by_line: HashMap<String, HashMap<chrono::NaiveDate, HashSet<String>>>,
 }
 
 impl Population {
+    /// Inserts `entries` for `(line_id, service_date)`, keeping only each
+    /// entry's `uid` -- **not** its `calling_points`.
+    ///
+    /// This used to retain the whole `Vec<CallingPoint>` per UID per line
+    /// per date, straight off the wire. That was pure waste: `uids_for`,
+    /// the only accessor this crate's dispatch loop
+    /// (`correlate::apply_movement`) or its stats path (`main::write_stats`)
+    /// ever calls, only needs UID membership, and the one accessor that DID
+    /// return calling points (`calling_points`, removed by this fix) had
+    /// exactly one caller in the entire repo: its own round-trip test --
+    /// confirmed by grepping every crate for `.calling_points(` during the
+    /// 2026-09-26 investigation into this consumer OOM-killing against its
+    /// 1Gi limit.
+    ///
+    /// Worse, the waste was multiplied by the line catalogue: `schedules_touching`
+    /// (`schedule-reference`'s producer side) is run independently per
+    /// catalogued line, and each run pulls in EVERY schedule touching ANY
+    /// of that line's own stations, complete with that schedule's FULL
+    /// national calling-point list -- not just the calling points at that
+    /// line's own stations. With 244 `lines/*.toml` files as of this fix
+    /// (up from the 109 a 2026-09-11 doc comment elsewhere in this crate
+    /// still quotes -- the catalogue has more than doubled since numbers
+    /// like that were last checked), a great many real services call at
+    /// stations belonging to several catalogued lines at once, so the same
+    /// schedule's calling-point list was being deserialized and retained
+    /// once per line it touched, for both today's and tomorrow's date,
+    /// every `population_reload_secs` cycle (300s by default). A
+    /// `CallingPoint` is not small either: `tiploc`/`activity` `String`s
+    /// plus four `Option<NaiveTime>` fields per entry, times roughly a
+    /// dozen calling points on a typical schedule -- multiple orders of
+    /// magnitude heavier per UID than the bare UID `String` this crate
+    /// actually needs.
+    ///
+    /// This is exactly the "footprint scales with the line catalogue" risk
+    /// `charts/distant-signal/values.yaml`'s `fullCoverageConsumer.resources`
+    /// comment already named when its 1Gi limit was set (2026-09-25) --
+    /// except the data driving that footprint was never actually read at
+    /// runtime, so the fix is to stop retaining it, not to raise the limit.
     pub fn insert(
         &mut self,
         line_id: &str,
         service_date: chrono::NaiveDate,
         entries: Vec<LinePopulationEntry>,
     ) {
-        let by_uid: HashMap<String, Vec<CallingPoint>> = entries
-            .into_iter()
-            .map(|e| (e.uid, e.calling_points))
-            .collect();
+        let uids: HashSet<String> = entries.into_iter().map(|e| e.uid).collect();
         self.by_line
             .entry(line_id.to_string())
             .or_default()
-            .insert(service_date, by_uid);
+            .insert(service_date, uids);
     }
 
     /// Drops every stored date strictly older than `service_date`, and any
@@ -34,11 +75,11 @@ impl Population {
     ///
     /// Without this, nothing ever removed a past date: `insert` is called
     /// for today AND tomorrow on every reload cycle (300s by default), so a
-    /// long-lived process accumulated one full per-line, per-UID
-    /// calling-point map per rail day forever -- data no longer read by
-    /// anything, since `uids_for`/`calling_points` are only ever asked about
-    /// the current `service_date`. Called at each rail-day rollover and at
-    /// the end of each reload, so the resident set stays at today+tomorrow.
+    /// long-lived process accumulated one full per-line UID set per rail
+    /// day forever -- data no longer read by anything, since `uids_for` is
+    /// only ever asked about the current `service_date`. Called at each
+    /// rail-day rollover and at the end of each reload, so the resident set
+    /// stays at today+tomorrow.
     pub fn retain_from(&mut self, service_date: chrono::NaiveDate) {
         self.by_line.retain(|_line_id, by_date| {
             by_date.retain(|date, _| *date >= service_date);
@@ -53,27 +94,8 @@ impl Population {
         self.by_line
             .get(line_id)
             .and_then(|by_date| by_date.get(&service_date))
-            .map(|by_uid| by_uid.keys().map(String::as_str).collect())
+            .map(|uids| uids.iter().map(String::as_str).collect())
             .unwrap_or_default()
-    }
-
-    /// Unused by `main.rs`'s loop today -- `stats::synthesize_departure`
-    /// doesn't consult a UID's own calling points yet (Decision 2g's
-    /// PASS-to-skipped mapping is unresolved, per that module's own doc
-    /// comment), but this accessor is real, tested API surface for that
-    /// future pass, not speculative.
-    #[allow(dead_code)]
-    pub fn calling_points(
-        &self,
-        line_id: &str,
-        service_date: chrono::NaiveDate,
-        uid: &str,
-    ) -> Option<&[CallingPoint]> {
-        self.by_line
-            .get(line_id)?
-            .get(&service_date)?
-            .get(uid)
-            .map(Vec::as_slice)
     }
 }
 
@@ -136,8 +158,8 @@ pub fn build_tiploc_index(
 mod tests {
     use super::*;
 
-    fn fixture_calling_point(tiploc: &str) -> CallingPoint {
-        CallingPoint {
+    fn fixture_calling_point(tiploc: &str) -> schedule_query::CallingPoint {
+        schedule_query::CallingPoint {
             tiploc: tiploc.to_string(),
             kind: schedule_query::CallingPointKind::Origin,
             booked_arrival: None,
@@ -176,23 +198,58 @@ mod tests {
         assert!(population.uids_for("nonexistent", date).is_empty());
     }
 
+    /// Regression test for the 2026-09-26 crash-loop investigation's actual
+    /// finding: a UID's `calling_points` must never end up resident in
+    /// `Population`, no matter how large -- only its membership in the
+    /// line/date's UID set. This is the fix for
+    /// `charts/distant-signal/values.yaml`'s `fullCoverageConsumer` 1Gi
+    /// limit being hit: this crate used to retain the FULL calling-point
+    /// list (potentially dozens of entries, each carrying several `String`/
+    /// `Option<NaiveTime>` fields) for every UID, once per catalogued line
+    /// it touched (244 `lines/*.toml` files, many sharing stations), for
+    /// both today's and tomorrow's date -- all of it dead weight, since
+    /// nothing in this crate ever read it back out (`uids_for` is the only
+    /// accessor any caller uses).
+    ///
+    /// Reaches into the private `by_line` field (this test module is a
+    /// child of `population`'s own module, so it may) specifically to
+    /// assert on the STORAGE TYPE, not just behavior: `HashSet<String>`
+    /// cannot hold a `Vec<CallingPoint>` even by accident, which is the
+    /// load-bearing guarantee here, not merely "the test happens to pass
+    /// today."
     #[test]
-    fn calling_points_round_trips_the_inserted_entry() {
+    fn insert_discards_calling_points_keeping_only_uid_membership() {
         let mut population = Population::default();
         let date: chrono::NaiveDate = "2026-09-04".parse().unwrap();
-        let cp = fixture_calling_point("WATRLMN");
+        // A deliberately oversized calling-point list -- if any of it were
+        // retained, this test's real point (the type itself makes that
+        // impossible) would be moot, but the size still documents the scale
+        // of the waste a real long schedule represents.
+        let heavy_calling_points: Vec<schedule_query::CallingPoint> = (0..50)
+            .map(|i| fixture_calling_point(&format!("TPL{i}")))
+            .collect();
         population.insert(
             "waterloo-reading",
             date,
             vec![LinePopulationEntry {
                 uid: "C11052".to_string(),
-                calling_points: vec![cp.clone()],
+                calling_points: heavy_calling_points,
             }],
         );
+
         assert_eq!(
-            population.calling_points("waterloo-reading", date, "C11052"),
-            Some(&[cp][..])
+            population.uids_for("waterloo-reading", date),
+            vec!["C11052"],
+            "membership must still work"
         );
+
+        let uids = population
+            .by_line
+            .get("waterloo-reading")
+            .and_then(|by_date| by_date.get(&date))
+            .expect("just inserted");
+        assert_eq!(uids.len(), 1);
+        assert!(uids.contains("C11052"));
     }
 
     /// Stations are built with `tiploc: None` throughout -- the exact
