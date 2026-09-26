@@ -16,6 +16,48 @@ use crate::MovementFeed;
 
 const STREAM: &str = "movement-events";
 
+/// How many pending entries a single id=`0` PEL-replay read (`next_batch`)
+/// or a single `XAUTOCLAIM` round-trip (`reclaim_stale`) asks Redis for at
+/// once.
+///
+/// **Why this was raised from 100** (Repeater Signal review, finding M15):
+/// `next_batch` only ever performs ONE id=`0` read per `replaying_pel`
+/// activation before switching back to `>` (see that field's own doc) --
+/// so the number of entries a single PEL replay actually delivers is
+/// capped by this count, not by how many are sitting in the PEL. After a
+/// consumer rename (or any event that reassigns a large backlog to a fresh
+/// consumer name via `reclaim_stale`), each further batch only becomes
+/// deliverable once it has aged past `autoclaim_min_idle` again and the
+/// next periodic sweep re-claims it -- i.e. at most one `count`-sized batch
+/// per sweep interval. At the old 100 and a 30s sweep interval (this
+/// crate's real deployed default -- see e.g. `trust-consumer`'s
+/// `redis_autoclaim_min_idle_secs`), a 5,000-entry backlog took roughly 25
+/// minutes (50 sweeps * 30s) of delayed, out-of-order replay to fully
+/// drain, confirmed against a live cluster.
+///
+/// 1000 was chosen, not just doubled or left at 100:
+/// - It cuts that same 5,000-entry drain to ~5 sweeps (~2.5 minutes),
+///   a real improvement rather than a marginal one.
+/// - Individual `movement-events` entries are small TRUST envelopes (a
+///   handful of string/optional-string fields per `trust-schema::schema`,
+///   typically well under 1KB serialized) -- 1000 of them in memory at
+///   once is on the order of hundreds of KB to ~1MB, not a memory
+///   concern, and nowhere close to problematic relative to the stream's
+///   own hard `MAXLEN 500_000` cap.
+/// - It does not require also decoupling the sweep-check interval from
+///   `autoclaim_min_idle`: that interval already fires as promptly as an
+///   entry can become re-eligible (an entry re-claimed at a sweep is only
+///   re-claimable once it has been idle for another full
+///   `autoclaim_min_idle`, so a same-length check interval already catches
+///   it essentially as soon as it is eligible) -- the batch count, not the
+///   interval, was the actual bottleneck.
+const PEL_REPLAY_BATCH_COUNT: usize = 1000;
+
+/// Batch size for ordinary `>` (new-entry) reads -- unchanged from the
+/// original 100; see `PEL_REPLAY_BATCH_COUNT` for why only the replay path
+/// was raised.
+const LIVE_READ_BATCH_COUNT: usize = 100;
+
 pub struct RedisStreamMovementFeed {
     conn: ConnectionManager,
     stream: String,
@@ -193,7 +235,16 @@ impl MovementFeed for RedisStreamMovementFeed {
                 &[id_arg],
                 &redis::streams::StreamReadOptions::default()
                     .group(&self.group, &self.consumer)
-                    .count(100)
+                    // The larger replay count applies only to the id=`0`
+                    // PEL-replay read it was sized for; ordinary `>` reads
+                    // keep their original batch size, so this change does
+                    // not also widen every live batch (and with it the
+                    // un-XACKed window a crash would redeliver).
+                    .count(if self.replaying_pel {
+                        PEL_REPLAY_BATCH_COUNT
+                    } else {
+                        LIVE_READ_BATCH_COUNT
+                    })
                     .block(if self.replaying_pel { 0 } else { 5000 }),
             )
             .await?;
@@ -272,7 +323,14 @@ impl RedisStreamMovementFeed {
                     &self.consumer,
                     self.autoclaim_min_idle.as_millis() as u64,
                     cursor,
-                    redis::streams::StreamAutoClaimOptions::default().count(100),
+                    // Same `PEL_REPLAY_BATCH_COUNT` as `next_batch`'s own
+                    // id=`0` read, for consistency; unlike that read this
+                    // loop already continues until `next_stream_id ==
+                    // "0-0"` regardless of count, so raising it here only
+                    // reduces the number of `XAUTOCLAIM` round-trips a full
+                    // sweep needs, it does not by itself change how much a
+                    // single `next_batch` call can deliver.
+                    redis::streams::StreamAutoClaimOptions::default().count(PEL_REPLAY_BATCH_COUNT),
                 )
                 .await?;
 
@@ -747,6 +805,82 @@ mod redis_tests {
             vec!["payload-1".to_string()],
             "the stale entry should be reclaimed and delivered to live-consumer"
         );
+
+        cleanup(&stream).await;
+    }
+
+    /// Regression test for Repeater Signal finding M15: a reclaimed backlog
+    /// used to replay only 100 entries per sweep (the old `.count(100)`),
+    /// so a 5,000-entry backlog took ~25 minutes to drain. A single reclaim
+    /// + replay must now deliver a full `PEL_REPLAY_BATCH_COUNT` batch.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn a_reclaimed_backlog_replays_a_full_pel_replay_batch_per_sweep() {
+        let stream = unique_stream("backlog-drain");
+        const BACKLOG: usize = PEL_REPLAY_BATCH_COUNT + 200;
+
+        let mut dead = RedisStreamMovementFeed::connect_for_test(
+            &redis_url(),
+            &stream,
+            "test-group",
+            "dead-consumer",
+            // Long enough that this consumer never reclaims (and so
+            // re-replays) its OWN pending entries while reading the backlog
+            // below -- only `live` should sweep.
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+
+        let client = redis::Client::open(redis_url()).unwrap();
+        let mut raw_conn = client.get_connection_manager().await.unwrap();
+        let mut pipe = redis::pipe();
+        for i in 0..BACKLOG {
+            pipe.cmd("XADD")
+                .arg(&stream)
+                .arg("*")
+                .arg("payload")
+                .arg(format!("payload-{i}"))
+                .ignore();
+        }
+        let _: () = pipe.query_async(&mut raw_conn).await.unwrap();
+
+        // Deliver the whole backlog to "dead-consumer" (live `>` reads, 100
+        // at a time) and never ack it -- a consumer rename / dead pod.
+        dead.next_batch().await.unwrap(); // drain empty startup PEL
+        let mut delivered_to_dead = 0;
+        while delivered_to_dead < BACKLOG {
+            let batch = dead.next_batch().await.unwrap();
+            assert!(!batch.is_empty(), "backlog should still be readable");
+            delivered_to_dead += batch.len();
+        }
+        drop(dead);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut live = RedisStreamMovementFeed::connect_for_test(
+            &redis_url(),
+            &stream,
+            "test-group",
+            "live-consumer",
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+        let replayed = live.next_batch().await.unwrap();
+        assert_eq!(
+            replayed.len(),
+            PEL_REPLAY_BATCH_COUNT,
+            "one reclaim + replay must deliver a full PEL_REPLAY_BATCH_COUNT batch, \
+             not the old 100-entry trickle"
+        );
+        assert!(
+            replayed.len() >= 500,
+            "a regression back toward the old 100-per-sweep replay must fail this test \
+             (got {})",
+            replayed.len()
+        );
+        assert_eq!(replayed.first().map(String::as_str), Some("payload-0"));
 
         cleanup(&stream).await;
     }

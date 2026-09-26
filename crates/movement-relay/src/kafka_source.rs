@@ -16,6 +16,9 @@
 //! confirmed/unknown message types happens in `main.rs` via
 //! `trust_schema::schema::confirmed_envelope_bodies`, not here.
 
+use std::collections::VecDeque;
+use std::time::Duration;
+
 use async_trait::async_trait;
 use rdkafka::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -65,13 +68,56 @@ pub struct KafkaRawSource {
     /// receive/confirm split `trust-consumer/src/feed/kafka.rs`'s
     /// `KafkaMovementFeed::last_received` already established.
     last_received: Option<(String, i32, i64)>,
-    /// A batch handed back by `retain_for_retry` because its downstream
-    /// write failed. While this is `Some`, `next_batch` re-delivers it and
-    /// deliberately does NOT call `consumer.recv()` -- `last_received` must
-    /// keep pointing at this record's own offset until it is either
+    /// Batches handed back by `retain_for_retry` because their downstream
+    /// write failed, in redelivery order (front = next to redeliver). While
+    /// this is non-empty, `next_batch` re-delivers its front entry instead
+    /// of fetching anything new via a real `consumer.recv()` -- `last_received`
+    /// must keep pointing at that entry's own offset until it is either
     /// committed or handed back again.
-    pending_retry: Option<Vec<String>>,
+    ///
+    /// A `VecDeque` rather than a single slot because of the keepalive poll
+    /// `next_batch` performs while this is non-empty (see that function's
+    /// own doc, and `paused`'s): partitions are paused for the whole time
+    /// there is a retained batch, so that poll should never surface a real
+    /// message, but librdkafka may still have a few messages already
+    /// buffered locally from just before the pause took effect. Rather than
+    /// silently dropping one of those (this pipeline's whole point is that
+    /// no movement is ever silently dropped), it is queued behind whatever
+    /// is already retained and delivered once its turn comes, in the same
+    /// order Kafka produced it.
+    pending_retry: VecDeque<PendingRecord>,
+    /// Whether this consumer's assigned partitions are currently paused
+    /// because `pending_retry` holds (or recently held) a batch awaiting
+    /// redelivery. Paused for the WHOLE time `pending_retry` is non-empty --
+    /// set by `retain_for_retry` the moment it first has something to
+    /// retain, cleared by `commit` once a successful commit leaves
+    /// `pending_retry` empty again -- so the keepalive `consumer.recv()`
+    /// call `next_batch` makes while retrying can never race a genuinely
+    /// NEW message ahead of the batch(es) still waiting to be redelivered:
+    /// with fetching paused, `recv()` cannot return a new message from the
+    /// broker, only (rarely) one already buffered locally beforehand, which
+    /// `next_batch` queues rather than drops -- see `pending_retry`'s own
+    /// doc.
+    paused: bool,
 }
+
+/// One retained-or-incidentally-received Kafka record awaiting redelivery,
+/// paired with the offset it must eventually be committed under.
+struct PendingRecord {
+    batch: Vec<String>,
+    offset: (String, i32, i64),
+}
+
+/// Upper bound on the keepalive `consumer.recv()` call `next_batch` makes
+/// while redelivering a retained batch. It only needs to touch `recv()`
+/// once to service librdkafka's own `max.poll.interval.ms` liveness check
+/// (see `MAX_POLL_INTERVAL_MS`'s own doc for why that budget exists and
+/// what it is sized for) -- not actually wait for a message, since
+/// partitions are paused for the whole retry window (see `paused`'s doc).
+/// Short enough that it never meaningfully delays redelivery of the
+/// retained batch relative to `movement-relay::main::ERROR_BACKOFF`, the
+/// flat backoff between retry cycles this keepalive call rides along with.
+const KEEPALIVE_POLL_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Worst-case time `run_cycle` can spend doing inline downstream work
 /// between one `consumer.recv()` and the next, so librdkafka's own
@@ -139,8 +185,44 @@ impl KafkaRawSource {
         Ok(Self {
             consumer,
             last_received: None,
-            pending_retry: None,
+            pending_retry: VecDeque::new(),
+            paused: false,
         })
+    }
+
+    /// Pauses fetching on this consumer's CURRENT partition assignment --
+    /// best-effort, logged rather than propagated, since a failure here
+    /// should not itself abort the retry it's meant to protect (worst case
+    /// without it: the narrow already-buffered-message race `pending_retry`
+    /// already tolerates becomes more likely, not a new failure mode).
+    fn pause_assigned_partitions(&self) {
+        match self.consumer.assignment() {
+            Ok(assignment) => {
+                if let Err(err) = self.consumer.pause(&assignment) {
+                    tracing::warn!(error = ?err, "failed to pause Kafka partitions for a Redis retry; a new message could race the retained batch");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = ?err, "failed to read Kafka partition assignment to pause for a Redis retry");
+            }
+        }
+    }
+
+    /// Resumes fetching on this consumer's current partition assignment --
+    /// same best-effort posture as `pause_assigned_partitions`: a failure
+    /// here means this consumer stays paused (a stall, caught by the
+    /// existing stream-lag alerting) rather than something worse.
+    fn resume_assigned_partitions(&self) {
+        match self.consumer.assignment() {
+            Ok(assignment) => {
+                if let Err(err) = self.consumer.resume(&assignment) {
+                    tracing::warn!(error = ?err, "failed to resume Kafka partitions after a successful Redis retry commit");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = ?err, "failed to read Kafka partition assignment to resume after a successful Redis retry commit");
+            }
+        }
     }
 }
 
@@ -148,11 +230,83 @@ impl KafkaRawSource {
 impl RawKafkaSource for KafkaRawSource {
     async fn next_batch(&mut self) -> anyhow::Result<Vec<String>> {
         // A previously-received batch whose downstream write failed is
-        // re-delivered before anything new is fetched: `recv()` here would
-        // advance the fetch position past it and overwrite `last_received`,
-        // which is exactly how such a record used to be dropped.
-        if let Some(batch) = self.pending_retry.take() {
-            return Ok(batch);
+        // re-delivered before anything new is fetched: a real `recv()` here
+        // would advance the fetch position past it and overwrite
+        // `last_received`, which is exactly how such a record used to be
+        // dropped.
+        if let Some(record) = self.pending_retry.pop_front() {
+            // M5 (Repeater Signal review): this branch used to return
+            // immediately, never touching `consumer.recv()` at all. Every
+            // cycle spent here (which, across a long Redis outage, is EVERY
+            // cycle -- `main::run_cycle` retries every
+            // `main::ERROR_BACKOFF`, and each retry lands right back in
+            // this branch as long as the batch keeps failing to publish)
+            // meant librdkafka's own liveness check
+            // (`max.poll.interval.ms`, `MAX_POLL_INTERVAL_MS` above --
+            // sized only for inline XADD work, 900s) went unserviced. A
+            // Redis outage longer than that budget could then ALSO trigger
+            // a Kafka consumer-group rebalance, on top of the outage
+            // itself, for no reason related to Kafka at all.
+            //
+            // This keepalive call fixes that: partitions are paused for
+            // the whole time `pending_retry` is non-empty (see `paused`'s
+            // own doc, set by `retain_for_retry` below), so `recv()` cannot
+            // return a genuinely NEW message from the broker -- it can
+            // only touch librdkafka's internal queue-poll (which is what
+            // actually resets the liveness timer, on every call, whether or
+            // not anything was found) and, rarely, surface a message that
+            // was already buffered locally an instant before the pause took
+            // effect. That rare case is queued behind whatever is already
+            // retained (same order Kafka produced it in) rather than
+            // dropped -- see `pending_retry`'s own doc for why silently
+            // dropping it is not an acceptable trade merely to service a
+            // liveness check.
+            match tokio::time::timeout(KEEPALIVE_POLL_TIMEOUT, self.consumer.recv()).await {
+                Ok(Ok(message)) => {
+                    let offset = (
+                        message.topic().to_string(),
+                        message.partition(),
+                        message.offset(),
+                    );
+                    match message.payload() {
+                        Some(payload) => {
+                            let payload = String::from_utf8_lossy(payload).into_owned();
+                            tracing::warn!(
+                                ?offset,
+                                "keepalive Kafka poll during a Redis retry unexpectedly received \
+                                 a message despite paused partitions (a message already buffered \
+                                 locally before the pause took effect); queuing it behind the \
+                                 retained batch rather than dropping it"
+                            );
+                            self.pending_retry.push_back(PendingRecord {
+                                batch: vec![payload],
+                                offset,
+                            });
+                        }
+                        None => {
+                            tracing::error!(
+                                ?offset,
+                                "keepalive Kafka poll during a Redis retry received a message with \
+                                 an empty payload; dropping it (same as an ordinary empty-payload \
+                                 message, which `next_batch`'s normal path treats as unrecoverable)"
+                            );
+                        }
+                    }
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(error = ?err, "keepalive Kafka poll during a Redis retry failed; will retry next cycle");
+                }
+                Err(_timeout_elapsed) => {
+                    // Expected common case: partitions are paused, so there
+                    // is nothing to receive. The `recv()` call above still
+                    // ran and touched librdkafka's queue poll before this
+                    // timeout fired, which is all this keepalive needs to
+                    // do.
+                }
+            }
+
+            self.last_received = Some(record.offset);
+            return Ok(record.batch);
         }
         let message = self.consumer.recv().await?;
         let payload = message
@@ -168,7 +322,16 @@ impl RawKafkaSource for KafkaRawSource {
     }
 
     fn retain_for_retry(&mut self, batch: Vec<String>) {
-        self.pending_retry = Some(batch);
+        let offset = self
+            .last_received
+            .take()
+            .expect("retain_for_retry is only ever called with a batch next_batch just returned, and next_batch always records that batch's offset in last_received before returning it");
+        self.pending_retry
+            .push_front(PendingRecord { batch, offset });
+        if !self.paused {
+            self.pause_assigned_partitions();
+            self.paused = true;
+        }
     }
 
     async fn commit(&mut self) -> anyhow::Result<()> {
@@ -179,6 +342,14 @@ impl RawKafkaSource for KafkaRawSource {
         self.consumer
             .commit_consumer_state(rdkafka::consumer::CommitMode::Async)?;
         self.last_received = None;
+        // Only safe to resume once nothing is left awaiting redelivery --
+        // `pending_retry` can still hold a keepalive-caught message even
+        // after the originally retained batch commits (see `next_batch`'s
+        // own doc).
+        if self.paused && self.pending_retry.is_empty() {
+            self.resume_assigned_partitions();
+            self.paused = false;
+        }
         Ok(())
     }
 }
