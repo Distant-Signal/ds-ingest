@@ -178,9 +178,18 @@ async fn main() -> anyhow::Result<()> {
                 let mut events = Vec::new();
                 let mut unparseable = Vec::new();
                 for raw in &batch {
-                    match trust_schema::schema::parse_batch(raw) {
-                        Ok(messages) => {
-                            for message in messages {
+                    match trust_schema::schema::parse_batch_detailed(raw) {
+                        Ok(parsed) => {
+                            // PL-8: count every envelope the parser dropped.
+                            for failure in &parsed.failures {
+                                metrics::counter!(
+                                    common::metrics::metric_name("trust_backlog_consumer_errors_total"),
+                                    "operation" => "parse_envelope",
+                                    "msg_type" => failure.msg_type.clone()
+                                )
+                                .increment(1);
+                            }
+                            for message in parsed.messages {
                                 if let Some(event) = process::process_message(
                                     &message,
                                     &mut process_state,

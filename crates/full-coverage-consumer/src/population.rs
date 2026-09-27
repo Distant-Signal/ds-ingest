@@ -589,7 +589,6 @@ impl Population {
 
     /// Whether a population (possibly empty) is held for
     /// `(line_id, service_date)`.
-    #[cfg(test)]
     pub fn has(&self, line_id: &str, service_date: chrono::NaiveDate) -> bool {
         self.by_line
             .get(line_id)

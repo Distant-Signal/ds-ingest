@@ -11,7 +11,7 @@ fn parse_stanox_crs(path: &str) -> anyhow::Result<StanoxCrsTable> {
 /// Which transport this crate's `MovementFeed` uses -- now defined once in
 /// `movement_feed`, re-exported here so every existing
 /// `use config::{Config, MovementFeedBackend};` import (and this file's own
-/// `#[arg(..., value_enum, default_value_t = MovementFeedBackend::Kafka)]`)
+/// `#[arg(..., value_enum, default_value_t = MovementFeedBackend::RedisStream)]`)
 /// keeps resolving unchanged.
 pub use movement_feed::MovementFeedBackend;
 
@@ -128,10 +128,13 @@ pub struct Config {
     pub stanox_crs_url: String,
 
     /// Which transport this crate's `MovementFeed` uses. See
-    /// `MovementFeedBackend`'s own doc. Defaults to `kafka` -- Deploy A
-    /// (docs/superpowers/plans/2026-09-04-movement-relay-plan.md) changes
-    /// nothing about production behavior until this is explicitly flipped.
-    #[arg(long, env, value_enum, default_value_t = MovementFeedBackend::Kafka)]
+    /// `MovementFeedBackend`'s own doc. Defaults to `redis-stream` (the
+    /// `movement-events` stream movement-relay publishes), which production
+    /// has run since Deploy B (PL-15a of the 2026-09-27 pipelines review).
+    /// The legacy direct-Kafka backend has no dead-letter stream and no gap
+    /// check, and would open a second RDM consumer group, so it is only
+    /// ever used when asked for by name.
+    #[arg(long, env, value_enum, default_value_t = MovementFeedBackend::RedisStream)]
     pub movement_feed_backend: MovementFeedBackend,
 
     /// Only read when `movement_feed_backend = redis-stream`. Always
@@ -198,12 +201,10 @@ pub struct Config {
 mod tests {
     use super::*;
 
-    /// The concrete regression test for "Deploy A changes nothing about
-    /// default production behavior" (docs/superpowers/plans/2026-09-04-movement-relay-plan.md
-    /// Task 4): parsing only the pre-existing required arguments -- none of
-    /// this plan's new flags -- must still yield `MovementFeedBackend::Kafka`.
+    /// PL-15a: with no backend flag, the consumer reads the Redis stream,
+    /// never Kafka directly.
     #[test]
-    fn movement_feed_backend_defaults_to_kafka_when_unset() {
+    fn movement_feed_backend_defaults_to_redis_stream_when_unset() {
         // The real, checked-in reference-data/stanox-crs.csv, since
         // --stanox-crs-file's default value is parsed eagerly (its
         // value_parser opens and parses the file) even when this test never
@@ -237,6 +238,9 @@ mod tests {
         ])
         .expect("minimal required args should parse");
 
-        assert_eq!(config.movement_feed_backend, MovementFeedBackend::Kafka);
+        assert_eq!(
+            config.movement_feed_backend,
+            MovementFeedBackend::RedisStream
+        );
     }
 }

@@ -44,7 +44,12 @@ pub async fn fetch_line_population(
     if let Some(etag) = if_none_match {
         request = request.header(reqwest::header::IF_NONE_MATCH, etag);
     }
-    let response = request.send().await?.error_for_status()?;
+    let response = request.send().await?;
+    // PL-15b: a 401/403 means the cached token itself was refused (an SSO
+    // restart, a key rotation), so drop it and fetch a fresh one next time,
+    // as every `common::ingest` helper does.
+    common::ingest::invalidate_on_auth_rejection(tokens, response.status());
+    let response = response.error_for_status()?;
     if response.status() == reqwest::StatusCode::NOT_MODIFIED {
         return Ok(LinePopulationFetch::NotModified);
     }
@@ -157,6 +162,45 @@ mod tests {
 
     fn date() -> chrono::NaiveDate {
         "2026-09-04".parse().unwrap()
+    }
+
+    /// PL-15b: a 401 on the population GET invalidates the cached token,
+    /// so the next fetch gets a fresh one instead of presenting the
+    /// rejected token until it expires. wiremock's `.expect(2)` on the token
+    /// endpoint is the assertion.
+    #[tokio::test]
+    async fn a_401_invalidates_the_cached_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "fake-jwt",
+                "expires_in": 300,
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/private/schedule-line-population"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let tokens =
+            common::oauth_client::OAuthTokenCache::new(common::oauth_client::OAuthCredentials {
+                token_url: format!("{}/token/", server.uri()),
+                client_id: "test-client".to_string(),
+                scope: "groups".to_string(),
+                username: "test-user".to_string(),
+                password: "test-password".to_string(),
+            });
+        let client = reqwest::Client::new();
+        let url = format!("{}/private/schedule-line-population", server.uri());
+        for _ in 0..2 {
+            let result =
+                fetch_line_population(&client, &url, &tokens, "waterloo-reading", date(), None)
+                    .await;
+            assert!(result.is_err(), "a 401 is still an error");
+        }
     }
 
     /// A new consumer against a new `api`: the first fetch is unconditional

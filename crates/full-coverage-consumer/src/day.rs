@@ -211,7 +211,7 @@ impl DayState {
         population: &Population,
         received_at: DateTime<Utc>,
     ) -> anyhow::Result<()> {
-        for message in trust_schema::schema::parse_batch(raw)? {
+        for message in parse_counted(raw)? {
             if let TrustMessage::Activation(activation) = &message {
                 self.note_next_day_activation(activation);
             }
@@ -229,6 +229,22 @@ impl DayState {
         }
         Ok(())
     }
+}
+
+/// `parse_batch`, counting each envelope it dropped into
+/// `full_coverage_consumer_errors_total{operation="parse_envelope",msg_type}`
+/// (PL-8). Whole-payload failures stay the caller's `Err`.
+fn parse_counted(raw: &str) -> anyhow::Result<Vec<TrustMessage>> {
+    let parsed = trust_schema::schema::parse_batch_detailed(raw)?;
+    for failure in &parsed.failures {
+        metrics::counter!(
+            common::metrics::metric_name("full_coverage_consumer_errors_total"),
+            "operation" => "parse_envelope",
+            "msg_type" => failure.msg_type.clone()
+        )
+        .increment(1);
+    }
+    Ok(parsed.messages)
 }
 
 impl DayState {
@@ -255,7 +271,7 @@ impl DayState {
         received_at: DateTime<Utc>,
     ) -> anyhow::Result<()> {
         let previous = self.service_date - chrono::Duration::days(1);
-        for message in trust_schema::schema::parse_batch(raw)? {
+        for message in parse_counted(raw)? {
             self.note_feed(&message, received_at);
             self.dispatch_to_trains(&message, lookups, received_at, true);
             if let TrustMessage::Activation(activation) = message

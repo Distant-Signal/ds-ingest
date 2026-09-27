@@ -84,7 +84,8 @@ enum Cycle {
 /// happens after a batch was received therefore hands that batch back via
 /// `RawKafkaSource::retain_for_retry`, which makes the next `next_batch`
 /// re-deliver exactly it before fetching anything new. The one deliberate
-/// exception is a classification failure -- see its own comment below.
+/// exception is a record that cannot be classified at all -- see
+/// `publish_batch`: it is skipped and the offset commits past it.
 async fn run_cycle<S, K>(source: &mut S, sink: &mut K) -> Cycle
 where
     S: RawKafkaSource,
@@ -113,18 +114,6 @@ where
             // commits over it -- one permanently dropped record per retry
             // cycle for the whole duration of a Redis outage.
             source.retain_for_retry(batch);
-            return Cycle::Failed;
-        }
-        BatchOutcome::Unclassifiable => {
-            // Deliberately NOT retained. A record that
-            // `confirmed_envelope_bodies` rejects is unprocessable by
-            // construction -- the bytes are fixed, so every retry fails
-            // identically and can never produce an envelope to publish.
-            // Retaining it would wedge the sole movement feed forever on a
-            // single malformed record (a far larger outage than the record
-            // itself). It is logged with its raw payload and counted under
-            // `operation = "classify_record"` above, and the next cycle
-            // moves on past it.
             return Cycle::Failed;
         }
     }
@@ -156,8 +145,6 @@ enum BatchOutcome {
     Published,
     /// A downstream XADD failed: transient, and the record must be retried.
     PublishFailed,
-    /// The record could not be classified at all: permanent for these bytes.
-    Unclassifiable,
 }
 
 async fn publish_batch<K>(sink: &mut K, batch: &[String]) -> BatchOutcome
@@ -166,15 +153,38 @@ where
 {
     for raw in batch {
         let envelopes = match trust_schema::schema::confirmed_envelope_bodies(raw) {
-            Ok(envelopes) => envelopes,
+            Ok(classified) => {
+                // PL-4: an envelope with no `header.msg_type` is skipped on
+                // its own; the rest of the record still publishes.
+                if classified.malformed > 0 {
+                    tracing::warn!(
+                        malformed = classified.malformed,
+                        raw = %raw,
+                        "skipping TRUST envelopes with no header.msg_type; publishing the rest of the record"
+                    );
+                    metrics::counter!(
+                        common::metrics::metric_name("movement_relay_errors_total"),
+                        "operation" => "classify_envelope"
+                    )
+                    .increment(classified.malformed as u64);
+                }
+                classified.envelopes
+            }
             Err(err) => {
-                tracing::error!(error = ?err, raw = %raw, "failed to classify Kafka record; not committing this record's offset");
+                // Permanent for these bytes: every retry would fail the same
+                // way, and retaining it would wedge the sole movement feed.
+                // Skip it and let the offset commit past it (PL-15c): it
+                // used to return a failed cycle, which cost an ERROR_BACKOFF
+                // sleep per bad record and throttled a burst of them to
+                // 0.5 records/s for all three consumer groups. It is logged
+                // with its raw payload and counted here.
+                tracing::error!(error = ?err, raw = %raw, "failed to classify Kafka record; skipping it");
                 metrics::counter!(
                     common::metrics::metric_name("movement_relay_errors_total"),
                     "operation" => "classify_record"
                 )
                 .increment(1);
-                return BatchOutcome::Unclassifiable;
+                continue;
             }
         };
         for (msg_type, payload) in &envelopes {
@@ -469,15 +479,21 @@ mod tests {
         );
     }
 
+    /// PL-15c: an unclassifiable record commits (no retry, no backoff).
     #[tokio::test]
-    async fn an_unclassifiable_record_does_not_commit() {
-        let mut source = FakeRawSource::new(vec![vec![r#"{"not_an_envelope": true}"#.to_string()]]);
+    async fn an_unclassifiable_record_is_committed_past_without_a_failed_cycle() {
+        let mut source = FakeRawSource::new(vec![vec!["not json".to_string()]]);
         let mut sink = FakeEventSink::default();
 
         let outcome = run_cycle(&mut source, &mut sink).await;
 
-        assert_eq!(outcome, Cycle::Failed);
-        assert_eq!(source.committed_count, 0);
+        assert_eq!(
+            outcome,
+            Cycle::Committed,
+            "no ERROR_BACKOFF for a skipped record"
+        );
+        assert_eq!(source.committed_offsets, vec![0]);
+        assert!(sink.published.is_empty());
     }
 
     #[tokio::test]
@@ -666,13 +682,13 @@ mod tests {
     #[tokio::test]
     async fn an_unclassifiable_record_does_not_wedge_the_feed() {
         let mut source = FakeRawSource::new(vec![
-            vec![r#"{"not_an_envelope": true}"#.to_string()],
+            vec!["not json".to_string()],
             vec![movement_record("BBB")],
         ]);
         let mut sink = FakeEventSink::default();
 
-        assert_eq!(run_cycle(&mut source, &mut sink).await, Cycle::Failed);
-        assert_eq!(source.committed_count, 0);
+        assert_eq!(run_cycle(&mut source, &mut sink).await, Cycle::Committed);
+        assert_eq!(source.committed_offsets, vec![0]);
 
         assert_eq!(run_cycle(&mut source, &mut sink).await, Cycle::Committed);
         assert_eq!(
@@ -680,6 +696,26 @@ mod tests {
             vec!["BBB".to_string()],
             "the poison record must not be re-delivered forever"
         );
+        assert_eq!(source.committed_offsets, vec![0, 1]);
+    }
+
+    /// PL-4: one envelope with no `header.msg_type` costs only itself; the
+    /// record's other envelopes still publish and the offset commits.
+    #[tokio::test]
+    async fn an_envelope_missing_msg_type_does_not_drop_its_neighbours() {
+        let raw = r#"[
+            {"header":{},"body":{"train_id":"XXX"}},
+            {"header":{"msg_type":"0003"},"body":{"train_id":"AAA","event_type":"DEPARTURE"}}
+        ]"#;
+        let mut source = FakeRawSource::new(vec![vec![raw.to_string()]]);
+        let mut sink = FakeEventSink::default();
+
+        assert_eq!(run_cycle(&mut source, &mut sink).await, Cycle::Committed);
+        assert_eq!(
+            published_train_ids(&sink.published),
+            vec!["AAA".to_string()]
+        );
+        assert_eq!(source.committed_count, 1);
     }
 
     #[tokio::test]

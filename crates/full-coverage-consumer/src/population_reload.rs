@@ -161,6 +161,73 @@ pub async fn reload_cycle(
     (next, outcome)
 }
 
+/// How many of `line_ids` have no population held for `date` (never
+/// published, or not yet fetched successfully).
+pub fn lines_without_population(
+    population: &Population,
+    line_ids: &[String],
+    date: chrono::NaiveDate,
+) -> usize {
+    line_ids
+        .iter()
+        .filter(|line_id| !population.has(line_id, date))
+        .count()
+}
+
+/// London local time by which the rail day's population must be present
+/// (DQ11/PL-9): `schedule-reference` publishes each day's population the
+/// day before (today and tomorrow), and the nightly delivery normally lands
+/// in the small hours, so still missing at 06:00 means both the previous
+/// and the current delivery failed to provide it.
+const POPULATION_DEADLINE_LONDON: chrono::NaiveTime = match chrono::NaiveTime::from_hms_opt(6, 0, 0)
+{
+    Some(time) => time,
+    None => panic!("06:00 is a valid time"),
+};
+
+/// `missing_today` once `now` is past 06:00 London on `service_date`, else
+/// 0 -- what the `..._population_missing_past_deadline_lines` gauge
+/// exports, so the alert needs no time-of-day logic of its own.
+pub fn missing_past_deadline(
+    missing_today: usize,
+    service_date: chrono::NaiveDate,
+    now: chrono::DateTime<chrono::Utc>,
+) -> usize {
+    let deadline = common::rail_day::london_to_utc(service_date, POPULATION_DEADLINE_LONDON);
+    if now >= deadline { missing_today } else { 0 }
+}
+
+/// Exports, after every reload cycle, how many lines have no population
+/// for the current rail day and the next
+/// (`full_coverage_consumer_population_missing_lines{day}`), and the
+/// current day's count once past the 06:00 London deadline
+/// (`full_coverage_consumer_population_missing_past_deadline_lines`, read by
+/// the chart's `DistantSignalLinePopulationMissing` alert).
+fn report_missing_populations(
+    population: &Population,
+    line_ids: &[String],
+    service_date: chrono::NaiveDate,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let today = lines_without_population(population, line_ids, service_date);
+    let tomorrow = lines_without_population(
+        population,
+        line_ids,
+        service_date + chrono::Duration::days(1),
+    );
+    for (day, missing) in [("today", today), ("tomorrow", tomorrow)] {
+        metrics::gauge!(
+            common::metrics::metric_name("full_coverage_consumer_population_missing_lines"),
+            "day" => day
+        )
+        .set(missing as f64);
+    }
+    metrics::gauge!(common::metrics::metric_name(
+        "full_coverage_consumer_population_missing_past_deadline_lines"
+    ))
+    .set(missing_past_deadline(today, service_date, now) as f64);
+}
+
 /// Signalled once, by the first reload cycle that makes the population
 /// usable -- see [`Reloader::run`] for exactly when.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +297,7 @@ impl Reloader {
                 "full_coverage_consumer_population_uids"
             ))
             .set(next.total_uids() as f64);
+            report_missing_populations(&next, &line_ids, service_date, chrono::Utc::now());
             self.population.store(Arc::new(next));
             metrics::histogram!(common::metrics::metric_name(
                 "full_coverage_consumer_population_reload_duration_seconds"
@@ -315,6 +383,46 @@ pub(crate) mod tests {
     use super::*;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// DQ11/PL-9: lines with no population for a date are counted, and the
+    /// current day's count is only reported past 06:00 London on that day.
+    #[test]
+    fn a_missing_population_is_reported_only_past_the_06_00_london_deadline() {
+        let date: chrono::NaiveDate = "2026-09-27".parse().unwrap();
+        let mut population = Population::default();
+        population.insert_uids("present", date, Default::default(), None);
+        let line_ids = vec!["present".to_string(), "absent".to_string()];
+        assert_eq!(lines_without_population(&population, &line_ids, date), 1);
+        assert_eq!(
+            lines_without_population(&population, &line_ids, date + chrono::Duration::days(1)),
+            2
+        );
+
+        // 2026-09-27 is BST: 06:00 London is 05:00 UTC.
+        let at = |raw: &str| raw.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+        assert_eq!(
+            missing_past_deadline(1, date, at("2026-09-27T04:59:00Z")),
+            0
+        );
+        assert_eq!(
+            missing_past_deadline(1, date, at("2026-09-27T05:00:00Z")),
+            1
+        );
+        assert_eq!(
+            missing_past_deadline(0, date, at("2026-09-27T12:00:00Z")),
+            0
+        );
+        // In GMT, 06:00 London is 06:00 UTC.
+        let winter: chrono::NaiveDate = "2026-12-01".parse().unwrap();
+        assert_eq!(
+            missing_past_deadline(3, winter, at("2026-12-01T05:30:00Z")),
+            0
+        );
+        assert_eq!(
+            missing_past_deadline(3, winter, at("2026-12-01T06:00:00Z")),
+            3
+        );
+    }
 
     pub(crate) async fn mock_token_cache(
         server: &MockServer,

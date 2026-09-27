@@ -110,10 +110,10 @@ pub struct Config {
     pub metrics: common::service_args::MetricsArgs,
 
     /// Which transport this crate's `MovementFeed` uses. Defaults to
-    /// `kafka` -- Deploy A (docs/superpowers/plans/2026-09-04-movement-relay-plan.md)
-    /// changes nothing about production behavior until this is explicitly
-    /// flipped. See `MovementFeedBackend`'s own doc.
-    #[arg(long, env, value_enum, default_value_t = MovementFeedBackend::Kafka)]
+    /// `redis-stream`, what production has run since Deploy B (PL-15a of
+    /// the 2026-09-27 pipelines review); `kafka` is only used when asked
+    /// for by name. See `trust-consumer/src/config.rs`'s identical field.
+    #[arg(long, env, value_enum, default_value_t = MovementFeedBackend::RedisStream)]
     pub movement_feed_backend: MovementFeedBackend,
 
     /// Only read when `movement_feed_backend = redis-stream`. See
@@ -367,12 +367,10 @@ pub(crate) mod tests {
         assert_eq!(config.shadow_line_ids(&[]), vec!["line-b".to_string()]);
     }
 
-    /// The concrete regression test for "Deploy A changes nothing about
-    /// default production behavior" (docs/superpowers/plans/2026-09-04-movement-relay-plan.md
-    /// Task 4): parsing only the pre-existing required arguments -- none of
-    /// this plan's new flags -- must still yield `MovementFeedBackend::Kafka`.
+    /// PL-15a: with no backend flag, the consumer reads the Redis stream,
+    /// never Kafka directly.
     #[test]
-    fn movement_feed_backend_defaults_to_kafka_when_unset() {
+    fn movement_feed_backend_defaults_to_redis_stream_when_unset() {
         let lines_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lines");
 
         let config = Config::try_parse_from([
@@ -400,7 +398,10 @@ pub(crate) mod tests {
         ])
         .expect("minimal required args should parse");
 
-        assert_eq!(config.movement_feed_backend, MovementFeedBackend::Kafka);
+        assert_eq!(
+            config.movement_feed_backend,
+            MovementFeedBackend::RedisStream
+        );
         assert!(
             !config.windowed.enabled,
             "windowed stats are off unless FULL_COVERAGE_WINDOWED_STATS=true"
