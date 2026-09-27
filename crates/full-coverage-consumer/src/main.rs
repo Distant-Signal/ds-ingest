@@ -362,6 +362,13 @@ fn init_metrics() {
         )
         .increment(0);
     }
+    // DistantSignalFullCoverageWindowPostErrors keys on this series; at 0
+    // from startup so `increase()` sees the first failed window POST.
+    metrics::counter!(
+        common::metrics::metric_name("full_coverage_consumer_errors_total"),
+        "operation" => "post_window_stats"
+    )
+    .increment(0);
 }
 
 /// Waits for the first population load, then replays the current rail day
