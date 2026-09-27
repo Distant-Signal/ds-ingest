@@ -183,7 +183,7 @@ pub fn prune_stale_activations(state: &mut ProcessorState, today: NaiveDate) {
 /// defeating `api::data::trust_event_backlog_match`'s own
 /// `service_date = $2` filter for exactly this class of train, every single
 /// night.
-fn service_date_for_instant(at: chrono::DateTime<chrono::Utc>) -> NaiveDate {
+pub(crate) fn service_date_for_instant(at: chrono::DateTime<chrono::Utc>) -> NaiveDate {
     at.with_timezone(&chrono_tz::Europe::London).date_naive()
 }
 
@@ -759,6 +759,7 @@ mod tests {
             train_id: "221832406".to_string(),
             dep_timestamp: None,
             loc_stanox: None,
+            reason_code: Some("YI".to_string()),
         });
         let mut state = ProcessorState::default();
         let result = process_message(

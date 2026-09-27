@@ -15,6 +15,7 @@ mod config;
 mod crs_index;
 mod process;
 mod queries;
+mod reasons;
 mod stanox_crs;
 
 use std::sync::RwLock;
@@ -52,6 +53,13 @@ async fn main() -> anyhow::Result<()> {
     );
     let http = common::ingest::consumer_http_client()?;
     let internal_oauth = config.internal_oauth.token_cache();
+    let reasons_url = queries::train_reasons_url(&config.api_ingest_url);
+    if reasons_url.is_none() {
+        tracing::warn!(
+            api_ingest_url = %config.api_ingest_url,
+            "API_INGEST_URL does not end in /trust-event-backlog; TRUST reason codes will not be sent"
+        );
+    }
 
     // Built once: purely static-catalogue-derived, needs no reload at
     // runtime (config.lines doesn't change without a restart).
@@ -176,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 let snapshot = stanox.read().expect("stanox lock poisoned").clone();
                 let mut events = Vec::new();
+                let mut reasons = Vec::new();
                 let mut unparseable = Vec::new();
                 for raw in &batch {
                     match trust_schema::schema::parse_batch_detailed(raw) {
@@ -190,6 +199,11 @@ async fn main() -> anyhow::Result<()> {
                                 .increment(1);
                             }
                             for message in parsed.messages {
+                                if let Some(reason) =
+                                    reasons::reason_message(&message, &process_state, today, now)
+                                {
+                                    reasons.push(reason);
+                                }
                                 if let Some(event) = process::process_message(
                                     &message,
                                     &mut process_state,
@@ -212,6 +226,24 @@ async fn main() -> anyhow::Result<()> {
                             unparseable.push(unparseable_payload(raw, &err));
                         }
                     }
+                }
+
+                // Reasons first, best-effort: a failure is logged and
+                // counted, never allowed to hold up the backlog batch (a
+                // reason is enrichment). The common failure, `api` being
+                // down, also fails the backlog POST below, which leaves the
+                // batch un-ACKed, so the reasons are re-sent on redelivery.
+                // The upsert is idempotent.
+                if let Some(url) = reasons_url.as_deref()
+                    && let Err(err) =
+                        queries::post_train_reasons(&http, url, &internal_oauth, &reasons).await
+                {
+                    tracing::warn!(error = ?err, count = reasons.len(), "failed to post train reasons; continuing with the backlog batch");
+                    metrics::counter!(
+                        common::metrics::metric_name("trust_backlog_consumer_errors_total"),
+                        "operation" => "post_train_reasons"
+                    )
+                    .increment(1);
                 }
 
                 let delivery = deliver_batch(&mut feed, &events, &unparseable, async |events| {

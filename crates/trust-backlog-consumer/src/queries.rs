@@ -43,3 +43,46 @@ pub async fn post_trust_event_backlog(
     )
     .await
 }
+
+/// `api`'s `/private/train-reasons` URL, derived from the backlog route's
+/// URL (`API_INGEST_URL`, `.../private/trust-event-backlog`) so no new
+/// setting is needed: the two routes share a host, a prefix and a
+/// service-account group. `None` when that URL does not end in
+/// `/trust-event-backlog`, in which case reasons are not sent.
+pub fn train_reasons_url(api_ingest_url: &str) -> Option<String> {
+    api_ingest_url
+        .trim_end_matches('/')
+        .strip_suffix("/trust-event-backlog")
+        .map(|prefix| format!("{prefix}/train-reasons"))
+}
+
+/// POSTs one batch of reason codes. An empty batch is not sent.
+pub async fn post_train_reasons(
+    client: &reqwest::Client,
+    url: &str,
+    tokens: &common::oauth_client::OAuthTokenCache,
+    reasons: &[common::TrainReasonMessage],
+) -> anyhow::Result<()> {
+    if reasons.is_empty() {
+        return Ok(());
+    }
+    common::ingest::post_batch(client, url, tokens, reasons, "train reasons").await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_reasons_url_sits_beside_the_backlog_route() {
+        assert_eq!(
+            train_reasons_url("http://api:8080/private/trust-event-backlog").as_deref(),
+            Some("http://api:8080/private/train-reasons")
+        );
+        assert_eq!(
+            train_reasons_url("http://api:8080/private/trust-event-backlog/").as_deref(),
+            Some("http://api:8080/private/train-reasons")
+        );
+        assert_eq!(train_reasons_url("http://api:8080/somewhere-else"), None);
+    }
+}
