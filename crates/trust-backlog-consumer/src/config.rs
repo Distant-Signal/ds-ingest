@@ -33,6 +33,15 @@ pub struct Config {
     #[arg(long, env, default_value_t = 30)]
     pub redis_autoclaim_min_idle_secs: u64,
 
+    /// Poison-entry guard: a `movement-events` entry replayed from this
+    /// group's pending-entries list after more than this many deliveries
+    /// is written to `movement-events-deadletter` and XACKed rather than
+    /// retried again. `0` disables it. See
+    /// `movement_feed::redis_stream::DEFAULT_MAX_DELIVERIES` for how the
+    /// default maps to time (about an hour of continuous failure).
+    #[arg(long, env, default_value_t = movement_feed::DEFAULT_MAX_DELIVERIES)]
+    pub redis_max_deliveries: u64,
+
     /// How often (seconds) this crate compares its own consumer group's
     /// `last-delivered-id` against the stream's oldest retained entry.
     /// Same cadence/reasoning as `trust-consumer`'s identical field.

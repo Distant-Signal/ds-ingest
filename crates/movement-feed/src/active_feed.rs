@@ -13,8 +13,8 @@
 //! picking one crate's own type arbitrarily (worse than the status quo);
 //! a generic parameter avoids both.
 
-use crate::MovementFeed;
 use crate::redis_stream::{GapInfo, RedisStreamMovementFeed};
+use crate::{DeadLetter, DeadLetterSink, MovementFeed};
 
 /// Which transport a `MovementFeed` consumer uses. Verbatim move of the
 /// two byte-identical enums previously duplicated in
@@ -63,6 +63,29 @@ impl<K: MovementFeed> MovementFeed for ActiveFeed<K> {
         match self {
             ActiveFeed::Kafka(feed) => feed.commit().await,
             ActiveFeed::RedisStream(feed, _, _) => feed.commit().await,
+        }
+    }
+}
+
+/// The Kafka backend has no dead-letter stream (it is legacy and slated for
+/// removal), so records are only logged there -- still enough to recover
+/// them by hand. Logging cannot fail, so neither does this.
+#[async_trait::async_trait]
+impl<K: MovementFeed> DeadLetterSink for ActiveFeed<K> {
+    async fn dead_letter(&mut self, records: &[DeadLetter]) -> anyhow::Result<()> {
+        match self {
+            ActiveFeed::Kafka(_) => {
+                for record in records {
+                    tracing::warn!(
+                        reason = record.reason,
+                        detail = %record.detail,
+                        payload = %record.payload,
+                        "dead-lettered record (Kafka backend: logged only)"
+                    );
+                }
+                Ok(())
+            }
+            ActiveFeed::RedisStream(feed, _, _) => feed.dead_letter(records).await,
         }
     }
 }

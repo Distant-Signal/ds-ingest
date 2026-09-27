@@ -12,9 +12,33 @@ use async_trait::async_trait;
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 
-use crate::MovementFeed;
+use crate::{DeadLetter, DeadLetterSink, MovementFeed};
 
 const STREAM: &str = "movement-events";
+
+/// Suffix of the dead-letter stream, so the production one is
+/// `movement-events-deadletter` and each test stream gets its own.
+const DEAD_LETTER_SUFFIX: &str = "-deadletter";
+
+/// Approximate (`MAXLEN ~`) cap on the dead-letter stream. Entries are
+/// small TRUST envelopes or single backlog rows (well under 1KB), so this
+/// bounds it to roughly 10MB of Redis memory: big enough to hold a whole
+/// PEL-replay batch several times over (the 2026-09 incident had 1,679
+/// stuck entries), small enough that a runaway source cannot grow it
+/// without limit. It is shared by all three consumer groups; each record
+/// carries its `group`.
+const DEAD_LETTER_MAXLEN: usize = 10_000;
+
+/// Default for [`RedisStreamMovementFeed::with_max_deliveries`].
+///
+/// Delivery counts climb by about 2 per `autoclaim_min_idle` sweep while an
+/// entry keeps failing (`XAUTOCLAIM` adds one and the id-`0` PEL re-read
+/// adds another -- checked against a local valkey 9), so at the deployed
+/// 30s sweep this is roughly an hour of continuous failure. That is long
+/// enough that an ordinary `api` restart or short outage never
+/// dead-letters healthy data, and far short of the ~92 hours (22,047
+/// deliveries) the 2026-09 poison batch sat retrying.
+pub const DEFAULT_MAX_DELIVERIES: u64 = 240;
 
 /// How many pending entries a single id=`0` PEL-replay read (`next_batch`)
 /// or a single `XAUTOCLAIM` round-trip (`reclaim_stale`) asks Redis for at
@@ -79,6 +103,8 @@ pub struct RedisStreamMovementFeed {
     pending_ack: Vec<String>,
     last_autoclaim_sweep: std::time::Instant,
     autoclaim_min_idle: Duration,
+    /// See [`Self::with_max_deliveries`]. `None` disables the guard.
+    max_deliveries: Option<u64>,
 }
 
 impl RedisStreamMovementFeed {
@@ -145,7 +171,176 @@ impl RedisStreamMovementFeed {
             pending_ack: Vec::new(),
             last_autoclaim_sweep: std::time::Instant::now() - autoclaim_min_idle,
             autoclaim_min_idle,
+            max_deliveries: Some(DEFAULT_MAX_DELIVERIES),
         })
+    }
+
+    /// Poison-entry guard: an entry the PEL replay finds has already been
+    /// delivered more than `max` times is written to the dead-letter stream
+    /// and XACKed instead of being handed to the caller again. Without it,
+    /// one entry that always makes the caller's downstream write fail (and
+    /// with it every entry in the same batch) is replayed forever -- the
+    /// 2026-09 trust-backlog-consumer incident. `0` disables the guard.
+    /// Defaults to [`DEFAULT_MAX_DELIVERIES`].
+    pub fn with_max_deliveries(mut self, max: u64) -> Self {
+        self.max_deliveries = (max > 0).then_some(max);
+        self
+    }
+
+    fn dead_letter_stream(&self) -> String {
+        format!("{}{DEAD_LETTER_SUFFIX}", self.stream)
+    }
+
+    /// Delivery counts, from `XPENDING`'s extended form, for this
+    /// consumer's pending entries between `first` and `last` inclusive.
+    async fn delivery_counts(
+        &mut self,
+        first: &str,
+        last: &str,
+        count: usize,
+    ) -> anyhow::Result<std::collections::HashMap<String, u64>> {
+        let reply: redis::streams::StreamPendingCountReply = self
+            .conn
+            .xpending_consumer_count(
+                &self.stream,
+                &self.group,
+                first,
+                last,
+                count,
+                &self.consumer,
+            )
+            .await?;
+        Ok(reply
+            .ids
+            .into_iter()
+            .map(|p| (p.id, p.times_delivered as u64))
+            .collect())
+    }
+
+    /// Splits PEL-replay entries into those still deliverable and those
+    /// over the delivery limit; the latter are dead-lettered and XACKed
+    /// here. A dead-letter write failure returns `Err` with nothing ACKed,
+    /// so the entries stay pending rather than being lost.
+    async fn divert_over_delivered(
+        &mut self,
+        entries: Vec<(String, String)>,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let (Some(max), Some(first), Some(last)) = (
+            self.max_deliveries,
+            entries.first().map(|(id, _)| id.clone()),
+            entries.last().map(|(id, _)| id.clone()),
+        ) else {
+            return Ok(entries);
+        };
+        // PEL_REPLAY_BATCH_COUNT, not entries.len(): the same range can also
+        // hold this read's malformed entries, which are XACKed only later.
+        let counts = self
+            .delivery_counts(&first, &last, PEL_REPLAY_BATCH_COUNT)
+            .await?;
+        let (over, keep) = partition_over_delivered(entries, &counts, max);
+        if over.is_empty() {
+            return Ok(keep);
+        }
+        let records: Vec<DeadLetter> = over
+            .iter()
+            .map(|(id, payload, delivered)| DeadLetter {
+                reason: "max_deliveries_exceeded",
+                source_id: Some(id.clone()),
+                delivery_count: Some(*delivered),
+                payload: payload.clone(),
+                detail: format!("delivered {delivered} times (limit {max})"),
+            })
+            .collect();
+        self.dead_letter(&records).await?;
+        let ids: Vec<&String> = over.iter().map(|(id, _, _)| id).collect();
+        let _: i64 = self.conn.xack(&self.stream, &self.group, &ids).await?;
+        Ok(keep)
+    }
+}
+
+/// Pure half of `divert_over_delivered`: `(over_limit, keep)`, where
+/// over-limit entries carry their delivery count. An entry XPENDING did not
+/// report (acked meanwhile, or beyond the reply) is kept.
+#[allow(clippy::type_complexity)]
+fn partition_over_delivered(
+    entries: Vec<(String, String)>,
+    counts: &std::collections::HashMap<String, u64>,
+    max: u64,
+) -> (Vec<(String, String, u64)>, Vec<(String, String)>) {
+    let mut over = Vec::new();
+    let mut keep = Vec::new();
+    for (id, payload) in entries {
+        match counts.get(&id) {
+            Some(&delivered) if delivered > max => over.push((id, payload, delivered)),
+            _ => keep.push((id, payload)),
+        }
+    }
+    (over, keep)
+}
+
+#[async_trait]
+impl DeadLetterSink for RedisStreamMovementFeed {
+    /// `XADD <stream>-deadletter MAXLEN ~ 10000` per record (one pipeline),
+    /// each with its `group`, `consumer`, `reason`, `source_id`,
+    /// `delivery_count`, `detail` and `payload`, plus a warn log and a
+    /// `distant_signal_movement_feed_deadlettered_total{group, reason}`
+    /// increment. The Redis stream is the record of truth (it keeps the
+    /// payload, so an operator can inspect it with `XRANGE` and re-inject
+    /// it once the cause is fixed); the log and metric are for alerting.
+    async fn dead_letter(&mut self, records: &[DeadLetter]) -> anyhow::Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let stream = self.dead_letter_stream();
+        let mut pipe = redis::pipe();
+        for record in records {
+            pipe.cmd("XADD")
+                .arg(&stream)
+                .arg("MAXLEN")
+                .arg("~")
+                .arg(DEAD_LETTER_MAXLEN)
+                .arg("*")
+                .arg("group")
+                .arg(&self.group)
+                .arg("consumer")
+                .arg(&self.consumer)
+                .arg("reason")
+                .arg(record.reason)
+                .arg("source_id")
+                .arg(record.source_id.as_deref().unwrap_or(""))
+                .arg("delivery_count")
+                .arg(
+                    record
+                        .delivery_count
+                        .map(|c| c.to_string())
+                        .unwrap_or_default(),
+                )
+                .arg("detail")
+                .arg(&record.detail)
+                .arg("payload")
+                .arg(&record.payload)
+                .ignore();
+        }
+        let _: () = pipe.query_async(&mut self.conn).await?;
+        for record in records {
+            tracing::warn!(
+                stream = %stream,
+                group = %self.group,
+                reason = record.reason,
+                source_id = ?record.source_id,
+                delivery_count = ?record.delivery_count,
+                detail = %record.detail,
+                payload = %record.payload,
+                "dead-lettered a record instead of retrying it forever"
+            );
+            metrics::counter!(
+                common::metrics::metric_name("movement_feed_deadlettered_total"),
+                "group" => self.group.clone(),
+                "reason" => record.reason
+            )
+            .increment(1);
+        }
+        Ok(())
     }
 }
 
@@ -251,6 +446,14 @@ impl MovementFeed for RedisStreamMovementFeed {
 
         let (entries, malformed_ids) =
             split_deliverable_and_malformed(reply.keys.into_iter().flat_map(|k| k.ids).collect());
+
+        // Only a PEL replay can return an entry that has been delivered
+        // before; a `>` read is always a first delivery.
+        let entries = if self.replaying_pel {
+            self.divert_over_delivered(entries).await?
+        } else {
+            entries
+        };
 
         // A malformed entry can never become processable -- see
         // `split_deliverable_and_malformed`'s own doc for why it is XACKed
@@ -529,6 +732,44 @@ mod split_deliverable_and_malformed_tests {
 }
 
 #[cfg(test)]
+mod partition_over_delivered_tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn entry(id: &str) -> (String, String) {
+        (id.to_string(), format!("payload-{id}"))
+    }
+
+    #[test]
+    fn only_entries_over_the_limit_are_diverted() {
+        let counts: HashMap<String, u64> = [
+            ("1-0".to_string(), 51),
+            ("2-0".to_string(), 50),
+            ("3-0".to_string(), 3),
+        ]
+        .into_iter()
+        .collect();
+
+        let (over, keep) =
+            partition_over_delivered(vec![entry("1-0"), entry("2-0"), entry("3-0")], &counts, 50);
+
+        assert_eq!(
+            over,
+            vec![("1-0".to_string(), "payload-1-0".to_string(), 51)]
+        );
+        assert_eq!(keep, vec![entry("2-0"), entry("3-0")]);
+    }
+
+    #[test]
+    fn an_entry_xpending_did_not_report_is_kept() {
+        let (over, keep) = partition_over_delivered(vec![entry("9-0")], &HashMap::new(), 1);
+        assert!(over.is_empty());
+        assert_eq!(keep, vec![entry("9-0")]);
+    }
+}
+
+#[cfg(test)]
 mod redis_tests {
     use super::*;
 
@@ -551,7 +792,158 @@ mod redis_tests {
     async fn cleanup(stream: &str) {
         let client = redis::Client::open(redis_url()).unwrap();
         let mut conn = client.get_connection_manager().await.unwrap();
-        let _: redis::RedisResult<i64> = redis::cmd("DEL").arg(stream).query_async(&mut conn).await;
+        let _: redis::RedisResult<i64> = redis::cmd("DEL")
+            .arg(stream)
+            .arg(format!("{stream}{DEAD_LETTER_SUFFIX}"))
+            .query_async(&mut conn)
+            .await;
+    }
+
+    /// `(field -> value)` maps of every entry in `stream`'s dead-letter stream.
+    async fn dead_letters(stream: &str) -> Vec<std::collections::HashMap<String, String>> {
+        let client = redis::Client::open(redis_url()).unwrap();
+        let mut conn = client.get_connection_manager().await.unwrap();
+        let reply: redis::streams::StreamRangeReply = conn
+            .xrange_all(format!("{stream}{DEAD_LETTER_SUFFIX}"))
+            .await
+            .unwrap();
+        reply
+            .ids
+            .into_iter()
+            .map(|entry| {
+                entry
+                    .map
+                    .iter()
+                    .map(|(k, v)| (k.clone(), redis::from_redis_value(v).unwrap()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The poison-entry guard: an entry that keeps failing downstream is
+    /// replayed until its delivery count passes the limit, then
+    /// dead-lettered (payload intact) and XACKed instead of replayed again.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn an_over_delivered_entry_is_dead_lettered_and_acked() {
+        let stream = unique_stream("over-delivered");
+        let connect = || async {
+            RedisStreamMovementFeed::connect_for_test(
+                &redis_url(),
+                &stream,
+                "test-group",
+                "test-consumer",
+                Duration::from_secs(3600),
+            )
+            .await
+            .unwrap()
+            .with_max_deliveries(2)
+        };
+
+        let mut feed = connect().await;
+        xadd(&stream, "poison").await;
+        feed.next_batch().await.unwrap(); // drain empty startup PEL
+        assert_eq!(feed.next_batch().await.unwrap(), vec!["poison".to_string()]); // delivery 1
+        drop(feed); // downstream failed: never committed
+
+        let mut feed = connect().await;
+        assert_eq!(
+            feed.next_batch().await.unwrap(),
+            vec!["poison".to_string()],
+            "delivery 2 is still within the limit"
+        );
+        drop(feed);
+
+        let mut feed = connect().await;
+        assert!(
+            feed.next_batch().await.unwrap().is_empty(),
+            "delivery 3 is over the limit: diverted, not handed out again"
+        );
+        let pending: redis::streams::StreamPendingCountReply = feed
+            .conn
+            .xpending_count(&stream, "test-group", "-", "+", 10)
+            .await
+            .unwrap();
+        assert!(pending.ids.is_empty(), "the diverted entry is XACKed");
+
+        let letters = dead_letters(&stream).await;
+        assert_eq!(letters.len(), 1);
+        assert_eq!(letters[0]["payload"], "poison");
+        assert_eq!(letters[0]["reason"], "max_deliveries_exceeded");
+        assert_eq!(letters[0]["group"], "test-group");
+        assert_eq!(letters[0]["delivery_count"], "3");
+
+        cleanup(&stream).await;
+    }
+
+    /// With the guard disabled (`0`), the same entry keeps being replayed.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn max_deliveries_zero_disables_the_guard() {
+        let stream = unique_stream("guard-disabled");
+        let connect = || async {
+            RedisStreamMovementFeed::connect_for_test(
+                &redis_url(),
+                &stream,
+                "test-group",
+                "test-consumer",
+                Duration::from_secs(3600),
+            )
+            .await
+            .unwrap()
+            .with_max_deliveries(0)
+        };
+        let mut feed = connect().await;
+        xadd(&stream, "payload-1").await;
+        feed.next_batch().await.unwrap();
+        feed.next_batch().await.unwrap();
+        for _ in 0..3 {
+            drop(feed);
+            feed = connect().await;
+            assert_eq!(
+                feed.next_batch().await.unwrap(),
+                vec!["payload-1".to_string()]
+            );
+        }
+        assert!(dead_letters(&stream).await.is_empty());
+        cleanup(&stream).await;
+    }
+
+    /// `dead_letter` (used by trust-backlog-consumer for rows `api`
+    /// rejected) writes every field to the capped dead-letter stream.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn dead_letter_writes_the_record_to_the_dead_letter_stream() {
+        let stream = unique_stream("dead-letter-write");
+        let mut feed = RedisStreamMovementFeed::connect_for_test(
+            &redis_url(),
+            &stream,
+            "test-group",
+            "test-consumer",
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+
+        feed.dead_letter(&[DeadLetter {
+            reason: "rejected_by_api",
+            source_id: None,
+            delivery_count: None,
+            payload: r#"{"msg_type":"0009"}"#.to_string(),
+            detail: "23514 check_violation".to_string(),
+        }])
+        .await
+        .unwrap();
+
+        let letters = dead_letters(&stream).await;
+        assert_eq!(letters.len(), 1);
+        assert_eq!(letters[0]["reason"], "rejected_by_api");
+        assert_eq!(letters[0]["payload"], r#"{"msg_type":"0009"}"#);
+        assert_eq!(letters[0]["detail"], "23514 check_violation");
+        assert_eq!(letters[0]["consumer"], "test-consumer");
+        assert_eq!(letters[0]["source_id"], "");
+
+        cleanup(&stream).await;
     }
 
     async fn xadd(stream: &str, payload: &str) {

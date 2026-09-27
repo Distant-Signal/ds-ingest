@@ -20,6 +20,7 @@ pub mod active_feed;
 pub mod redis_stream;
 
 pub use active_feed::{ActiveFeed, MovementFeedBackend};
+pub use redis_stream::DEFAULT_MAX_DELIVERIES;
 
 use async_trait::async_trait;
 
@@ -49,6 +50,37 @@ pub trait MovementFeed: Send {
     async fn commit(&mut self) -> anyhow::Result<()>;
 }
 
+/// One record set aside instead of being retried forever: either a stream
+/// entry delivered more than `max_deliveries` times (see
+/// `redis_stream::RedisStreamMovementFeed::with_max_deliveries`), or one
+/// row `api` refused from a batch (trust-backlog-consumer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadLetter {
+    /// Fixed-vocabulary cause, used as the `reason` metric label, e.g.
+    /// `"max_deliveries_exceeded"` or `"rejected_by_api"`.
+    pub reason: &'static str,
+    /// The `movement-events` entry id, when the record is a whole entry.
+    pub source_id: Option<String>,
+    /// XPENDING delivery count, when known.
+    pub delivery_count: Option<u64>,
+    /// The raw entry payload, or the rejected row as JSON -- enough to
+    /// re-inject by hand once the cause is fixed.
+    pub payload: String,
+    /// Free-text explanation (e.g. the SQLSTATE and Postgres message).
+    pub detail: String,
+}
+
+/// Where a consumer sends [`DeadLetter`]s. Implemented by
+/// `RedisStreamMovementFeed` (a small capped Redis stream), by
+/// [`ActiveFeed`] (which delegates, or only logs under Kafka), and by
+/// [`FakeMovementFeed`] (which records them for tests).
+#[async_trait]
+pub trait DeadLetterSink: Send {
+    /// Must return `Err` if the records were not stored, so the caller can
+    /// leave the batch un-ACKed and try again rather than lose them.
+    async fn dead_letter(&mut self, records: &[DeadLetter]) -> anyhow::Result<()>;
+}
+
 /// Test double for `MovementFeed` -- verbatim in spirit from the two
 /// pre-existing, now-deleted copies in `trust-consumer`/
 /// `full-coverage-consumer`. `committed_count` only moves for a `commit`
@@ -59,6 +91,10 @@ pub struct FakeMovementFeed {
     batches: std::collections::VecDeque<Vec<String>>,
     received_since_commit: bool,
     pub committed_count: usize,
+    /// Everything passed to [`DeadLetterSink::dead_letter`], in order.
+    pub dead_lettered: Vec<DeadLetter>,
+    /// When set, the next `dead_letter` call fails (and clears this).
+    pub fail_next_dead_letter: bool,
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -68,6 +104,8 @@ impl FakeMovementFeed {
             batches: batches.into(),
             received_since_commit: false,
             committed_count: 0,
+            dead_lettered: Vec::new(),
+            fail_next_dead_letter: false,
         }
     }
 }
@@ -89,6 +127,18 @@ impl MovementFeed for FakeMovementFeed {
         }
         self.received_since_commit = false;
         self.committed_count += 1;
+        Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+#[async_trait]
+impl DeadLetterSink for FakeMovementFeed {
+    async fn dead_letter(&mut self, records: &[DeadLetter]) -> anyhow::Result<()> {
+        if std::mem::take(&mut self.fail_next_dead_letter) {
+            anyhow::bail!("fake dead-letter failure");
+        }
+        self.dead_lettered.extend_from_slice(records);
         Ok(())
     }
 }

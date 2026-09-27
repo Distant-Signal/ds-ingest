@@ -25,6 +25,7 @@ use config::Config;
 use movement_feed::ActiveFeed;
 use movement_feed::MovementFeed;
 use movement_feed::redis_stream::RedisStreamMovementFeed;
+use movement_feed::{DeadLetter, DeadLetterSink};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -65,7 +66,8 @@ async fn main() -> anyhow::Result<()> {
                 "trust-event-backlog-1",
                 Duration::from_secs(config.redis_autoclaim_min_idle_secs),
             )
-            .await?,
+            .await?
+            .with_max_deliveries(config.redis_max_deliveries),
         ),
         connection_state,
         "trust_backlog_consumer_ready",
@@ -191,40 +193,18 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                if let Err(err) = queries::post_trust_event_backlog(
-                    &http,
-                    &config.api_ingest_url,
-                    &internal_oauth,
-                    &events,
-                )
-                .await
-                {
-                    tracing::error!(error = ?err, "failed to post trust-event-backlog batch; will retry next cycle");
-                    metrics::counter!(
-                        common::metrics::metric_name("trust_backlog_consumer_errors_total"),
-                        "operation" => "post_batch"
+                let delivery = deliver_batch(&mut feed, &events, async |events| {
+                    queries::post_trust_event_backlog(
+                        &http,
+                        &config.api_ingest_url,
+                        &internal_oauth,
+                        events,
                     )
-                    .increment(1);
-                    // Deliberately does NOT commit on a failed post -- same
-                    // "only ack after a successful downstream write"
-                    // posture as trust-consumer's own main loop, since this
-                    // consumer's whole reason to exist is not losing events
-                    // a late-tracking pin might need.
+                    .await
+                })
+                .await;
+                if matches!(delivery, Delivery::PostFailed | Delivery::DeadLetterFailed) {
                     tokio::time::sleep(ERROR_BACKOFF).await;
-                    continue;
-                }
-                metrics::counter!(common::metrics::metric_name(
-                    "trust_backlog_consumer_events_stored_total"
-                ))
-                .increment(events.len() as u64);
-
-                if let Err(err) = feed.commit().await {
-                    tracing::error!(error = ?err, "failed to commit Redis Streams offsets");
-                    metrics::counter!(
-                        common::metrics::metric_name("trust_backlog_consumer_errors_total"),
-                        "operation" => "commit_offsets"
-                    )
-                    .increment(1);
                 }
             }
             Err(err) => {
@@ -245,6 +225,122 @@ async fn main() -> anyhow::Result<()> {
 }
 
 const ERROR_BACKOFF: Duration = Duration::from_secs(2);
+
+/// What [`deliver_batch`] did with one batch.
+#[derive(Debug, PartialEq, Eq)]
+enum Delivery {
+    /// Posted (any rows `api` rejected were dead-lettered) and XACKed.
+    Committed,
+    /// The POST failed (network, 5xx, ...): nothing XACKed, so the batch is
+    /// redelivered later.
+    PostFailed,
+    /// `api` rejected rows but they could not be dead-lettered: nothing
+    /// XACKed, so the rejected rows are not lost. The retry re-posts the
+    /// batch; the good rows then conflict harmlessly on `dedup_key`.
+    DeadLetterFailed,
+    /// Posted, but the XACK itself failed; the batch will be redelivered
+    /// and re-posted harmlessly.
+    CommitFailed,
+}
+
+/// Post -> dead-letter rejected rows -> XACK, extracted from the main loop
+/// so it can be tested against `FakeMovementFeed` without Redis or `api`.
+///
+/// **Rejected rows no longer hold a batch hostage.** When `api` answers 2xx
+/// with a non-empty `rejected` list, those rows failed a constraint or were
+/// invalid input and will fail identically on every retry, while every other
+/// row has already landed. So the batch is ACKed like any success, and the
+/// rejected rows go to the dead-letter stream (see
+/// `movement_feed::DeadLetterSink`) with the SQLSTATE and message, where an
+/// operator can inspect them and re-inject them once the cause is fixed.
+/// Only a failed POST (transient: `api` answers 500 for those) or a failed
+/// dead-letter write leaves the batch un-ACKed.
+async fn deliver_batch<F, P>(
+    feed: &mut F,
+    events: &[common::TrustBacklogEventMessage],
+    post: P,
+) -> Delivery
+where
+    F: MovementFeed + DeadLetterSink,
+    P: AsyncFnOnce(
+        &[common::TrustBacklogEventMessage],
+    ) -> anyhow::Result<common::TrustBacklogIngestResponse>,
+{
+    let response = match post(events).await {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::error!(error = ?err, "failed to post trust-event-backlog batch; will retry next cycle");
+            metrics::counter!(
+                common::metrics::metric_name("trust_backlog_consumer_errors_total"),
+                "operation" => "post_batch"
+            )
+            .increment(1);
+            // Deliberately does NOT commit on a failed post -- same
+            // "only ack after a successful downstream write" posture as
+            // trust-consumer's own main loop, since this consumer's whole
+            // reason to exist is not losing events a late-tracking pin
+            // might need.
+            return Delivery::PostFailed;
+        }
+    };
+
+    if !response.rejected.is_empty() {
+        let records: Vec<DeadLetter> = response
+            .rejected
+            .iter()
+            .map(|rejected| DeadLetter {
+                reason: "rejected_by_api",
+                source_id: None,
+                delivery_count: None,
+                payload: events
+                    .get(rejected.index)
+                    .and_then(|event| serde_json::to_string(event).ok())
+                    .unwrap_or_default(),
+                detail: format!(
+                    "{} {} (constraint {}): {} [dedup_key {}]",
+                    rejected.sqlstate,
+                    rejected.reason,
+                    rejected.constraint.as_deref().unwrap_or("-"),
+                    rejected.message,
+                    rejected.dedup_key,
+                ),
+            })
+            .collect();
+        if let Err(err) = feed.dead_letter(&records).await {
+            tracing::error!(
+                error = ?err,
+                rejected = records.len(),
+                "failed to dead-letter rows api rejected; leaving the batch un-ACKed to retry"
+            );
+            metrics::counter!(
+                common::metrics::metric_name("trust_backlog_consumer_errors_total"),
+                "operation" => "dead_letter"
+            )
+            .increment(1);
+            return Delivery::DeadLetterFailed;
+        }
+        metrics::counter!(
+            common::metrics::metric_name("trust_backlog_consumer_deadlettered_total"),
+            "reason" => "rejected_by_api"
+        )
+        .increment(records.len() as u64);
+    }
+    metrics::counter!(common::metrics::metric_name(
+        "trust_backlog_consumer_events_stored_total"
+    ))
+    .increment(events.len().saturating_sub(response.rejected.len()) as u64);
+
+    if let Err(err) = feed.commit().await {
+        tracing::error!(error = ?err, "failed to commit Redis Streams offsets");
+        metrics::counter!(
+            common::metrics::metric_name("trust_backlog_consumer_errors_total"),
+            "operation" => "commit_offsets"
+        )
+        .increment(1);
+        return Delivery::CommitFailed;
+    }
+    Delivery::Committed
+}
 
 /// The Europe/London rail day `at` falls on -- the calendar date the
 /// process.rs/migration doc comments already promise ("falls back to the
@@ -341,5 +437,145 @@ mod tests {
             "the PASS event must be dropped, only the DEPARTURE kept"
         );
         assert_eq!(events[0].event_type, Some("DEPARTURE".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod deliver_batch_tests {
+    use movement_feed::FakeMovementFeed;
+
+    use super::*;
+
+    fn event(msg_type: &str, dedup_key: &str) -> common::TrustBacklogEventMessage {
+        common::TrustBacklogEventMessage {
+            crs: Some("WAT".to_string()),
+            train_uid: None,
+            train_id: "221832406".to_string(),
+            service_date: "2026-09-05".parse().unwrap(),
+            msg_type: msg_type.to_string(),
+            event_type: Some("DEPARTURE".to_string()),
+            planned_timestamp: None,
+            actual_timestamp: None,
+            variation_status: None,
+            delay_minutes: None,
+            dedup_key: dedup_key.to_string(),
+        }
+    }
+
+    /// A feed that has handed out one batch, so `commit` has something to
+    /// confirm (see `FakeMovementFeed::committed_count`).
+    async fn feed_with_one_batch() -> FakeMovementFeed {
+        let mut feed = FakeMovementFeed::new(vec![vec!["entry".to_string()]]);
+        feed.next_batch().await.unwrap();
+        feed
+    }
+
+    fn rejection(index: usize, dedup_key: &str) -> common::RejectedTrustBacklogRow {
+        common::RejectedTrustBacklogRow {
+            index,
+            dedup_key: dedup_key.to_string(),
+            sqlstate: "23514".to_string(),
+            reason: "check_violation".to_string(),
+            constraint: Some("trust_event_backlog_msg_type_check".to_string()),
+            message: "new row violates check constraint".to_string(),
+        }
+    }
+
+    /// The production incident's fix, consumer half: a batch where `api`
+    /// rejected a row is ACKed like any success, and the rejected row goes
+    /// to the dead-letter sink with enough to recover it.
+    #[tokio::test]
+    async fn rejected_rows_are_dead_lettered_and_the_batch_is_acked() {
+        let mut feed = feed_with_one_batch().await;
+        let events = vec![event("0003", "good"), event("0009", "bad")];
+
+        let outcome = deliver_batch(&mut feed, &events, async |_| {
+            Ok(common::TrustBacklogIngestResponse {
+                upserted: 1,
+                rejected: vec![rejection(1, "bad")],
+            })
+        })
+        .await;
+
+        assert_eq!(outcome, Delivery::Committed);
+        assert_eq!(feed.committed_count, 1, "the batch must be ACKed");
+        assert_eq!(feed.dead_lettered.len(), 1);
+        let letter = &feed.dead_lettered[0];
+        assert_eq!(letter.reason, "rejected_by_api");
+        let payload: common::TrustBacklogEventMessage =
+            serde_json::from_str(&letter.payload).expect("payload is the rejected row as JSON");
+        assert_eq!(payload.dedup_key, "bad");
+        assert_eq!(payload.msg_type, "0009");
+        assert!(letter.detail.contains("23514"), "{}", letter.detail);
+        assert!(
+            letter.detail.contains("trust_event_backlog_msg_type_check"),
+            "{}",
+            letter.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_batch_is_acked_with_nothing_dead_lettered() {
+        let mut feed = feed_with_one_batch().await;
+        let events = vec![event("0003", "good")];
+
+        let outcome = deliver_batch(&mut feed, &events, async |_| {
+            Ok(common::TrustBacklogIngestResponse {
+                upserted: 1,
+                rejected: vec![],
+            })
+        })
+        .await;
+
+        assert_eq!(outcome, Delivery::Committed);
+        assert_eq!(feed.committed_count, 1);
+        assert!(feed.dead_lettered.is_empty());
+    }
+
+    /// A transient failure (api answers 500) must still leave the batch
+    /// un-ACKed so it is retried.
+    #[tokio::test]
+    async fn a_failed_post_is_not_acked_or_dead_lettered() {
+        let mut feed = feed_with_one_batch().await;
+        let events = vec![event("0003", "good")];
+
+        let outcome = deliver_batch(&mut feed, &events, async |_| {
+            Err(anyhow::anyhow!("ingestion POST failed: 500"))
+        })
+        .await;
+
+        assert_eq!(outcome, Delivery::PostFailed);
+        assert_eq!(feed.committed_count, 0);
+        assert!(feed.dead_lettered.is_empty());
+    }
+
+    /// If the rejected rows cannot be stored, ACKing would lose them: the
+    /// batch stays pending and is retried instead.
+    #[tokio::test]
+    async fn a_failed_dead_letter_write_leaves_the_batch_un_acked() {
+        let mut feed = feed_with_one_batch().await;
+        feed.fail_next_dead_letter = true;
+        let events = vec![event("0003", "good"), event("0009", "bad")];
+
+        let outcome = deliver_batch(&mut feed, &events, async |_| {
+            Ok(common::TrustBacklogIngestResponse {
+                upserted: 1,
+                rejected: vec![rejection(1, "bad")],
+            })
+        })
+        .await;
+
+        assert_eq!(outcome, Delivery::DeadLetterFailed);
+        assert_eq!(feed.committed_count, 0);
+    }
+
+    /// An older `api` that only sends `upserted` still parses, as a clean
+    /// success.
+    #[test]
+    fn an_old_api_response_without_rejected_parses() {
+        let response: common::TrustBacklogIngestResponse =
+            serde_json::from_str(r#"{"upserted": 3}"#).unwrap();
+        assert_eq!(response.upserted, 3);
+        assert!(response.rejected.is_empty());
     }
 }
