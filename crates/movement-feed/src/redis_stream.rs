@@ -202,6 +202,24 @@ impl RedisStreamMovementFeed {
 
         ensure_group(&mut conn, stream, &group).await?;
 
+        // Register the dead-letter counters at 0 for this group, so the
+        // DistantSignalDeadLetterGrowing/Full alerts can use a plain
+        // `increase()` instead of also firing on a new series (which, with
+        // a fresh pod's series, fired on every rollout).
+        for reason in crate::DEAD_LETTER_REASONS {
+            metrics::counter!(
+                common::metrics::metric_name("movement_feed_deadlettered_total"),
+                "group" => group.clone(),
+                "reason" => reason
+            )
+            .increment(0);
+        }
+        metrics::counter!(
+            common::metrics::metric_name("movement_feed_deadletter_full_total"),
+            "group" => group.clone()
+        )
+        .increment(0);
+
         Ok(Self {
             conn,
             stream: stream.to_string(),

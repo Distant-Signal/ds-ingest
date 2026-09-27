@@ -33,6 +33,13 @@ async fn main() -> anyhow::Result<()> {
     if config.metrics.metrics_enabled {
         common::metrics::install(config.metrics_port)?;
     }
+    // Register the stream-gap counter at 0 so the DistantSignalStreamGap
+    // alert can use a plain `increase()`: a counter that only appears on its
+    // first increment has no increase to see.
+    metrics::counter!(common::metrics::metric_name(
+        "trust_consumer_stream_gap_detected_total"
+    ))
+    .increment(0);
     let (connection_state, progress) = health_http::spawn_with_progress(
         config.health_bind_url.clone(),
         "connected",

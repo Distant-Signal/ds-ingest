@@ -67,6 +67,13 @@ pub trait MovementFeed: Send {
     }
 }
 
+/// Every [`DeadLetter::reason`] in use. `RedisStreamMovementFeed` registers
+/// `distant_signal_movement_feed_deadlettered_total{group, reason}` at 0 for
+/// each of these when it connects, so the dead-letter alert can use a plain
+/// `increase()`. A new reason must be added here.
+pub const DEAD_LETTER_REASONS: [&str; 3] =
+    ["rejected_by_api", "malformed_entry", "unparseable_payload"];
+
 /// One poison record set aside instead of being retried forever: a stream
 /// entry the downstream explicitly rejected (see
 /// [`MovementFeed::reject_batch`]), a malformed or unparseable entry, or one
@@ -74,8 +81,8 @@ pub trait MovementFeed: Send {
 /// that merely failed transiently, however many times.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeadLetter {
-    /// Fixed-vocabulary cause, used as the `reason` metric label:
-    /// `"rejected_by_api"`, `"malformed_entry"` or `"unparseable_payload"`.
+    /// Fixed-vocabulary cause, used as the `reason` metric label: one of
+    /// [`DEAD_LETTER_REASONS`].
     pub reason: &'static str,
     /// The `movement-events` entry id, when the record is a whole entry.
     pub source_id: Option<String>,
