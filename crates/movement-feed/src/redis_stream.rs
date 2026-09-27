@@ -1288,8 +1288,50 @@ mod long_pending_entries_tests {
 mod redis_tests {
     use super::*;
 
+    /// `REDIS_URL` plus `REDIS_PASSWORD` (when set), combined exactly as the
+    /// services do, so this suite also runs against a Redis started with
+    /// `--requirepass` (the chart's `redis.auth`).
     fn redis_url() -> String {
-        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into())
+        let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
+        let password = std::env::var("REDIS_PASSWORD")
+            .ok()
+            .map(common::secret::Secret::from);
+        common::redis_auth::redis_url_with_password(&url, password.as_ref())
+            .expect("REDIS_URL/REDIS_PASSWORD combine")
+            .expose()
+            .to_owned()
+    }
+
+    /// Rollout step 1 of the chart's `redis.auth` (clients get a password
+    /// before the server requires one) must not break anything: the
+    /// `AUTH default <password>` the clients send is accepted by a Redis 6+
+    /// whose default user has no password yet. With no `REDIS_PASSWORD` set
+    /// this runs against the local password-less Redis with an arbitrary
+    /// password; with one set it checks that password against a
+    /// `--requirepass` server.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn a_client_with_a_password_connects_whether_or_not_the_server_requires_one() {
+        let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
+        let password = std::env::var("REDIS_PASSWORD")
+            .unwrap_or_else(|_| "rollout-step-1-server-has-no-password-yet".into());
+        let url = common::redis_auth::redis_url_with_password(
+            &url,
+            Some(&common::secret::Secret::new(password)),
+        )
+        .unwrap();
+        let stream = unique_stream("auth");
+        let mut feed = RedisStreamMovementFeed::connect_for_test(
+            url.expose(),
+            &stream,
+            "test-group",
+            "test-consumer",
+            Duration::from_secs(3600),
+        )
+        .await
+        .expect("AUTH default <password> accepted");
+        assert!(feed.next_batch().await.unwrap().is_empty());
+        cleanup(&stream).await;
     }
 
     /// A fresh, unique stream/group namespace per test, so concurrent runs

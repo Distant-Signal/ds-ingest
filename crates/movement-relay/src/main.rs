@@ -41,11 +41,17 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut source = KafkaRawSource::connect(&config, ready)?;
+    // REDIS_PASSWORD, when set, is applied here (common::redis_auth). The
+    // result carries the password: pass it on, never log it.
+    let redis_url = common::redis_auth::redis_url_with_password(
+        &config.redis_url,
+        config.redis_password.as_ref(),
+    )?;
     let mut sink =
-        RedisEventSink::connect(&config.redis_url, config.movement_stream_maxlen).await?;
+        RedisEventSink::connect(redis_url.expose(), config.movement_stream_maxlen).await?;
 
     tokio::spawn(stream_lag_loop::<redis::aio::ConnectionManager>(
-        config.redis_url.clone(),
+        redis_url.expose().to_owned(),
         Duration::from_secs(config.stream_lag_poll_secs),
         config.movement_stream_maxlen,
     ));

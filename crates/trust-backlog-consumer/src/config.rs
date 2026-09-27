@@ -27,6 +27,12 @@ pub struct Config {
     #[arg(long, env, default_value = "redis://redis:6379")]
     pub redis_url: String,
 
+    /// Redis AUTH password (chart `redis.auth`, from a Secret). Unset or
+    /// empty: no AUTH, `redis_url` is used as-is. Applied to `redis_url` by
+    /// `common::redis_auth::redis_url_with_password`, never logged.
+    #[arg(long, env, hide_env_values = true)]
+    pub redis_password: Option<common::secret::Secret>,
+
     /// How long an entry may sit unacked in this consumer's own
     /// pending-entries list before its periodic sweep reclaims it. Same
     /// default/reasoning as `trust-consumer`'s identical field.

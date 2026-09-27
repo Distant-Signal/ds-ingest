@@ -122,6 +122,12 @@ pub struct Config {
     #[arg(long, env, default_value = "redis://redis:6379")]
     pub redis_url: String,
 
+    /// Redis AUTH password (chart `redis.auth`, from a Secret). Unset or
+    /// empty: no AUTH, `redis_url` is used as-is. Applied to `redis_url` by
+    /// `common::redis_auth::redis_url_with_password`, never logged.
+    #[arg(long, env, hide_env_values = true)]
+    pub redis_password: Option<common::secret::Secret>,
+
     /// See `trust-consumer/src/config.rs`'s identical field.
     #[arg(long, env, default_value_t = 30)]
     pub redis_autoclaim_min_idle_secs: u64,
@@ -313,6 +319,7 @@ pub(crate) mod tests {
             },
             movement_feed_backend: MovementFeedBackend::Kafka,
             redis_url: String::new(),
+            redis_password: None,
             redis_autoclaim_min_idle_secs: 30,
             redis_gap_check_secs: 60,
             windowed: WindowedStatsArgs {

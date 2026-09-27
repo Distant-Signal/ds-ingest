@@ -80,7 +80,11 @@ async fn main() -> anyhow::Result<()> {
     let mut feed: ActiveFeed<RedisStreamMovementFeed> = ActiveFeed::RedisStream(
         Box::new(
             RedisStreamMovementFeed::connect(
-                &config.redis_url,
+                common::redis_auth::redis_url_with_password(
+                    &config.redis_url,
+                    config.redis_password.as_ref(),
+                )?
+                .expose(),
                 "trust-event-backlog",
                 "trust-event-backlog-1",
                 Duration::from_secs(config.redis_autoclaim_min_idle_secs),
