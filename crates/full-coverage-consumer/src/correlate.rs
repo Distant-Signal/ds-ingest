@@ -178,6 +178,7 @@ mod tests {
             schedule_wtt_id: None,
             schedule_start_date: Some("2026-09-04".to_string()),
             schedule_end_date: Some("2026-09-04".to_string()),
+            tp_origin_timestamp: None,
         }
     }
 

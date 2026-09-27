@@ -245,11 +245,28 @@ pub fn process_message(
             // via `service_date_for_instant` directly, so `received_at`
             // (the only temporal anchor available) decides whether `today`
             // needs that one-day correction.
-            let service_date = if is_within_post_midnight_window(received_at) {
+            //
+            // **M7, second pass (2026-09-27).** Dating by the processing
+            // time still split every overnight train activated on the other
+            // side of midnight from its departure. A train activated at
+            // 23:49 to leave at 00:49 was filed under D while its CIF
+            // running date is D+1. A train activated late, at 00:37, having
+            // left at 23:30, was filed under D+1 instead of D. The
+            // Activation's own `tp_origin_timestamp` is the origin
+            // departure date, so it is used whenever it is present and
+            // plausible (within a day of the processing rail day). The
+            // processing-time rule above stays as the fallback.
+            let fallback_service_date = if is_within_post_midnight_window(received_at) {
                 today + chrono::Duration::days(1)
             } else {
                 today
             };
+            let service_date = activation
+                .tp_origin_timestamp
+                .as_deref()
+                .and_then(|raw| NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d").ok())
+                .filter(|date| (*date - today).num_days().abs() <= 1)
+                .unwrap_or(fallback_service_date);
             state
                 .pending_service_dates
                 .insert(activation.train_id.clone(), service_date);
@@ -633,6 +650,7 @@ mod tests {
             schedule_wtt_id: Some("WTT1".to_string()),
             schedule_start_date: Some(schedule_start_date.to_string()),
             schedule_end_date: Some(schedule_start_date.to_string()),
+            tp_origin_timestamp: None,
         }
     }
 
@@ -853,6 +871,87 @@ mod tests {
             "a 00:30-local Activation must be dated by the calendar day it actually falls on \
              (one day after the rail day it was processed in), not the rail day `today` itself"
         );
+    }
+
+    fn activation_with_origin_date(tp_origin_timestamp: &str) -> TrustMessage {
+        let mut activation = activation("221832406", "C21373", "2026-08-01");
+        activation.tp_origin_timestamp = Some(tp_origin_timestamp.to_string());
+        TrustMessage::Activation(activation)
+    }
+
+    /// **M7, second pass.** An overnight train activated BEFORE local
+    /// midnight to depart after it (a real production shape: activated
+    /// 22:55 BST, departing 01:55 BST) must be dated by its origin date,
+    /// `tp_origin_timestamp`, not by the day it happened to be processed on.
+    #[test]
+    fn an_activation_before_midnight_for_an_after_midnight_departure_uses_its_origin_date() {
+        // 21:55Z = 22:55 BST on 2026-09-26, rail day 2026-09-26.
+        let received_at: chrono::DateTime<chrono::Utc> = "2026-09-26T21:55:17Z".parse().unwrap();
+        let rail_day_today: NaiveDate = "2026-09-26".parse().unwrap();
+        let mut state = ProcessorState::default();
+        let result = process_message(
+            &activation_with_origin_date("2026-09-27"),
+            &mut state,
+            &stanox_table(),
+            &crs_index_with(&["WAT"]),
+            rail_day_today,
+            received_at,
+        )
+        .unwrap();
+        assert_eq!(
+            result.service_date,
+            "2026-09-27".parse::<NaiveDate>().unwrap()
+        );
+        assert_eq!(
+            state.pending_service_dates.get("221832406"),
+            Some(&"2026-09-27".parse::<NaiveDate>().unwrap()),
+            "the parked date later Movements inherit must be the origin date too"
+        );
+    }
+
+    /// **M7, second pass.** The mirror case: a train that departed at 23:30
+    /// but was only activated at 00:37 the next morning (real production
+    /// shape) belongs to the day it departed, not the calendar day of
+    /// processing that the first M7 fix would pick.
+    #[test]
+    fn a_late_activation_after_midnight_for_a_before_midnight_departure_uses_its_origin_date() {
+        // 23:37Z on 2026-09-26 = 00:37 BST on 2026-09-27, rail day 2026-09-26.
+        let received_at: chrono::DateTime<chrono::Utc> = "2026-09-26T23:37:00Z".parse().unwrap();
+        let rail_day_today: NaiveDate = "2026-09-26".parse().unwrap();
+        let mut state = ProcessorState::default();
+        let result = process_message(
+            &activation_with_origin_date("2026-09-26"),
+            &mut state,
+            &stanox_table(),
+            &crs_index_with(&["WAT"]),
+            rail_day_today,
+            received_at,
+        )
+        .unwrap();
+        assert_eq!(
+            result.service_date,
+            "2026-09-26".parse::<NaiveDate>().unwrap()
+        );
+    }
+
+    /// An unparseable or implausible `tp_origin_timestamp` is ignored in
+    /// favour of the processing-time rule, rather than filing the row
+    /// under a nonsense date.
+    #[test]
+    fn an_implausible_or_malformed_origin_date_falls_back_to_the_processing_day() {
+        for raw in ["2026-10-15", "not-a-date", ""] {
+            let mut state = ProcessorState::default();
+            let result = process_message(
+                &activation_with_origin_date(raw),
+                &mut state,
+                &stanox_table(),
+                &crs_index_with(&["WAT"]),
+                today(),
+                test_received_at(),
+            )
+            .unwrap();
+            assert_eq!(result.service_date, today(), "tp_origin_timestamp {raw:?}");
+        }
     }
 
     /// **Low finding #3 of the 2026-09-25 review, this fix's own regression
