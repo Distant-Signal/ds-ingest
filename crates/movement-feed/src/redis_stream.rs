@@ -54,10 +54,12 @@ pub const LONG_PENDING_DELIVERIES: u64 = 240;
 /// once.
 ///
 /// **Why this was raised from 100** (Repeater Signal review, finding M15):
-/// `next_batch` only ever performs ONE id=`0` read per `replaying_pel`
-/// activation before switching back to `>` (see that field's own doc) --
-/// so the number of entries a single PEL replay actually delivers is
-/// capped by this count, not by how many are sitting in the PEL. After a
+/// `next_batch` used to perform only ONE id=`0` read per replay activation
+/// before switching back to `>` -- so the number of entries a single PEL
+/// replay actually delivered was capped by this count, not by how many
+/// were sitting in the PEL. (It now keeps reading until a short batch;
+/// see `pel_replay_cursor`. The rest of this note is the history of why
+/// the count was raised as well.) After a
 /// consumer rename (or any event that reassigns a large backlog to a fresh
 /// consumer name via `reclaim_stale`), each further batch only becomes
 /// deliverable once it has aged past `autoclaim_min_idle` again and the
@@ -96,13 +98,23 @@ pub struct RedisStreamMovementFeed {
     stream: String,
     group: String,
     consumer: String,
-    /// Startup replay of this consumer's own pending-entries list (`0`,
-    /// not `>`) happens exactly once, before the first `>` read -- see
-    /// `next_batch`'s own doc. Also flipped back to `true` by
-    /// `reclaim_stale` after a non-empty `XAUTOCLAIM` claim, so a
-    /// reclaimed entry is picked up through the same code path -- see that
-    /// function's own doc.
-    replaying_pel: bool,
+    /// `Some(id)` while this consumer is replaying its own pending-entries
+    /// list: the next read asks for pending entries after `id` (`"0"` to
+    /// start from the beginning) instead of new entries (`>`). Starts as
+    /// `Some("0")` for the startup replay, and is reset to `Some("0")` by
+    /// `reclaim_stale` after a non-empty `XAUTOCLAIM` claim (so a reclaimed
+    /// entry is picked up through the same code path -- see that
+    /// function's own doc) and by `reject_batch` when it starts isolation.
+    ///
+    /// **M15 (Repeater Signal review).** An ordinary replay advances this
+    /// cursor past each full batch and keeps reading until a short batch,
+    /// rather than doing a single `0` read and switching to `>`. With the
+    /// single read, only `PEL_REPLAY_BATCH_COUNT` entries were delivered per
+    /// replay; the rest waited for the next `XAUTOCLAIM` sweep (one
+    /// `autoclaim_min_idle` later), so a large reclaimed backlog drained one
+    /// batch per sweep. Isolation (see `isolating`) does not advance it: it
+    /// keeps re-reading id `0` one entry at a time until the PEL is empty.
+    pel_replay_cursor: Option<String>,
     /// `(id, payload)` of every entry returned by the most recent
     /// `next_batch` call, held until `commit` XACKs them, `reject_batch`
     /// acts on them, or they're replaced by the next call -- same
@@ -181,7 +193,7 @@ impl RedisStreamMovementFeed {
             stream: stream.to_string(),
             group,
             consumer: consumer.into(),
-            replaying_pel: true,
+            pel_replay_cursor: Some("0".to_string()),
             pending: Vec::new(),
             isolating: false,
             last_autoclaim_sweep: std::time::Instant::now() - autoclaim_min_idle,
@@ -302,7 +314,7 @@ impl RedisStreamMovementFeed {
                 );
                 self.pending.clear();
                 self.isolating = true;
-                self.replaying_pel = true;
+                self.pel_replay_cursor = Some("0".to_string());
                 Ok(())
             }
         }
@@ -516,6 +528,22 @@ fn split_deliverable_and_malformed(
     (entries, malformed)
 }
 
+/// Where the next PEL-replay read should start, given the raw size and last
+/// id of the batch just read with `count = batch_count`: after that last id
+/// when the batch was full (more may follow), or `None` (switch to `>`)
+/// when it was short. See `RedisStreamMovementFeed::pel_replay_cursor`.
+fn next_pel_replay_cursor(
+    last_raw_id: Option<String>,
+    raw_len: usize,
+    batch_count: usize,
+) -> Option<String> {
+    if raw_len >= batch_count {
+        last_raw_id
+    } else {
+        None
+    }
+}
+
 #[async_trait]
 impl MovementFeed for RedisStreamMovementFeed {
     async fn next_batch(&mut self) -> anyhow::Result<Vec<String>> {
@@ -529,10 +557,15 @@ impl MovementFeed for RedisStreamMovementFeed {
             self.last_autoclaim_sweep = std::time::Instant::now();
         }
 
-        let id_arg = if self.replaying_pel { "0" } else { ">" };
+        let replaying_pel = self.pel_replay_cursor.is_some();
+        let id_arg = if self.isolating {
+            "0"
+        } else {
+            self.pel_replay_cursor.as_deref().unwrap_or(">")
+        };
         let count = if self.isolating {
             1
-        } else if self.replaying_pel {
+        } else if replaying_pel {
             PEL_REPLAY_BATCH_COUNT
         } else {
             LIVE_READ_BATCH_COUNT
@@ -552,18 +585,20 @@ impl MovementFeed for RedisStreamMovementFeed {
                     // (and isolation reads one entry at a time, see
                     // `isolating`).
                     .count(count)
-                    .block(if self.replaying_pel { 0 } else { 5000 }),
+                    .block(if replaying_pel { 0 } else { 5000 }),
             )
             .await?;
 
         let raw: Vec<redis::streams::StreamId> =
             reply.keys.into_iter().flat_map(|k| k.ids).collect();
         let pel_drained = raw.is_empty();
+        let last_raw_id = raw.last().map(|entry| entry.id.clone());
+        let raw_len = raw.len();
         let (entries, malformed) = split_deliverable_and_malformed(raw);
 
         // Only a PEL replay can return an entry that has been delivered
         // before; a `>` read is always a first delivery.
-        if self.replaying_pel {
+        if replaying_pel {
             self.report_long_pending(&entries).await;
         }
 
@@ -581,14 +616,15 @@ impl MovementFeed for RedisStreamMovementFeed {
                 .await?;
         }
 
-        // The PEL replay pass (id `0`) returns however many pending
-        // entries this consumer name left unacked last time -- possibly
-        // zero (a clean prior shutdown, or a first-ever run). EITHER WAY
-        // it only ever runs once: a `0`-id read that returns nothing still
-        // means "no more of MY OWN old pending entries," not "no more
-        // entries in the stream" (there could be plenty ahead of `>` from
-        // other consumers' progress) -- switching to `>` after exactly one
-        // empty (or non-empty) `0`-read is correct regardless of which.
+        // Advance the PEL replay (M15, see `pel_replay_cursor`'s doc). A
+        // full batch means more of this consumer's own pending entries may
+        // follow, so the next call continues after the last id returned. A
+        // short (or empty) batch means the pending-entries list is
+        // exhausted: "no more of MY OWN old pending entries," not "no more
+        // entries in the stream" (there could be plenty ahead of `>`), so
+        // switch to `>`. Counted on the raw reply, before malformed entries
+        // were split off, so a batch of only malformed entries still
+        // advances.
         //
         // Isolation is the exception: it keeps re-reading id `0` one entry
         // at a time until that read comes back with nothing at all.
@@ -596,10 +632,11 @@ impl MovementFeed for RedisStreamMovementFeed {
             if pel_drained {
                 tracing::info!(group = %self.group, "isolation finished: no pending entries left");
                 self.isolating = false;
-                self.replaying_pel = false;
+                self.pel_replay_cursor = None;
             }
-        } else if self.replaying_pel {
-            self.replaying_pel = false;
+        } else if replaying_pel {
+            self.pel_replay_cursor =
+                next_pel_replay_cursor(last_raw_id, raw_len, PEL_REPLAY_BATCH_COUNT);
         }
 
         let payloads = entries.iter().map(|(_, payload)| payload.clone()).collect();
@@ -673,7 +710,7 @@ impl RedisStreamMovementFeed {
             cursor = reply.next_stream_id;
         }
         if claimed_any {
-            self.replaying_pel = true;
+            self.pel_replay_cursor = Some("0".to_string());
         }
         Ok(())
     }
@@ -887,6 +924,20 @@ mod long_pending_entries_tests {
     #[test]
     fn an_entry_xpending_did_not_report_is_not_long_pending() {
         assert!(long_pending_entries(&[entry("9-0")], &HashMap::new(), 1).is_empty());
+    }
+
+    #[test]
+    fn a_full_pel_replay_batch_continues_after_its_last_id() {
+        assert_eq!(
+            next_pel_replay_cursor(Some("7-0".to_string()), 3, 3),
+            Some("7-0".to_string())
+        );
+    }
+
+    #[test]
+    fn a_short_or_empty_pel_replay_batch_ends_the_replay() {
+        assert_eq!(next_pel_replay_cursor(Some("7-0".to_string()), 2, 3), None);
+        assert_eq!(next_pel_replay_cursor(None, 0, 3), None);
     }
 }
 
@@ -1496,6 +1547,79 @@ mod redis_tests {
             replayed.len()
         );
         assert_eq!(replayed.first().map(String::as_str), Some("payload-0"));
+
+        cleanup(&stream).await;
+    }
+
+    /// M15 (Repeater Signal review): a pending-entries list larger than one
+    /// replay batch is delivered in full by consecutive `next_batch` calls,
+    /// not one batch per `XAUTOCLAIM` sweep. Before the fix the second call
+    /// switched to `>` and the remaining entries waited for a later sweep.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn a_pel_larger_than_one_batch_is_replayed_in_full_without_waiting_for_a_sweep() {
+        let stream = unique_stream("pel-multi-batch");
+        let total = PEL_REPLAY_BATCH_COUNT * 2 + 7;
+        let connect = || async {
+            RedisStreamMovementFeed::connect_for_test(
+                &redis_url(),
+                &stream,
+                "test-group",
+                "test-consumer",
+                Duration::from_secs(3600),
+            )
+            .await
+            .unwrap()
+        };
+
+        // Creates the group (at `$`) before anything is added.
+        drop(connect().await);
+        let client = redis::Client::open(redis_url()).unwrap();
+        let mut conn = client.get_connection_manager().await.unwrap();
+        let mut pipe = redis::pipe();
+        for i in 0..total {
+            pipe.cmd("XADD")
+                .arg(&stream)
+                .arg("*")
+                .arg("payload")
+                .arg(format!("p{i}"))
+                .ignore();
+        }
+        let _: () = pipe.query_async(&mut conn).await.unwrap();
+        // Deliver everything to this consumer name without acking, as a
+        // crashed previous run would have.
+        let _: redis::streams::StreamReadReply = conn
+            .xread_options(
+                &[&stream],
+                &[">"],
+                &redis::streams::StreamReadOptions::default()
+                    .group("test-group", "test-consumer")
+                    .count(total),
+            )
+            .await
+            .unwrap();
+
+        let mut feed = connect().await;
+        let mut replayed = Vec::new();
+        for _ in 0..3 {
+            let batch = feed.next_batch().await.unwrap();
+            assert!(
+                !batch.is_empty(),
+                "every replay call must deliver pending entries"
+            );
+            replayed.extend(batch);
+            feed.commit().await.unwrap();
+        }
+        assert_eq!(replayed.len(), total);
+        assert_eq!(replayed.first().map(String::as_str), Some("p0"));
+        assert_eq!(
+            replayed.last().cloned(),
+            Some(format!("p{}", total - 1)),
+            "entries are replayed in order"
+        );
+        let pending: redis::streams::StreamPendingReply =
+            conn.xpending(&stream, "test-group").await.unwrap();
+        assert_eq!(pending.count(), 0, "every replayed entry was acked");
 
         cleanup(&stream).await;
     }

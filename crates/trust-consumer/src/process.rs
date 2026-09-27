@@ -1383,35 +1383,12 @@ fn process_message(
                 loc_crs.as_deref(),
                 destination_crs.as_deref(),
             );
-            if let (Some(p), Some(a), Some("LATE")) =
-                (planned, actual, movement.variation_status.as_deref())
-            {
-                // M11 finding (2026-09-26 review): this bare
-                // `(a - p).num_minutes() as i32` used to run unguarded, the
-                // exact truncating-cast shape
-                // `common::trust_timestamp::plausible_delay_minutes`'s own
-                // doc comment identifies as the confirmed bug -- one corrupt
-                // `actual_timestamp` (the same class of corruption
-                // `is_plausible_actual_timestamp` already guards against
-                // elsewhere in this same message's own timestamp parsing)
-                // could turn into a delay of literally millions of minutes,
-                // written straight into `train_current_state.delay_minutes`
-                // for every subscriber sharing this train. Both `api` write
-                // paths for the identical `TrustEventMessage`-derived
-                // `delay_minutes` computation
-                // (`api::data::trust_event_backlog`,
-                // `api::data::trust_event_backlog_match`) were already
-                // guarded this way; this live path -- computing the exact
-                // same value from the exact same kind of TRUST
-                // Movement -- was the one gap. `None` here (rather than a
-                // clamped, still-fabricated number) leaves `derived`'s
-                // coarser, `variation_status`-only estimate that
-                // `trust_schema::journey::apply_movement` already computed
-                // in place, same as both api paths do.
-                if let Some(delay) = common::trust_timestamp::plausible_delay_minutes(a, p) {
-                    derived.delay_minutes = Some(delay);
-                }
-            }
+            refine_late_delay_minutes(
+                &mut derived,
+                planned,
+                actual,
+                movement.variation_status.as_deref(),
+            );
             state.set_last_derived(&movement.train_id, derived.clone());
 
             // `resolved_train_uid`/`resolved_train_id` are only ever `Some`
@@ -1712,6 +1689,33 @@ fn previous_state(state: &ProcessorState, train_id: &str) -> DerivedState {
         .unwrap_or_else(DerivedState::awaiting_activation)
 }
 
+/// Replaces `derived.delay_minutes` with the exact `actual - planned` delay
+/// for a `LATE` Movement, but only when that delay is plausible.
+///
+/// M11 finding (2026-09-26 review): this used to be a bare
+/// `(a - p).num_minutes() as i32`, the truncating-cast shape
+/// `common::trust_timestamp::plausible_delay_minutes`'s own doc comment
+/// identifies as the confirmed bug. One corrupt `actual_timestamp` could
+/// become a delay of millions of minutes, written into
+/// `train_current_state.delay_minutes` for every subscriber of the train.
+/// Both `api` write paths for the same value (`api::data::trust_event_backlog`,
+/// `api::data::trust_event_backlog_match`) were already guarded; this live
+/// path was the gap. An implausible delay leaves the coarser,
+/// `variation_status`-only estimate from
+/// `trust_schema::journey::apply_movement` in place, as both api paths do.
+fn refine_late_delay_minutes(
+    derived: &mut DerivedState,
+    planned: Option<chrono::DateTime<chrono::Utc>>,
+    actual: Option<chrono::DateTime<chrono::Utc>>,
+    variation_status: Option<&str>,
+) {
+    if let (Some(p), Some(a), Some("LATE")) = (planned, actual, variation_status)
+        && let Some(delay) = common::trust_timestamp::plausible_delay_minutes(a, p)
+    {
+        derived.delay_minutes = Some(delay);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1721,6 +1725,44 @@ mod tests {
     use crate::feed::FakeMovementFeed;
     use crate::matching::PendingPin;
     use crate::stanox_crs::StanoxCrsTable;
+
+    /// M11 (Repeater Signal, 2026-09-26): a plausible LATE delay replaces
+    /// `apply_movement`'s coarse estimate with the exact minutes.
+    #[test]
+    fn refine_late_delay_minutes_uses_a_plausible_exact_delay() {
+        let planned: chrono::DateTime<chrono::Utc> = "2026-09-20T08:00:00Z".parse().unwrap();
+        let actual = planned + chrono::Duration::minutes(7);
+        let mut derived = DerivedState {
+            delay_minutes: Some(1),
+            ..Default::default()
+        };
+        refine_late_delay_minutes(&mut derived, Some(planned), Some(actual), Some("LATE"));
+        assert_eq!(derived.delay_minutes, Some(7));
+    }
+
+    /// M11 (Repeater Signal, 2026-09-26): a corrupt `actual_timestamp` must
+    /// not become a delay of millions of minutes; the coarse estimate stays.
+    #[test]
+    fn refine_late_delay_minutes_keeps_the_estimate_for_an_implausible_delay() {
+        let planned: chrono::DateTime<chrono::Utc> = "2026-09-20T08:00:00Z".parse().unwrap();
+        let actual = planned + chrono::Duration::days(4000);
+        let mut derived = DerivedState {
+            delay_minutes: Some(1),
+            ..Default::default()
+        };
+        refine_late_delay_minutes(&mut derived, Some(planned), Some(actual), Some("LATE"));
+        assert_eq!(derived.delay_minutes, Some(1));
+    }
+
+    /// Only a `LATE` Movement is refined.
+    #[test]
+    fn refine_late_delay_minutes_ignores_a_non_late_movement() {
+        let planned: chrono::DateTime<chrono::Utc> = "2026-09-20T08:00:00Z".parse().unwrap();
+        let actual = planned + chrono::Duration::minutes(7);
+        let mut derived = DerivedState::default();
+        refine_late_delay_minutes(&mut derived, Some(planned), Some(actual), Some("ON TIME"));
+        assert_eq!(derived.delay_minutes, None);
+    }
 
     /// The real, checked-in `reference-data/stanox-crs.csv` -- not a
     /// synthetic fixture -- loaded once and shared across every test below,
