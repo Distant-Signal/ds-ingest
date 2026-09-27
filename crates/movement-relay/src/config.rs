@@ -33,6 +33,21 @@ pub struct Config {
 
     #[arg(long, env, default_value = "0.0.0.0:8083")]
     pub health_bind_url: String,
+    /// Liveness watchdog: `/livez` (and `/healthz`) answer 503 ("stalled")
+    /// once no relay-loop iteration has completed for this many seconds, so
+    /// a loop wedged inside an `await` gets restarted by the liveness probe
+    /// (which still needs its own `failureThreshold * periodSeconds` on top
+    /// of this). Waiting on Kafka for the next record never counts
+    /// (`Progress::idle`), and a failed cycle (Redis down) still completes
+    /// and beats, so neither a traffic lull nor a Redis outage is a stall.
+    ///
+    /// 900s, not trust-consumer's 300s: one Kafka record fans out into
+    /// ~218 sequential XADDs, which `kafka_source::MAX_POLL_INTERVAL_MS`
+    /// (also 900s) budgets at up to ~7 minutes under a degraded Redis. A
+    /// cycle longer than that has already cost this consumer its group
+    /// membership, so it is a genuine wedge.
+    #[arg(long, env, default_value_t = 900)]
+    pub progress_stall_secs: u64,
     #[arg(long, env, default_value_t = 9094)]
     pub metrics_port: u16,
     #[arg(long, env, default_value_t = true)]
@@ -159,5 +174,100 @@ mod tests {
         assert!(parse(&["--movement-stream-maxlen", "999"]).is_err());
         assert!(parse(&["--movement-stream-maxlen", "0"]).is_err());
         assert!(parse(&["--movement-stream-maxlen", "1000"]).is_ok());
+    }
+}
+
+/// Every env var `Config` declares must be set on the `movement-relay`
+/// container in `charts/distant-signal/templates/movement-relay-deployment.yaml`
+/// (and vice versa), and its probes must keep the readiness/liveness split.
+/// Same raw-template-text check as `crates/notifier/src/config.rs`'s own
+/// `chart_env_wiring_tests`.
+#[cfg(test)]
+mod chart_env_wiring_tests {
+    use clap::CommandFactory;
+
+    use super::Config;
+
+    /// Read by `tracing_subscriber::EnvFilter`, not by `Config`.
+    const NOT_CONFIG_ENV_VARS: &[&str] = &["RUST_LOG"];
+
+    /// The container's slice of the template, from its `- name:` line to EOF
+    /// (it is the only container), so a var named only in a leading comment
+    /// cannot satisfy the check.
+    fn relay_container_block() -> String {
+        let chart = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/distant-signal/templates/movement-relay-deployment.yaml");
+        let rendered = std::fs::read_to_string(&chart)
+            .unwrap_or_else(|err| panic!("read {}: {err}", chart.display()));
+        let marker = "- name: movement-relay\n";
+        let start = rendered
+            .find(marker)
+            .expect("the Deployment must still declare a container named `movement-relay`");
+        rendered[start..].to_string()
+    }
+
+    fn declared_env_vars() -> Vec<String> {
+        Config::command()
+            .get_arguments()
+            .filter_map(|arg| arg.get_env().and_then(|env| env.to_str()))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn every_env_var_this_config_declares_is_set_on_the_charts_container() {
+        let block = relay_container_block();
+        let declared = declared_env_vars();
+        assert!(
+            declared.iter().any(|env| env == "PROGRESS_STALL_SECS"),
+            "sanity check: {declared:?}"
+        );
+        let missing: Vec<&String> = declared
+            .iter()
+            .filter(|env| !block.contains(&format!("- name: {env}\n")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "declared by crates/movement-relay/src/config.rs but never set on the movement-relay \
+             container, so the chart's value has no effect: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn the_chart_sets_no_env_var_this_config_does_not_declare() {
+        let block = relay_container_block();
+        let declared = declared_env_vars();
+        let stale: Vec<&str> = block
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("- name: "))
+            .filter(|env| env.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+            .filter(|env| !NOT_CONFIG_ENV_VARS.contains(env))
+            .filter(|env| !declared.iter().any(|d| d == env))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "set on the movement-relay container but not declared by Config: {stale:?}"
+        );
+    }
+
+    /// Liveness on `/healthz` (readiness: a confirmed Kafka partition
+    /// assignment) got the relay SIGKILLed whenever it was unready for
+    /// ~2 minutes, e.g. while the Redis pod was being recreated by the same
+    /// rollout. Liveness must be the dependency-free `/livez`.
+    #[test]
+    fn liveness_probes_livez_and_readiness_probes_healthz() {
+        let block = relay_container_block();
+        let probe_path = |probe: &str| -> String {
+            let start = block
+                .find(&format!("{probe}:\n"))
+                .unwrap_or_else(|| panic!("no {probe}"));
+            block[start..]
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("path: "))
+                .unwrap_or_else(|| panic!("{probe} has no httpGet path"))
+                .to_string()
+        };
+        assert_eq!(probe_path("livenessProbe"), "/livez");
+        assert_eq!(probe_path("readinessProbe"), "/healthz");
     }
 }

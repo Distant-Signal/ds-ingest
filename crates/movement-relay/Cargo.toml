@@ -20,4 +20,4 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 trust-schema = { path = "../trust-schema" }
 
 [dev-dependencies]
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "test-util"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "test-util", "net", "io-util"] }

@@ -99,6 +99,10 @@ pub struct KafkaRawSource {
     /// `next_batch` queues rather than drops -- see `pending_retry`'s own
     /// doc.
     paused: bool,
+    /// Liveness progress (`main`'s `/livez` watchdog). Waiting in
+    /// `consumer.recv()` for the next record is idle time, not a stall: a
+    /// quiet feed must never get the relay restarted.
+    progress: health_http::Progress,
 }
 
 /// One retained-or-incidentally-received Kafka record awaiting redelivery,
@@ -175,7 +179,11 @@ impl KafkaRawSource {
     /// way `trust-consumer`'s `KafkaMovementFeed` uses its
     /// `connection_state` flag -- the one structural divergence from that
     /// crate's copy beyond the return-shape difference.
-    pub fn connect(config: &Config, ready: health_http::ConnectionState) -> anyhow::Result<Self> {
+    pub fn connect(
+        config: &Config,
+        ready: health_http::ConnectionState,
+        progress: health_http::Progress,
+    ) -> anyhow::Result<Self> {
         let context = RelayContext { ready };
         let consumer: StreamConsumer<RelayContext> =
             Self::client_config(config).create_with_context(context)?;
@@ -187,6 +195,7 @@ impl KafkaRawSource {
             last_received: None,
             pending_retry: VecDeque::new(),
             paused: false,
+            progress,
         })
     }
 
@@ -308,7 +317,7 @@ impl RawKafkaSource for KafkaRawSource {
             self.last_received = Some(record.offset);
             return Ok(record.batch);
         }
-        let message = self.consumer.recv().await?;
+        let message = self.progress.idle(self.consumer.recv()).await?;
         let payload = message
             .payload()
             .ok_or_else(|| anyhow::anyhow!("empty Kafka message payload"))?;
@@ -368,6 +377,7 @@ fn test_config() -> Config {
         redis_url: "redis://localhost:6379".to_string(),
         redis_password: None,
         health_bind_url: "0.0.0.0:8083".to_string(),
+        progress_stall_secs: 900,
         metrics_port: 9094,
         metrics_enabled: false,
         stream_lag_poll_secs: 30,
