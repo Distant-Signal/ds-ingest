@@ -478,14 +478,16 @@ impl ProcessorState {
 
     /// One-shot claim of a parked Activation's `train_uid` by the Movement
     /// that resolves the pin, journaled.
-    fn claim_activation(&mut self, train_id: &str) -> Option<String> {
+    /// Returns the parked `train_uid` and, when known, the train's origin
+    /// date (`PendingActivation::origin_date`).
+    fn claim_activation(&mut self, train_id: &str) -> Option<(String, Option<NaiveDate>)> {
         let claimed = self.pending_activations.remove(train_id)?;
-        let train_uid = claimed.train_uid.clone();
+        let identity = (claimed.train_uid.clone(), claimed.origin_date);
         self.journal.push(StateChange::ActivationClaimed {
             train_id: train_id.to_string(),
             claimed,
         });
-        Some(train_uid)
+        Some(identity)
     }
 
     /// Defers an Activation-fast-path resolution's one-time "freshly
@@ -558,6 +560,24 @@ pub struct PendingActivation {
     /// `train_id` string's internal structure, which is not part of any
     /// shape this codebase has confirmed.
     pub observed_rail_day: NaiveDate,
+    /// The train's origin date, from `Activation::tp_origin_timestamp`, when
+    /// it parsed and was plausible (see [`activation_origin_date`]). Carried
+    /// to `api` as `TrainMovementEventMessage::identity_date` by the
+    /// Movement that claims this Activation, so the `trains` row is keyed on
+    /// the train's own date rather than the pin's (Repeater Signal M7
+    /// leftover, 2026-09-27).
+    pub origin_date: Option<NaiveDate>,
+}
+
+/// An Activation's origin date (`tp_origin_timestamp`, `YYYY-MM-DD`), when
+/// it parses and is within one day of the rail day the Activation was
+/// observed on -- the same plausibility rule `trust-backlog-consumer`
+/// applies to the same field (97ccd3ea). `None` otherwise, in which case
+/// `api` keeps its old behaviour and keys the train on the subscription's
+/// own `service_date`.
+fn activation_origin_date(raw: Option<&str>, activation_rail_day: NaiveDate) -> Option<NaiveDate> {
+    raw.and_then(|raw| NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d").ok())
+        .filter(|date| (*date - activation_rail_day).num_days().abs() <= 1)
 }
 
 /// Applies one reference-reload tick's worth of `api` state to the
@@ -1144,6 +1164,10 @@ fn process_message(
                         .as_deref()
                         .and_then(|raw| raw.parse::<NaiveDate>().ok()),
                     observed_rail_day: activation_rail_day,
+                    origin_date: activation_origin_date(
+                        activation.tp_origin_timestamp.as_deref(),
+                        activation_rail_day,
+                    ),
                 },
             );
             Vec::new()
@@ -1399,13 +1423,21 @@ fn process_message(
             // Carried on EVERY event this message fans out to, not just
             // the first: each one drives `flip_legacy_resolution` for its
             // own subscription, and that flip is the whole point.
-            let (resolved_train_uid, resolved_train_id) = if freshly_resolved {
+            //
+            // `identity_date` rides along with the claimed `train_uid`: the
+            // Activation's origin date, so `api` keys a new `trains` row on
+            // the train's own date, not on a post-midnight intermediate
+            // pin's next-day `service_date` (M7 leftover).
+            let (resolved_train_uid, identity_date, resolved_train_id) = if freshly_resolved {
+                let claimed = state.claim_activation(&movement.train_id);
+                let identity_date = claimed.as_ref().and_then(|(_, date)| *date);
                 (
-                    state.claim_activation(&movement.train_id),
+                    claimed.map(|(train_uid, _)| train_uid),
+                    identity_date,
                     Some(movement.train_id.clone()),
                 )
             } else {
-                (None, None)
+                (None, None, None)
             };
 
             let dedup = trust_schema::dedup::dedup_key(
@@ -1423,6 +1455,7 @@ fn process_message(
                     tracked_train_id,
                     resolved_train_uid: resolved_train_uid.clone(),
                     resolved_train_id: resolved_train_id.clone(),
+                    identity_date,
                     dedup_key: dedup.clone(),
                     msg_type: "0003".to_string(),
                     event_type: Some(movement.event_type.clone()),
@@ -1520,6 +1553,7 @@ fn process_message(
                     tracked_train_id,
                     resolved_train_uid: None,
                     resolved_train_id: None,
+                    identity_date: None,
                     dedup_key: dedup.clone(),
                     msg_type: "0002".to_string(),
                     event_type: None,
@@ -1579,6 +1613,7 @@ fn process_message(
                     tracked_train_id,
                     resolved_train_uid: None,
                     resolved_train_id: None,
+                    identity_date: None,
                     dedup_key: dedup.clone(),
                     msg_type: "0005".to_string(),
                     event_type: None,
@@ -1659,6 +1694,7 @@ fn passthrough_event(
             tracked_train_id,
             resolved_train_uid: None,
             resolved_train_id: None,
+            identity_date: None,
             dedup_key: dedup.clone(),
             msg_type: msg_type.to_string(),
             event_type: None,
@@ -1975,6 +2011,66 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].resolved_train_uid, Some("C21373".to_string()));
         assert_eq!(events[0].resolved_train_id, Some("221832406".to_string()));
+        assert_eq!(
+            events[0].identity_date, None,
+            "no tp_origin_timestamp: api keeps keying on the subscription's date"
+        );
+    }
+
+    /// M7 leftover (2026-09-27): the resolving Movement carries the claimed
+    /// Activation's `tp_origin_timestamp` as `identity_date`, so `api` keys
+    /// the `trains` row on the train's origin date, not the pin's.
+    #[tokio::test]
+    async fn the_resolving_movement_carries_the_activations_origin_date() {
+        let activation = r#"[{"header":{"msg_type":"0001"},"body":{
+            "train_id":"221832406","train_uid":"C21373","toc_id":"SW",
+            "train_service_code":"22345000","schedule_wtt_id":"WTT1",
+            "schedule_start_date":"2026-08-28","schedule_end_date":"2026-08-28",
+            "tp_origin_timestamp":"2026-08-27"
+        }}]"#;
+        let mut feed = FakeMovementFeed::new(vec![
+            vec![activation.to_string()],
+            vec![ORIGIN_DEPARTURE.to_string()],
+        ]);
+        let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
+        let mut state = ProcessorState::default();
+        for _ in 0..2 {
+            let events = run_once(
+                &mut feed,
+                &reference,
+                &mut state,
+                &TEST_STANOX_CRS,
+                test_received_at(),
+            )
+            .await
+            .unwrap();
+            if let Some(event) = events.first() {
+                assert_eq!(event.resolved_train_uid.as_deref(), Some("C21373"));
+                assert_eq!(event.identity_date, Some("2026-08-27".parse().unwrap()));
+                return;
+            }
+        }
+        panic!("the Movement never resolved the pin");
+    }
+
+    #[test]
+    fn an_activation_origin_date_must_parse_and_be_within_a_day() {
+        let rail_day: NaiveDate = "2026-08-28".parse().unwrap();
+        for (raw, expected) in [
+            (Some("2026-08-27"), Some("2026-08-27")),
+            (Some(" 2026-08-28 "), Some("2026-08-28")),
+            (Some("2026-08-29"), Some("2026-08-29")),
+            (Some("2026-08-25"), None),
+            (Some("2026-08-28T00:00:00"), None),
+            (Some("garbage"), None),
+            (None, None),
+        ] {
+            assert_eq!(
+                activation_origin_date(raw, rail_day),
+                expected.map(|d| d.parse().unwrap()),
+                "{raw:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3286,6 +3382,7 @@ mod tests {
             train_uid: train_uid.to_string(),
             schedule_end_date: end.map(|e| e.parse().unwrap()),
             observed_rail_day: observed.parse().unwrap(),
+            origin_date: None,
         }
     }
 
@@ -3662,6 +3759,7 @@ mod tests {
                 tracked_train_id: 1,
                 resolved_train_uid: None,
                 resolved_train_id: None,
+                identity_date: None,
                 dedup_key: "d1".to_string(),
                 msg_type: "0003".to_string(),
                 event_type: Some("DEPARTURE".to_string()),
@@ -3683,6 +3781,7 @@ mod tests {
                 tracked_train_id: 2, // no trains_id known for this one
                 resolved_train_uid: None,
                 resolved_train_id: None,
+                identity_date: None,
                 dedup_key: "d2".to_string(),
                 msg_type: "0003".to_string(),
                 event_type: None,
@@ -4064,6 +4163,7 @@ mod tests {
                 tracked_train_id,
                 resolved_train_uid: None,
                 resolved_train_id: None,
+                identity_date: None,
                 dedup_key: "shared-dedup".to_string(),
                 msg_type: "0003".to_string(),
                 event_type: Some("ARRIVAL".to_string()),
