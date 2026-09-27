@@ -26,16 +26,22 @@ pub async fn fetch_stanox_crs(
     common::ingest::get_json(client, url, tokens).await
 }
 
+/// POSTs one batch and returns `api`'s reply, including any events it
+/// rejected for a data error (DB2-2; the same `rejected` shape as
+/// `/private/trust-event-backlog`). A transient failure is `Err` (a 5xx
+/// among them), so the caller leaves the batch un-ACKed. An older `api` that
+/// answers only `{"upserted": N}` parses as "nothing rejected". An empty
+/// batch is not sent.
 pub async fn post_train_events(
     client: &Client,
     url: &str,
     tokens: &OAuthTokenCache,
     events: &[TrainMovementEventMessage],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<common::TrustBacklogIngestResponse> {
     if events.is_empty() {
-        return Ok(());
+        return Ok(common::TrustBacklogIngestResponse::default());
     }
-    common::ingest::post_batch(client, url, tokens, events, "train events").await
+    common::ingest::post_batch_for_response(client, url, tokens, events, "train events").await
 }
 
 pub async fn post_train_forward_signals(

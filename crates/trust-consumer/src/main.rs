@@ -70,7 +70,6 @@ async fn main() -> anyhow::Result<()> {
         destination_crs_by_trains_id: std::collections::HashMap::new(),
     };
     let reload_interval = Duration::from_secs(config.reference_reload_secs);
-    let mut last_reference_reload = tokio::time::Instant::now() - reload_interval;
 
     // The CSV-derived table `config.stanox_crs` already loaded at parse
     // time becomes the shared cell's initial value -- the startup value
@@ -88,6 +87,30 @@ async fn main() -> anyhow::Result<()> {
     // `process::ProcessorState`'s docs.
     let mut state = process::ProcessorState::new(config.trust_timestamp_correction_enabled);
 
+    // PL-11: nothing is read from the feed until the first reference load
+    // has succeeded. Consuming with the empty `Reference` above matched
+    // nothing and XACKed everything, so after a reboot (api and the SSO
+    // token endpoint usually come up after the consumers) every movement in
+    // the first `reference_reload_secs` -- an origin DEPARTURE for a pinned
+    // train among them -- was lost from the live path. Retried on a short,
+    // doubling backoff rather than the 60s reload interval.
+    let refs = load_reference_until_ok(
+        async || {
+            queries::fetch_active_tracked_trains(
+                &http,
+                &config.api_tracked_trains_url,
+                &internal_oauth,
+            )
+            .await
+        },
+        STARTUP_RETRY_MIN,
+        STARTUP_RETRY_MAX,
+        || progress.beat(),
+    )
+    .await;
+    apply_loaded_reference(refs, &mut reference, &mut state);
+    let mut last_reference_reload = tokio::time::Instant::now();
+
     loop {
         if last_reference_reload.elapsed() >= reload_interval {
             match queries::fetch_active_tracked_trains(
@@ -98,29 +121,13 @@ async fn main() -> anyhow::Result<()> {
             .await
             {
                 Ok(refs) => {
-                    // Rebuilds the matchable pins AND rehydrates already-resolved
-                    // train_ids, so a restart doesn't permanently lose trains
-                    // whose origin departure has already been and gone.
-                    process::apply_reference_reload(refs, &mut reference, &mut state);
-                    // Same cadence, unrelated job: age out parked Activations
-                    // that no live Movement can still claim, so the national
-                    // Activation stream can't grow this map without bound.
-                    //
-                    // The CURRENT rail day, not `Utc::now().date_naive()`
-                    // (finding #5): the pruning rule is now about how old an
-                    // Activation's own observed rail day is, so both sides of
-                    // that comparison have to be rail days on the same
-                    // Europe/London 02:00 convention, or an Activation
-                    // observed at 01:00 local would be compared against
-                    // tomorrow's date.
-                    process::prune_expired_activations(
-                        &mut state.pending_activations,
-                        common::rail_day::current_rail_day(chrono::Utc::now()),
-                    );
+                    apply_loaded_reference(refs, &mut reference, &mut state);
                     last_reference_reload = tokio::time::Instant::now();
                 }
                 Err(err) => {
-                    tracing::error!(error = ?err, "failed to reload active tracked trains; retrying next cycle");
+                    // An already-loaded reference is kept as it is: a stale
+                    // snapshot is far better than none (PL-11).
+                    tracing::error!(error = ?err, "failed to reload active tracked trains; keeping the previous reference and retrying next cycle");
                     metrics::counter!(
                         common::metrics::metric_name("trust_consumer_errors_total"),
                         "operation" => "reload_tracked_trains"
@@ -167,10 +174,24 @@ async fn main() -> anyhow::Result<()> {
             &mut state,
             &stanox_crs,
             async |events| {
-                queries::post_train_events(&http, &config.api_ingest_url, &internal_oauth, events)
-                    .await?;
-                let signals = process::build_forward_signals(
+                let response = queries::post_train_events(
+                    &http,
+                    &config.api_ingest_url,
+                    &internal_oauth,
                     events,
+                )
+                .await?;
+                // Forward signals only for events api actually wrote.
+                let rejected: std::collections::HashSet<usize> =
+                    response.rejected.iter().map(|row| row.index).collect();
+                let written: Vec<common::TrainMovementEventMessage> = events
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| !rejected.contains(index))
+                    .map(|(_, event)| event.clone())
+                    .collect();
+                let signals = process::build_forward_signals(
+                    &written,
                     &reference.trains_id_by_tracked_train_id,
                 );
                 if let Err(err) = queries::post_train_forward_signals(
@@ -183,7 +204,7 @@ async fn main() -> anyhow::Result<()> {
                 {
                     tracing::warn!(error = ?err, "failed to post train forward signals");
                 }
-                Ok(())
+                Ok(response.rejected)
             },
         )
         .await;
@@ -209,6 +230,80 @@ async fn main() -> anyhow::Result<()> {
 /// How long to wait before retrying after a failed cycle. See its one use
 /// site above for why a flat constant is the right shape here.
 const ERROR_BACKOFF: Duration = Duration::from_secs(2);
+
+/// First and largest retry delay for the startup reference load (PL-11):
+/// 1 s, doubling, capped at 30 s -- the same shape full-coverage-consumer
+/// uses for its own startup load.
+const STARTUP_RETRY_MIN: Duration = Duration::from_secs(1);
+const STARTUP_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// Rebuilds the matchable pins AND rehydrates already-resolved train_ids
+/// from a freshly fetched reference, so a restart doesn't permanently lose
+/// trains whose origin departure has already been and gone.
+fn apply_loaded_reference(
+    refs: Vec<common::TrackedTrainRef>,
+    reference: &mut process::Reference,
+    state: &mut process::ProcessorState,
+) {
+    process::apply_reference_reload(refs, reference, state);
+    // Same cadence, unrelated job: age out parked Activations that no live
+    // Movement can still claim, so the national Activation stream can't
+    // grow this map without bound.
+    //
+    // The CURRENT rail day, not `Utc::now().date_naive()` (finding #5): the
+    // pruning rule is about how old an Activation's own observed rail day
+    // is, so both sides of that comparison have to be rail days on the same
+    // Europe/London 02:00 convention, or an Activation observed at 01:00
+    // local would be compared against tomorrow's date.
+    process::prune_expired_activations(
+        &mut state.pending_activations,
+        common::rail_day::current_rail_day(chrono::Utc::now()),
+    );
+}
+
+/// Startup gate (PL-11): calls `fetch` until it succeeds, sleeping `min`,
+/// then doubling up to `max`, between attempts, and returns the first
+/// successful result. `on_retry` runs on every failure (the caller beats
+/// the health-progress heartbeat, so a slow `api` is not mistaken for a
+/// wedged loop). The caller must not touch the feed before this returns.
+async fn load_reference_until_ok<F, B>(
+    mut fetch: F,
+    min: Duration,
+    max: Duration,
+    on_retry: B,
+) -> Vec<common::TrackedTrainRef>
+where
+    F: AsyncFnMut() -> anyhow::Result<Vec<common::TrackedTrainRef>>,
+    B: Fn(),
+{
+    let mut backoff = min.min(max);
+    loop {
+        match fetch().await {
+            Ok(refs) => {
+                tracing::info!(
+                    count = refs.len(),
+                    "loaded active tracked trains; starting to consume"
+                );
+                return refs;
+            }
+            Err(err) => {
+                tracing::error!(
+                    error = ?err,
+                    retry_in_ms = backoff.as_millis() as u64,
+                    "failed to load active tracked trains at startup; not consuming until it loads"
+                );
+                metrics::counter!(
+                    common::metrics::metric_name("trust_consumer_errors_total"),
+                    "operation" => "startup_reference_load"
+                )
+                .increment(1);
+                on_retry();
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(max);
+            }
+        }
+    }
+}
 
 /// What one consume -> post -> commit cycle did. Returned rather than acted
 /// on inside `run_cycle` so the caller owns the backoff sleep, and a test of
@@ -254,7 +349,9 @@ async fn run_cycle<F, P>(
 ) -> Cycle
 where
     F: MovementFeed + movement_feed::DeadLetterSink,
-    P: AsyncFnOnce(&[common::TrainMovementEventMessage]) -> anyhow::Result<()>,
+    P: AsyncFnOnce(
+        &[common::TrainMovementEventMessage],
+    ) -> anyhow::Result<Vec<common::RejectedTrustBacklogRow>>,
 {
     let snapshot = stanox_crs.read().expect("stanox_crs lock poisoned").clone();
 
@@ -276,31 +373,62 @@ where
         }
     };
 
-    if let Err(err) = post(&events).await {
-        state.roll_back_batch();
-        // Only an explicit data rejection is handed to `reject_batch` (which
-        // isolates and dead-letters the poison entry). A transient failure
-        // (unreachable, timeout, 5xx) just leaves the batch pending, to be
-        // retried for as long as the outage lasts -- never dead-lettered.
-        if common::ingest::classify_failure(&err) == common::ingest::FailureClass::Rejected {
-            tracing::error!(error = ?err, "api rejected this batch's train events; isolating the poison entry");
+    let rejected = match post(&events).await {
+        Ok(rejected) => rejected,
+        Err(err) => return post_failed(feed, state, err).await,
+    };
+
+    // DB2-2: `api` wrote every event except these, which it refused for a
+    // data error (each rolled back in full, behind its own savepoint). No
+    // retry can fix them, so they are dead-lettered -- with the SQLSTATE and
+    // message, for an operator to inspect and re-inject -- and the batch is
+    // ACKed like any success. If the dead-letter write fails the batch stays
+    // un-ACKed, so the rejected events are not lost; the retry re-posts the
+    // good ones harmlessly (`dedup_key`).
+    if !rejected.is_empty() {
+        let records: Vec<movement_feed::DeadLetter> = rejected
+            .iter()
+            .map(|row| movement_feed::DeadLetter {
+                reason: "rejected_by_api",
+                source_id: None,
+                delivery_count: None,
+                payload: events
+                    .get(row.index)
+                    .and_then(|event| serde_json::to_string(event).ok())
+                    .unwrap_or_default(),
+                detail: format!(
+                    "{} {} (constraint {}): {} [dedup_key {}]",
+                    row.sqlstate,
+                    row.reason,
+                    row.constraint.as_deref().unwrap_or("-"),
+                    row.message,
+                    row.dedup_key,
+                ),
+            })
+            .collect();
+        if let Err(err) = feed.dead_letter(&records).await {
+            tracing::error!(
+                error = ?err,
+                rejected = records.len(),
+                "failed to dead-letter train events api rejected; leaving the batch un-ACKed to retry"
+            );
             metrics::counter!(
                 common::metrics::metric_name("trust_consumer_errors_total"),
-                "operation" => "post_rejected"
+                "operation" => "dead_letter"
             )
             .increment(1);
-            if let Err(reject_err) = feed.reject_batch(&err.to_string()).await {
-                tracing::error!(error = ?reject_err, "failed to handle the rejected batch; it stays pending");
-            }
+            state.roll_back_batch();
             return Cycle::Failed;
         }
-        tracing::error!(error = ?err, "failed to post train events; not committing this batch's offsets");
+        tracing::warn!(
+            rejected = records.len(),
+            "api rejected train events for a data error; dead-lettered them and committing the rest"
+        );
         metrics::counter!(
-            common::metrics::metric_name("trust_consumer_errors_total"),
-            "operation" => "post_train_events"
+            common::metrics::metric_name("trust_consumer_deadlettered_total"),
+            "reason" => "rejected_by_api"
         )
-        .increment(1);
-        return Cycle::Failed;
+        .increment(records.len() as u64);
     }
 
     if let Err(err) = feed.commit().await {
@@ -323,6 +451,43 @@ where
     // Posted and committed: the batch's in-memory mutations are now facts.
     state.confirm_batch();
     Cycle::Committed
+}
+
+/// A failed train-events POST: roll the batch's in-memory state back and
+/// leave it un-ACKed. Only an explicit data rejection of the whole request
+/// (400/413/422) is handed to `reject_batch` (which isolates and
+/// dead-letters the poison entry). A transient failure (unreachable,
+/// timeout, 5xx -- which is what `api` now answers for any transient DB
+/// error, DB2-2) just leaves the batch pending, to be retried for as long as
+/// the outage lasts -- never dead-lettered.
+async fn post_failed<F>(
+    feed: &mut F,
+    state: &mut process::ProcessorState,
+    err: anyhow::Error,
+) -> Cycle
+where
+    F: MovementFeed,
+{
+    state.roll_back_batch();
+    if common::ingest::classify_failure(&err) == common::ingest::FailureClass::Rejected {
+        tracing::error!(error = ?err, "api rejected this batch's train events; isolating the poison entry");
+        metrics::counter!(
+            common::metrics::metric_name("trust_consumer_errors_total"),
+            "operation" => "post_rejected"
+        )
+        .increment(1);
+        if let Err(reject_err) = feed.reject_batch(&err.to_string()).await {
+            tracing::error!(error = ?reject_err, "failed to handle the rejected batch; it stays pending");
+        }
+        return Cycle::Failed;
+    }
+    tracing::error!(error = ?err, "failed to post train events; not committing this batch's offsets");
+    metrics::counter!(
+        common::metrics::metric_name("trust_consumer_errors_total"),
+        "operation" => "post_train_events"
+    )
+    .increment(1);
+    Cycle::Failed
 }
 
 #[cfg(test)]
@@ -416,7 +581,7 @@ mod tests {
             &TEST_STANOX_CRS,
             async |events| {
                 assert_eq!(events.len(), 1, "the pinned train's origin departure");
-                Ok(())
+                Ok(Vec::new())
             },
         )
         .await;
@@ -439,7 +604,7 @@ mod tests {
             &reference,
             &mut state,
             &TEST_STANOX_CRS,
-            async |_| Ok(()),
+            async |_| Ok(Vec::new()),
         )
         .await;
 
@@ -502,7 +667,7 @@ mod tests {
             &TEST_STANOX_CRS,
             async |events| {
                 assert!(events.is_empty(), "nothing parseable to post");
-                Ok(())
+                Ok(Vec::new())
             },
         )
         .await;
@@ -535,7 +700,7 @@ mod tests {
             &reference,
             &mut state,
             &TEST_STANOX_CRS,
-            async |_| Ok(()),
+            async |_| Ok(Vec::new()),
         )
         .await;
 
@@ -603,6 +768,167 @@ mod tests {
         assert!(state.resolved.is_empty(), "rolled back like any failure");
     }
 
+    fn rejected_row(index: usize) -> common::RejectedTrustBacklogRow {
+        common::RejectedTrustBacklogRow {
+            index,
+            dedup_key: "some-dedup-key".to_string(),
+            sqlstate: "23514".to_string(),
+            reason: "check_violation".to_string(),
+            constraint: Some("train_current_state_status_check".to_string()),
+            message: "new row violates check constraint".to_string(),
+        }
+    }
+
+    /// DB2-2: `api` now answers 500 for a transient DB error instead of
+    /// swallowing it behind a 200 -- and a 500 must leave the batch
+    /// un-ACKed, undead-lettered and rolled back, so the retry re-sends the
+    /// same events (including a pin's one-time resolution).
+    #[tokio::test]
+    async fn a_500_from_api_leaves_the_batch_to_be_retried() {
+        let mut feed = FakeMovementFeed::new(vec![
+            vec![ORIGIN_DEPARTURE.to_string()],
+            vec![ORIGIN_DEPARTURE.to_string()],
+        ]);
+        let reference = one_pending_pin();
+        let mut state = process::ProcessorState::default();
+
+        let failed = run_cycle(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            async |_| Err(status_error(500)),
+        )
+        .await;
+        assert_eq!(failed, Cycle::Failed);
+        assert_eq!(feed.committed_count, 0);
+        assert!(feed.dead_lettered.is_empty());
+        assert!(feed.rejected_batches.is_empty());
+        assert!(state.resolved.is_empty());
+
+        let retried = run_cycle(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            async |events| {
+                assert_eq!(
+                    events[0].resolved_train_id,
+                    Some("221832406".to_string()),
+                    "the retry still carries the resolution"
+                );
+                Ok(Vec::new())
+            },
+        )
+        .await;
+        assert_eq!(retried, Cycle::Committed);
+        assert_eq!(feed.committed_count, 1);
+    }
+
+    /// DB2-2: events `api` rejected per row for a data error are
+    /// dead-lettered (with the event as payload and the SQLSTATE in the
+    /// detail) and the batch is committed -- no retry could fix them.
+    #[tokio::test]
+    async fn per_row_rejections_are_dead_lettered_and_the_batch_commits() {
+        let mut feed = FakeMovementFeed::new(vec![vec![ORIGIN_DEPARTURE.to_string()]]);
+        let reference = one_pending_pin();
+        let mut state = process::ProcessorState::default();
+
+        let outcome = run_cycle(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            async |events| {
+                assert_eq!(events.len(), 1);
+                Ok(vec![rejected_row(0)])
+            },
+        )
+        .await;
+
+        assert_eq!(outcome, Cycle::Committed);
+        assert_eq!(feed.committed_count, 1);
+        assert!(
+            feed.rejected_batches.is_empty(),
+            "not a whole-batch rejection"
+        );
+        assert_eq!(feed.dead_lettered.len(), 1);
+        assert_eq!(feed.dead_lettered[0].reason, "rejected_by_api");
+        assert!(
+            feed.dead_lettered[0]
+                .detail
+                .starts_with("23514 check_violation")
+        );
+        let payload: common::TrainMovementEventMessage =
+            serde_json::from_str(&feed.dead_lettered[0].payload).expect("payload is the event");
+        assert_eq!(payload.tracked_train_id, 1);
+    }
+
+    /// DB2-2: if the rejected events cannot be dead-lettered, the batch is
+    /// NOT committed (and its state is rolled back), so they are not lost.
+    #[tokio::test]
+    async fn a_failed_dead_letter_of_rejected_rows_commits_nothing() {
+        let mut feed = FakeMovementFeed::new(vec![vec![ORIGIN_DEPARTURE.to_string()]]);
+        feed.fail_next_dead_letter = true;
+        let reference = one_pending_pin();
+        let mut state = process::ProcessorState::default();
+
+        let outcome = run_cycle(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            async |_| Ok(vec![rejected_row(0)]),
+        )
+        .await;
+
+        assert_eq!(outcome, Cycle::Failed);
+        assert_eq!(feed.committed_count, 0);
+        assert!(state.resolved.is_empty(), "rolled back like any failure");
+    }
+
+    /// PL-11: the startup gate keeps retrying a failing reference load --
+    /// quickly, not on the 60 s reload interval -- and only returns (letting
+    /// the caller start consuming) once a load has succeeded.
+    #[tokio::test]
+    async fn the_startup_gate_returns_only_after_a_successful_reference_load() {
+        let attempts = std::cell::Cell::new(0u32);
+        let retries = std::cell::Cell::new(0u32);
+        let started = std::time::Instant::now();
+
+        let refs = load_reference_until_ok(
+            async || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() <= 4 {
+                    anyhow::bail!("api is still starting");
+                }
+                Ok(vec![common::TrackedTrainRef {
+                    id: 7,
+                    service_date: "2026-08-28".parse().unwrap(),
+                    pin_origin_crs: Some("WAT".to_string()),
+                    pin_scheduled_departure: Some("2026-08-28T18:32:00Z".parse().unwrap()),
+                    resolution_status: "pending".to_string(),
+                    train_uid: None,
+                    train_id: None,
+                    trains_id: None,
+                    destination_crs: None,
+                }])
+            },
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            || retries.set(retries.get() + 1),
+        )
+        .await;
+
+        assert_eq!(attempts.get(), 5);
+        assert_eq!(retries.get(), 4, "every failure beats the heartbeat");
+        assert_eq!(refs.len(), 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "retried on the short backoff (5+10+20+20 ms), not the reload interval"
+        );
+    }
+
     /// The other half of finding #8, and the one that made it a data-loss
     /// bug rather than just a stuck-batch bug: the GOOD entries sharing a
     /// batch with a bad one must still be processed and posted. Before the
@@ -631,7 +957,7 @@ mod tests {
                 );
                 assert_eq!(events[0].tracked_train_id, 1);
                 assert_eq!(events[0].resolved_train_id, Some("221832406".to_string()));
-                Ok(())
+                Ok(Vec::new())
             },
         )
         .await;
@@ -691,7 +1017,7 @@ mod tests {
                     "the redelivered batch must still announce the resolution"
                 );
                 assert_eq!(events[0].tracked_train_id, 1);
-                Ok(())
+                Ok(Vec::new())
             },
         )
         .await;
@@ -725,7 +1051,7 @@ mod tests {
                 &reference,
                 &mut state,
                 &TEST_STANOX_CRS,
-                async |_| Ok(())
+                async |_| Ok(Vec::new())
             )
             .await,
             Cycle::Committed
@@ -742,7 +1068,7 @@ mod tests {
                     events[0].resolved_train_id, None,
                     "a confirmed resolution is not re-announced by the next movement"
                 );
-                Ok(())
+                Ok(Vec::new())
             },
         )
         .await;
