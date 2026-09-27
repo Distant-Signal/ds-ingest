@@ -48,6 +48,7 @@ use config::{Config, MovementFeedBackend};
 use feed::MovementFeed;
 use feed::kafka::KafkaMovementFeed;
 use movement_feed::ActiveFeed;
+use movement_feed::DeadLetterSink;
 use movement_feed::redis_stream::RedisStreamMovementFeed;
 use trust_schema::schema::TrustMessage;
 
@@ -61,9 +62,13 @@ async fn main() -> anyhow::Result<()> {
     if config.metrics.metrics_enabled {
         common::metrics::install(config.metrics_port)?;
     }
-    let connection_state =
-        health_http::spawn(config.health_bind_url.clone(), "connected", "disconnected");
-    let http = reqwest::Client::new();
+    let (connection_state, progress) = health_http::spawn_with_progress(
+        config.health_bind_url.clone(),
+        "connected",
+        "disconnected",
+        Duration::from_secs(config.progress_stall_secs),
+    );
+    let http = common::ingest::consumer_http_client()?;
     let internal_oauth = config.internal_oauth.token_cache();
 
     let mut feed = match config.movement_feed_backend {
@@ -273,6 +278,7 @@ async fn main() -> anyhow::Result<()> {
         match feed.next_batch().await {
             Ok(batch) => {
                 let snapshot = stanox.read().expect("stanox lock poisoned").clone();
+                let mut unparseable = Vec::new();
                 for raw in &batch {
                     match trust_schema::schema::parse_batch(raw) {
                         Ok(messages) => {
@@ -289,20 +295,40 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                         Err(err) => {
-                            tracing::error!(error = ?err, raw = %raw, "failed to parse TRUST batch; dropping this payload");
+                            tracing::error!(error = ?err, raw = %raw, "failed to parse TRUST batch; dead-lettering this payload");
                             metrics::counter!(
                                 common::metrics::metric_name("full_coverage_consumer_errors_total"),
                                 "operation" => "parse_batch"
                             )
                             .increment(1);
+                            unparseable.push(movement_feed::DeadLetter {
+                                reason: "unparseable_payload",
+                                source_id: None,
+                                delivery_count: None,
+                                payload: raw.clone(),
+                                detail: format!("{err:?}"),
+                            });
                         }
                     }
+                }
+                // An unparseable payload is kept, not just logged. If it
+                // cannot be stored, the batch is left un-ACKed rather than
+                // lose it (re-dispatching the rest on redelivery is
+                // harmless -- last-write-wins, see this module's doc).
+                if let Err(err) = feed.dead_letter(&unparseable).await {
+                    tracing::error!(error = ?err, "failed to dead-letter unparseable payloads; not committing this batch");
+                    metrics::counter!(
+                        common::metrics::metric_name("full_coverage_consumer_errors_total"),
+                        "operation" => "dead_letter"
+                    )
+                    .increment(1);
+                    tokio::time::sleep(ERROR_BACKOFF).await;
                 }
                 // Commit as soon as the batch is dispatched into
                 // in-memory state -- see this module's own doc comment
                 // for why this crate's commit cadence is decoupled from
                 // its stats-write cadence, unlike trust-consumer's.
-                if let Err(err) = feed.commit().await {
+                else if let Err(err) = feed.commit().await {
                     tracing::error!(error = ?err, "failed to commit Kafka offsets");
                     metrics::counter!(
                         common::metrics::metric_name("full_coverage_consumer_errors_total"),
@@ -342,6 +368,10 @@ async fn main() -> anyhow::Result<()> {
             .await;
             last_stats_write = tokio::time::Instant::now();
         }
+
+        // One loop iteration completed, however it went -- see
+        // `health_http::Progress`.
+        progress.beat();
     }
 }
 

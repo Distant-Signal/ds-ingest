@@ -33,9 +33,13 @@ async fn main() -> anyhow::Result<()> {
     if config.metrics.metrics_enabled {
         common::metrics::install(config.metrics_port)?;
     }
-    let connection_state =
-        health_http::spawn(config.health_bind_url.clone(), "connected", "disconnected");
-    let http = reqwest::Client::new();
+    let (connection_state, progress) = health_http::spawn_with_progress(
+        config.health_bind_url.clone(),
+        "connected",
+        "disconnected",
+        Duration::from_secs(config.progress_stall_secs),
+    );
+    let http = common::ingest::consumer_http_client()?;
     let internal_oauth = config.internal_oauth.token_cache();
 
     let mut feed = match config.movement_feed_backend {
@@ -196,6 +200,9 @@ async fn main() -> anyhow::Result<()> {
             // costs nothing once the outage clears.
             tokio::time::sleep(ERROR_BACKOFF).await;
         }
+        // One loop iteration completed, however it went -- see
+        // `health_http::Progress`.
+        progress.beat();
     }
 }
 
@@ -246,7 +253,7 @@ async fn run_cycle<F, P>(
     post: P,
 ) -> Cycle
 where
-    F: MovementFeed,
+    F: MovementFeed + movement_feed::DeadLetterSink,
     P: AsyncFnOnce(&[common::TrainMovementEventMessage]) -> anyhow::Result<()>,
 {
     let snapshot = stanox_crs.read().expect("stanox_crs lock poisoned").clone();
@@ -270,13 +277,29 @@ where
     };
 
     if let Err(err) = post(&events).await {
+        state.roll_back_batch();
+        // Only an explicit data rejection is handed to `reject_batch` (which
+        // isolates and dead-letters the poison entry). A transient failure
+        // (unreachable, timeout, 5xx) just leaves the batch pending, to be
+        // retried for as long as the outage lasts -- never dead-lettered.
+        if common::ingest::classify_failure(&err) == common::ingest::FailureClass::Rejected {
+            tracing::error!(error = ?err, "api rejected this batch's train events; isolating the poison entry");
+            metrics::counter!(
+                common::metrics::metric_name("trust_consumer_errors_total"),
+                "operation" => "post_rejected"
+            )
+            .increment(1);
+            if let Err(reject_err) = feed.reject_batch(&err.to_string()).await {
+                tracing::error!(error = ?reject_err, "failed to handle the rejected batch; it stays pending");
+            }
+            return Cycle::Failed;
+        }
         tracing::error!(error = ?err, "failed to post train events; not committing this batch's offsets");
         metrics::counter!(
             common::metrics::metric_name("trust_consumer_errors_total"),
             "operation" => "post_train_events"
         )
         .increment(1);
-        state.roll_back_batch();
         return Cycle::Failed;
     }
 
@@ -489,6 +512,95 @@ mod tests {
             feed.committed_count, 1,
             "the poison payload must be acknowledged, not replayed forever"
         );
+        assert_eq!(
+            feed.dead_lettered.len(),
+            1,
+            "...and dead-lettered, not lost"
+        );
+        assert_eq!(feed.dead_lettered[0].reason, "unparseable_payload");
+        assert_eq!(feed.dead_lettered[0].payload, "not json at all");
+    }
+
+    /// If the unparseable payload cannot be dead-lettered, the cycle fails
+    /// and nothing is ACKed, so it is not lost.
+    #[tokio::test]
+    async fn a_failed_dead_letter_of_an_unparseable_payload_commits_nothing() {
+        let mut feed = FakeMovementFeed::new(vec![vec!["not json at all".to_string()]]);
+        feed.fail_next_dead_letter = true;
+        let reference = one_pending_pin();
+        let mut state = process::ProcessorState::default();
+
+        let outcome = run_cycle(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            async |_| Ok(()),
+        )
+        .await;
+
+        assert_eq!(outcome, Cycle::Failed);
+        assert_eq!(feed.committed_count, 0);
+    }
+
+    fn status_error(status: u16) -> anyhow::Error {
+        common::ingest::HttpStatusError {
+            prefix: "ingestion POST failed",
+            status: reqwest::StatusCode::from_u16(status).unwrap(),
+            body: String::new(),
+        }
+        .into()
+    }
+
+    /// PL-2: transient failures (timeouts, 5xx, auth, ...) never reach
+    /// `reject_batch` or the dead-letter sink, however long they go on.
+    #[tokio::test]
+    async fn a_transient_failure_is_never_rejected_or_dead_lettered() {
+        let statuses = [500u16, 502, 503, 504, 401, 403, 404, 429];
+        let batches = (0..300)
+            .map(|_| vec![ORIGIN_DEPARTURE.to_string()])
+            .collect();
+        let mut feed = FakeMovementFeed::new(batches);
+        let reference = one_pending_pin();
+        let mut state = process::ProcessorState::default();
+
+        for status in statuses.into_iter().cycle().take(300) {
+            let outcome = run_cycle(
+                &mut feed,
+                &reference,
+                &mut state,
+                &TEST_STANOX_CRS,
+                async |_| Err(status_error(status)),
+            )
+            .await;
+            assert_eq!(outcome, Cycle::Failed);
+        }
+        assert_eq!(feed.committed_count, 0);
+        assert!(feed.rejected_batches.is_empty());
+        assert!(feed.dead_lettered.is_empty());
+    }
+
+    /// PL-2: an explicit data rejection hands the batch to `reject_batch`,
+    /// without committing it.
+    #[tokio::test]
+    async fn a_data_rejection_is_handed_to_reject_batch() {
+        let mut feed = FakeMovementFeed::new(vec![vec![ORIGIN_DEPARTURE.to_string()]]);
+        let reference = one_pending_pin();
+        let mut state = process::ProcessorState::default();
+
+        let outcome = run_cycle(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            async |_| Err(status_error(422)),
+        )
+        .await;
+
+        assert_eq!(outcome, Cycle::Failed);
+        assert_eq!(feed.committed_count, 0);
+        assert_eq!(feed.rejected_batches.len(), 1);
+        assert!(state.resolved.is_empty(), "rolled back like any failure");
     }
 
     /// The other half of finding #8, and the one that made it a data-loss

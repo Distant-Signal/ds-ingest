@@ -33,15 +33,6 @@ pub struct Config {
     #[arg(long, env, default_value_t = 30)]
     pub redis_autoclaim_min_idle_secs: u64,
 
-    /// Poison-entry guard: a `movement-events` entry replayed from this
-    /// group's pending-entries list after more than this many deliveries
-    /// is written to `movement-events-deadletter` and XACKed rather than
-    /// retried again. `0` disables it. See
-    /// `movement_feed::redis_stream::DEFAULT_MAX_DELIVERIES` for how the
-    /// default maps to time (about an hour of continuous failure).
-    #[arg(long, env, default_value_t = movement_feed::DEFAULT_MAX_DELIVERIES)]
-    pub redis_max_deliveries: u64,
-
     /// How often (seconds) this crate compares its own consumer group's
     /// `last-delivered-id` against the stream's oldest retained entry.
     /// Same cadence/reasoning as `trust-consumer`'s identical field.
@@ -94,6 +85,16 @@ pub struct Config {
 
     #[arg(long, env, default_value = "0.0.0.0:8083")]
     pub health_bind_url: String,
+    /// Liveness watchdog: `/healthz` answers 503 ("stalled") once no
+    /// consume-loop iteration has completed for this many seconds, so a
+    /// loop wedged inside an `await` gets restarted by the liveness probe
+    /// (which still needs its own `failureThreshold * periodSeconds` on top
+    /// of this). A healthy iteration takes a few seconds (the `XREADGROUP`
+    /// blocks for at most 5s); this is sized well above the worst
+    /// legitimate one, every HTTP call in it being bounded by
+    /// `common::ingest::CONSUMER_REQUEST_TIMEOUT` (60s).
+    #[arg(long, env, default_value_t = 300)]
+    pub progress_stall_secs: u64,
     #[arg(long, env, default_value_t = 9096)]
     pub metrics_port: u16,
     #[command(flatten)]

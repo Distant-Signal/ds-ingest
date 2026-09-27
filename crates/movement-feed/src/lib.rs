@@ -20,7 +20,7 @@ pub mod active_feed;
 pub mod redis_stream;
 
 pub use active_feed::{ActiveFeed, MovementFeedBackend};
-pub use redis_stream::DEFAULT_MAX_DELIVERIES;
+pub use redis_stream::LONG_PENDING_DELIVERIES;
 
 use async_trait::async_trait;
 
@@ -48,16 +48,34 @@ pub trait MovementFeed: Send {
     /// A `commit` with nothing received since the last one is a no-op that
     /// still returns `Ok(())`.
     async fn commit(&mut self) -> anyhow::Result<()>;
+
+    /// Called INSTEAD of `commit` when the downstream explicitly rejected
+    /// the data of the batch the most recent `next_batch` returned (a
+    /// 400/413/422 -- see `common::ingest::classify_failure`). NOT called
+    /// for a transient failure (unreachable, timeout, 5xx): then the caller
+    /// just skips `commit`, and the batch stays pending and is retried
+    /// indefinitely.
+    ///
+    /// The Redis implementation dead-letters a rejected single entry and
+    /// narrows a rejected multi-entry batch down one entry at a time -- see
+    /// `redis_stream::RedisStreamMovementFeed::reject_batch`. The default
+    /// (the legacy Kafka backend) does nothing, leaving the batch
+    /// uncommitted exactly as before. `Err` means nothing was dead-lettered
+    /// or ACKed.
+    async fn reject_batch(&mut self, _detail: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
-/// One record set aside instead of being retried forever: either a stream
-/// entry delivered more than `max_deliveries` times (see
-/// `redis_stream::RedisStreamMovementFeed::with_max_deliveries`), or one
-/// row `api` refused from a batch (trust-backlog-consumer).
+/// One poison record set aside instead of being retried forever: a stream
+/// entry the downstream explicitly rejected (see
+/// [`MovementFeed::reject_batch`]), a malformed or unparseable entry, or one
+/// row `api` refused from a batch (trust-backlog-consumer). Never an entry
+/// that merely failed transiently, however many times.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeadLetter {
-    /// Fixed-vocabulary cause, used as the `reason` metric label, e.g.
-    /// `"max_deliveries_exceeded"` or `"rejected_by_api"`.
+    /// Fixed-vocabulary cause, used as the `reason` metric label:
+    /// `"rejected_by_api"`, `"malformed_entry"` or `"unparseable_payload"`.
     pub reason: &'static str,
     /// The `movement-events` entry id, when the record is a whole entry.
     pub source_id: Option<String>,
@@ -95,6 +113,8 @@ pub struct FakeMovementFeed {
     pub dead_lettered: Vec<DeadLetter>,
     /// When set, the next `dead_letter` call fails (and clears this).
     pub fail_next_dead_letter: bool,
+    /// The `detail` of every [`MovementFeed::reject_batch`] call, in order.
+    pub rejected_batches: Vec<String>,
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -106,6 +126,7 @@ impl FakeMovementFeed {
             committed_count: 0,
             dead_lettered: Vec::new(),
             fail_next_dead_letter: false,
+            rejected_batches: Vec::new(),
         }
     }
 }
@@ -127,6 +148,11 @@ impl MovementFeed for FakeMovementFeed {
         }
         self.received_since_commit = false;
         self.committed_count += 1;
+        Ok(())
+    }
+
+    async fn reject_batch(&mut self, detail: &str) -> anyhow::Result<()> {
+        self.rejected_batches.push(detail.to_string());
         Ok(())
     }
 }

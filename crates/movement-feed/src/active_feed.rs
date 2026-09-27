@@ -65,6 +65,13 @@ impl<K: MovementFeed> MovementFeed for ActiveFeed<K> {
             ActiveFeed::RedisStream(feed, _, _) => feed.commit().await,
         }
     }
+
+    async fn reject_batch(&mut self, detail: &str) -> anyhow::Result<()> {
+        match self {
+            ActiveFeed::Kafka(feed) => feed.reject_batch(detail).await,
+            ActiveFeed::RedisStream(feed, _, _) => feed.reject_batch(detail).await,
+        }
+    }
 }
 
 /// The Kafka backend has no dead-letter stream (it is legacy and slated for

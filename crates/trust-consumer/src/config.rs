@@ -83,6 +83,16 @@ pub struct Config {
     /// Open Questions #6.
     #[arg(long, env, default_value = "0.0.0.0:8081")]
     pub health_bind_url: String,
+    /// Liveness watchdog: `/healthz` answers 503 ("stalled") once no
+    /// consume-loop iteration has completed for this many seconds, so a
+    /// loop wedged inside an `await` gets restarted by the liveness probe
+    /// (which still needs its own `failureThreshold * periodSeconds` on top
+    /// of this). A healthy iteration takes a few seconds (the `XREADGROUP`
+    /// blocks for at most 5s); this is sized well above the worst
+    /// legitimate one, every HTTP call in it being bounded by
+    /// `common::ingest::CONSUMER_REQUEST_TIMEOUT` (60s).
+    #[arg(long, env, default_value_t = 300)]
+    pub progress_stall_secs: u64,
 
     /// STANOX->CRS translation table, loaded once at startup. See
     /// `crate::stanox_crs`'s module doc for the file format and

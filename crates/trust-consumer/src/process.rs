@@ -846,7 +846,7 @@ pub fn build_forward_signals(
 /// timestamp parsed this cycle (via
 /// `common::trust_timestamp::parse_trust_epoch_millis`) and into
 /// `matching::resolve_origin_departure`'s own guard.
-pub async fn run_once<F: MovementFeed>(
+pub async fn run_once<F: MovementFeed + movement_feed::DeadLetterSink>(
     feed: &mut F,
     reference: &Reference,
     state: &mut ProcessorState,
@@ -855,6 +855,7 @@ pub async fn run_once<F: MovementFeed>(
 ) -> anyhow::Result<Vec<common::TrainMovementEventMessage>> {
     let raw_batches = feed.next_batch().await?;
     let mut events = Vec::new();
+    let mut unparseable = Vec::new();
 
     for raw in raw_batches {
         // ONE unparseable payload must not take the rest of the batch down
@@ -880,14 +881,21 @@ pub async fn run_once<F: MovementFeed>(
                 tracing::error!(
                     error = ?err,
                     raw = %raw,
-                    "failed to parse a TRUST payload; dropping just this payload and continuing \
-                     with the rest of the batch"
+                    "failed to parse a TRUST payload; dead-lettering just this payload and \
+                     continuing with the rest of the batch"
                 );
                 metrics::counter!(
                     common::metrics::metric_name("trust_consumer_errors_total"),
                     "operation" => "parse_batch"
                 )
                 .increment(1);
+                unparseable.push(movement_feed::DeadLetter {
+                    reason: "unparseable_payload",
+                    source_id: None,
+                    delivery_count: None,
+                    detail: format!("{err:?}"),
+                    payload: raw,
+                });
                 continue;
             }
         };
@@ -922,6 +930,11 @@ pub async fn run_once<F: MovementFeed>(
             }
         }
     }
+
+    // Kept (not just logged) so it can be recovered once whatever produced
+    // it, or the parser, is fixed. A failed write fails the cycle, leaving
+    // the batch un-ACKed rather than losing the payload.
+    feed.dead_letter(&unparseable).await?;
 
     Ok(events)
 }

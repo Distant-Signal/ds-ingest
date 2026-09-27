@@ -82,6 +82,20 @@ pub struct Config {
 
     #[arg(long, env, default_value = "0.0.0.0:8082")]
     pub health_bind_url: String,
+    /// Liveness watchdog: `/healthz` answers 503 ("stalled") once no
+    /// consume-loop iteration has completed for this many seconds, so a
+    /// loop wedged inside an `await` gets restarted by the liveness probe
+    /// (which still needs its own `failureThreshold * periodSeconds` on top
+    /// of this). A healthy iteration takes a few seconds (the `XREADGROUP`
+    /// blocks for at most 5s); this is sized well above the worst
+    /// legitimate one, every HTTP call in it being bounded by
+    /// `common::ingest::CONSUMER_REQUEST_TIMEOUT` (60s).
+    /// Larger than the other two consumers': one iteration here can also
+    /// run a full population reload and a stats write, each several
+    /// requests, and a restart costs this consumer its in-memory
+    /// correlation state for the rail day.
+    #[arg(long, env, default_value_t = 900)]
+    pub progress_stall_secs: u64,
     #[arg(long, env, default_value_t = 9093)]
     pub metrics_port: u16,
     #[command(flatten)]
@@ -242,6 +256,7 @@ pub(crate) mod tests {
             shadow_lines: shadow_lines.to_string(),
             lines: LineCatalogue(lines),
             health_bind_url: String::new(),
+            progress_stall_secs: 900,
             metrics_port: 9093,
             metrics: common::service_args::MetricsArgs {
                 metrics_enabled: false,
