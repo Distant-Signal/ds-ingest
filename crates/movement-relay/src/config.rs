@@ -222,9 +222,15 @@ mod chart_env_wiring_tests {
             declared.iter().any(|env| env == "PROGRESS_STALL_SECS"),
             "sanity check: {declared:?}"
         );
+        // REDIS_PASSWORD is rendered by the shared `distant-signal.redisPasswordEnv`
+        // helper (only when redis.auth.enabled), so it never appears literally.
         let missing: Vec<&String> = declared
             .iter()
             .filter(|env| !block.contains(&format!("- name: {env}\n")))
+            .filter(|env| {
+                !(env.as_str() == "REDIS_PASSWORD"
+                    && block.contains(r#"include "distant-signal.redisPasswordEnv""#))
+            })
             .collect();
         assert!(
             missing.is_empty(),
