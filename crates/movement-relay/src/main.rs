@@ -47,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(stream_lag_loop::<redis::aio::ConnectionManager>(
         config.redis_url.clone(),
         Duration::from_secs(config.stream_lag_poll_secs),
+        config.movement_stream_maxlen,
     ));
 
     loop {
@@ -222,6 +223,8 @@ const STREAM_LAG_GROUPS: [&str; 3] = [
 trait LagConnection: Sized + Send + 'static {
     async fn connect(redis_url: &str) -> anyhow::Result<Self>;
     async fn group_lag(&mut self, group: &str) -> anyhow::Result<Option<i64>>;
+    /// `XLEN movement-events` -- 0 for a stream that doesn't exist yet.
+    async fn stream_len(&mut self) -> anyhow::Result<u64>;
 }
 
 #[async_trait::async_trait]
@@ -233,6 +236,52 @@ impl LagConnection for redis::aio::ConnectionManager {
 
     async fn group_lag(&mut self, group: &str) -> anyhow::Result<Option<i64>> {
         group_lag(self, group).await
+    }
+
+    async fn stream_len(&mut self) -> anyhow::Result<u64> {
+        Ok(redis::cmd("XLEN")
+            .arg("movement-events")
+            .query_async(self)
+            .await?)
+    }
+}
+
+/// Per-group `XINFO GROUPS` lag, labelled `group`.
+const STREAM_LAG_METRIC: &str = "movement_relay_stream_lag";
+/// `XLEN movement-events` -- how full the stream currently is.
+const STREAM_LENGTH_METRIC: &str = "movement_relay_stream_length";
+/// The configured `MAXLEN ~` cap (`--movement-stream-maxlen`). Exported so
+/// an alert can express lag as a fraction of the cap without hard-coding
+/// the cap into the rule (the chart's `templates/prometheusrule.yaml`
+/// divides `movement_relay_stream_lag` by this).
+const STREAM_MAXLEN_METRIC: &str = "movement_relay_stream_maxlen";
+
+/// What one `run_lag_tick` observed -- returned rather than only written
+/// to gauges so the tick's behaviour is testable without a metrics
+/// recorder (this crate has no `metrics-util` dev-dependency).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LagSample {
+    /// `None` when there was no connection this tick or `XLEN` failed.
+    stream_length: Option<u64>,
+    /// Only the groups that exist and reported a lag, in
+    /// `STREAM_LAG_GROUPS` order.
+    group_lags: Vec<(&'static str, i64)>,
+}
+
+/// Writes one tick's `LagSample` plus the configured cap to the gauges.
+/// The cap is written every tick, connected or not, so it is present from
+/// the first tick onward even while Redis is unreachable.
+fn publish_lag_sample(sample: &LagSample, maxlen: u64) {
+    metrics::gauge!(common::metrics::metric_name(STREAM_MAXLEN_METRIC)).set(maxlen as f64);
+    if let Some(len) = sample.stream_length {
+        metrics::gauge!(common::metrics::metric_name(STREAM_LENGTH_METRIC)).set(len as f64);
+    }
+    for (group, lag) in &sample.group_lags {
+        metrics::gauge!(
+            common::metrics::metric_name(STREAM_LAG_METRIC),
+            "group" => *group
+        )
+        .set(*lag as f64);
     }
 }
 
@@ -253,17 +302,23 @@ impl LagConnection for redis::aio::ConnectionManager {
 /// per tick, whenever it doesn't already have one -- a failed tick logs a
 /// warning, counts it, and tries again next tick, forever, instead of giving
 /// up once.
-async fn stream_lag_loop<C: LagConnection>(redis_url: String, interval: Duration) {
+///
+/// Also exports the stream's current length (`XLEN`) and its configured
+/// cap (`maxlen`) alongside the per-group lag, so lag can be alerted on as
+/// a fraction of the cap.
+async fn stream_lag_loop<C: LagConnection>(redis_url: String, interval: Duration, maxlen: u64) {
     let mut conn: Option<C> = None;
     loop {
         tokio::time::sleep(interval).await;
-        run_lag_tick(&redis_url, &mut conn).await;
+        let sample = run_lag_tick(&redis_url, &mut conn).await;
+        publish_lag_sample(&sample, maxlen);
     }
 }
 
 /// One tick's worth of `stream_lag_loop` work, split out so it's callable
 /// (and its retry behaviour testable) without an actual `sleep`.
-async fn run_lag_tick<C: LagConnection>(redis_url: &str, conn: &mut Option<C>) {
+async fn run_lag_tick<C: LagConnection>(redis_url: &str, conn: &mut Option<C>) -> LagSample {
+    let mut sample = LagSample::default();
     if conn.is_none() {
         match C::connect(redis_url).await {
             Ok(c) => *conn = Some(c),
@@ -274,28 +329,29 @@ async fn run_lag_tick<C: LagConnection>(redis_url: &str, conn: &mut Option<C>) {
                     "operation" => "redis_connect"
                 )
                 .increment(1);
-                return;
+                return sample;
             }
         }
     }
     // `conn` was just proven `Some` above (either already, or by the
     // successful `connect` arm) -- the only early return is the `Err` arm.
     let active = conn.as_mut().expect("connection ensured Some above");
+    match active.stream_len().await {
+        Ok(len) => sample.stream_length = Some(len),
+        Err(err) => {
+            tracing::warn!(error = ?err, "stream_lag_loop: failed to fetch XLEN");
+        }
+    }
     for group in STREAM_LAG_GROUPS {
         match active.group_lag(group).await {
-            Ok(Some(lag)) => {
-                metrics::gauge!(
-                    common::metrics::metric_name("movement_relay_stream_lag"),
-                    "group" => group
-                )
-                .set(lag as f64);
-            }
+            Ok(Some(lag)) => sample.group_lags.push((group, lag)),
             Ok(None) => {} // group doesn't exist yet -- nothing to report.
             Err(err) => {
                 tracing::warn!(error = ?err, group, "stream_lag_loop: failed to fetch XINFO GROUPS");
             }
         }
     }
+    sample
 }
 
 /// `XINFO GROUPS movement-events`'s `lag` field for one named group --
@@ -662,6 +718,8 @@ mod tests {
         /// proves a group was queried, not merely that the fake knows a lag
         /// value for it.
         queried: Vec<&'static str>,
+        /// `None` makes `stream_len` fail, modelling an `XLEN` error.
+        stream_len: Option<u64>,
     }
 
     // `LagConnection::connect` is an associated function (no `&self`), so it
@@ -691,6 +749,7 @@ mod tests {
             Ok(Self {
                 lag_by_group,
                 queried: Vec::new(),
+                stream_len: Some(282),
             })
         }
 
@@ -702,6 +761,11 @@ mod tests {
                 .expect("test only ever queries groups from STREAM_LAG_GROUPS");
             self.queried.push(owned);
             Ok(self.lag_by_group.get(group).copied())
+        }
+
+        async fn stream_len(&mut self) -> anyhow::Result<u64> {
+            self.stream_len
+                .ok_or_else(|| anyhow::anyhow!("simulated XLEN failure"))
         }
     }
 
@@ -761,6 +825,87 @@ mod tests {
             STREAM_LAG_GROUPS.to_vec(),
             "every group in STREAM_LAG_GROUPS -- trust-event-backlog included -- \
              must actually be queried in one tick, not just the first two"
+        );
+    }
+
+    /// A tick reports the stream's length alongside every group's lag --
+    /// the length/cap gauges the chart's lag alerts divide by.
+    #[tokio::test]
+    async fn a_connected_tick_reports_stream_length_and_every_group_lag() {
+        CONNECT_FAILURES_REMAINING.with(|c| c.set(0));
+        let mut conn: Option<FakeLagConnection> = None;
+
+        let sample = run_lag_tick("redis://fake", &mut conn).await;
+
+        assert_eq!(
+            sample,
+            LagSample {
+                stream_length: Some(282),
+                group_lags: vec![
+                    ("trust-consumer", 5),
+                    ("full-coverage-consumer", 7),
+                    ("trust-event-backlog", 9),
+                ],
+            }
+        );
+    }
+
+    /// An `XLEN` failure must not cost the tick its lag readings.
+    #[tokio::test]
+    async fn an_xlen_failure_still_reports_group_lag() {
+        CONNECT_FAILURES_REMAINING.with(|c| c.set(0));
+        let mut conn: Option<FakeLagConnection> = None;
+        run_lag_tick("redis://fake", &mut conn).await;
+        conn.as_mut().expect("connected").stream_len = None;
+
+        let sample = run_lag_tick("redis://fake", &mut conn).await;
+
+        assert_eq!(sample.stream_length, None);
+        assert_eq!(sample.group_lags.len(), 3);
+    }
+
+    /// No connection this tick: nothing observed, so nothing to report
+    /// (the configured cap is still published by `publish_lag_sample`).
+    #[tokio::test]
+    async fn a_failed_connect_reports_an_empty_sample() {
+        CONNECT_FAILURES_REMAINING.with(|c| c.set(1));
+        let mut conn: Option<FakeLagConnection> = None;
+
+        let sample = run_lag_tick("redis://fake", &mut conn).await;
+
+        assert_eq!(sample, LagSample::default());
+    }
+
+    /// The chart's PrometheusRule (charts/distant-signal/templates/
+    /// prometheusrule.yaml) references these exact names; renaming one
+    /// silently breaks an alert.
+    #[test]
+    fn stream_gauge_names_match_the_chart_alert_rules() {
+        assert_eq!(
+            common::metrics::metric_name(STREAM_LAG_METRIC),
+            "distant_signal_movement_relay_stream_lag"
+        );
+        assert_eq!(
+            common::metrics::metric_name(STREAM_LENGTH_METRIC),
+            "distant_signal_movement_relay_stream_length"
+        );
+        assert_eq!(
+            common::metrics::metric_name(STREAM_MAXLEN_METRIC),
+            "distant_signal_movement_relay_stream_maxlen"
+        );
+    }
+
+    /// `publish_lag_sample` must be callable without a recorder installed
+    /// (the `metrics` macros are no-ops then) -- guards against a panic in
+    /// the tick path when `--metrics-enabled` is off.
+    #[test]
+    fn publishing_a_sample_without_a_recorder_is_a_no_op() {
+        publish_lag_sample(
+            &LagSample {
+                stream_length: Some(1),
+                group_lags: vec![("trust-consumer", 1)],
+            },
+            1_048_576,
         );
     }
 }
