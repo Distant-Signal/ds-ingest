@@ -77,6 +77,21 @@ pub async fn post_full_coverage_stats(
     common::ingest::post_batch(client, url, tokens, rows, "full-coverage line stats").await
 }
 
+/// `POST /private/full-coverage-window-stats` -- one batch per stats write
+/// (every line's `recent` and `day_to_date` window). Only called with
+/// `FULL_COVERAGE_WINDOWED_STATS=true`.
+pub async fn post_full_coverage_window_stats(
+    client: &reqwest::Client,
+    url: &str,
+    tokens: &common::oauth_client::OAuthTokenCache,
+    rows: &[common::FullCoverageWindowStatsRow],
+) -> anyhow::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    common::ingest::post_batch(client, url, tokens, rows, "full-coverage window stats").await
+}
+
 /// Posts to the OTHER chain's own endpoint (`POST /private/station-full-coverage-samples`),
 /// owned by `docs/superpowers/plans/2026-09-04-per-station-full-coverage-stats-plan.md`
 /// -- this crate is only ever an HTTP client of it, never its

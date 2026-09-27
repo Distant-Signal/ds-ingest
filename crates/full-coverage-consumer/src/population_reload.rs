@@ -18,12 +18,13 @@
 //! is retried on a short, doubling backoff instead of the full interval --
 //! the same idea as the stanox/crs reload's `failed_reload_retry_delay`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 
-use crate::population::{Population, UidOnly};
+use crate::population::{LineGeometry, Population};
 use crate::queries;
 
 /// The current population snapshot, swapped whole by the reloader.
@@ -31,6 +32,10 @@ pub type SharedPopulation = Arc<ArcSwap<Population>>;
 /// The shadow line ids the reloader fetches, refreshed by the consume
 /// loop's stanox/crs reload.
 pub type SharedLineIds = Arc<ArcSwap<Vec<String>>>;
+/// line_id -> [`LineGeometry`], refreshed by the stanox/crs reload. Empty
+/// while `FULL_COVERAGE_WINDOWED_STATS` is off, so no trains are reduced
+/// (the population is then exactly what it was before windowed stats).
+pub type SharedGeometry = Arc<ArcSwap<HashMap<String, Arc<LineGeometry>>>>;
 
 /// What one reload cycle achieved.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -69,6 +74,7 @@ pub async fn reload_cycle(
     url: &str,
     tokens: &common::oauth_client::OAuthTokenCache,
     line_ids: &[String],
+    geometry: &HashMap<String, Arc<LineGeometry>>,
     previous: &Population,
     service_date: chrono::NaiveDate,
 ) -> (Population, CycleOutcome) {
@@ -80,7 +86,10 @@ pub async fn reload_cycle(
             // The ETag of what we already hold for this key, if `api` sent
             // one: an unchanged population then costs a bodyless 304
             // instead of a full re-download. See `Population::etags`.
-            let if_none_match = previous.etag_for(line_id, date);
+            // ...unless the line's geometry changed since that population
+            // was reduced: it must then be downloaded and reduced again.
+            let geometry_hash = geometry.get(line_id).map_or(0, |g| g.hash);
+            let if_none_match = previous.etag_if_current(line_id, date, geometry_hash);
             match queries::fetch_line_population(client, url, tokens, line_id, date, if_none_match)
                 .await
             {
@@ -103,17 +112,19 @@ pub async fn reload_cycle(
                         "result" => "fetched"
                     )
                     .increment(1);
-                    // Straight from the body text into uids only -- no
-                    // `serde_json::Value` tree and no calling points (see
-                    // `UidOnly`). The body is dropped as soon as it is
-                    // parsed, so a cold start holds at most one line's wire
-                    // payload at a time.
-                    let parsed = serde_json::from_str::<Option<Vec<UidOnly>>>(&body);
+                    // Straight from the body text, one entry at a time,
+                    // into uids and (with a geometry) reduced trains -- no
+                    // `serde_json::Value` tree and no calling points kept
+                    // (see `population::parse_line_population`, which also
+                    // leaves rail-replacement buses and ships out). The body
+                    // is dropped as soon as it is parsed, so a cold start
+                    // holds at most one line's wire payload at a time.
+                    let geometry = geometry.get(line_id).map(Arc::as_ref);
+                    let parsed = crate::population::parse_line_population(&body, geometry, date);
                     drop(body);
                     match parsed {
-                        Ok(Some(entries)) => {
-                            let uids = entries.into_iter().map(|e| e.uid).collect();
-                            next.insert_uids(line_id, date, uids, etag);
+                        Ok(Some(pop)) => {
+                            next.insert_line_pop(line_id, date, pop, etag);
                             outcome.succeeded += 1;
                         }
                         Ok(None) => {
@@ -166,6 +177,7 @@ pub struct Reloader {
     pub url: String,
     pub tokens: Arc<common::oauth_client::OAuthTokenCache>,
     pub line_ids: SharedLineIds,
+    pub geometry: SharedGeometry,
     pub population: SharedPopulation,
     /// Wait after a cycle in which every fetch succeeded.
     pub interval: Duration,
@@ -200,6 +212,7 @@ impl Reloader {
         loop {
             let service_date = crate::stats::current_rail_service_date(chrono::Utc::now());
             let line_ids = self.line_ids.load_full();
+            let geometry = self.geometry.load_full();
             let previous = self.population.load_full();
             let cycle_start = std::time::Instant::now();
             let (next, outcome) = reload_cycle(
@@ -207,6 +220,7 @@ impl Reloader {
                 &self.url,
                 &self.tokens,
                 &line_ids,
+                &geometry,
                 &previous,
                 service_date,
             )
@@ -364,8 +378,16 @@ pub(crate) mod tests {
         let mut population = Population::default();
 
         for _ in 0..2 {
-            let (next, outcome) =
-                reload_cycle(&client, &url(&server), &tokens, &lines, &population, today).await;
+            let (next, outcome) = reload_cycle(
+                &client,
+                &url(&server),
+                &tokens,
+                &lines,
+                &HashMap::new(),
+                &population,
+                today,
+            )
+            .await;
             assert!(outcome.failed.is_empty());
             population = next;
             for date in [today, tomorrow] {
@@ -379,6 +401,78 @@ pub(crate) mod tests {
                 );
             }
         }
+        server.verify().await;
+    }
+
+    /// When a line's geometry changes (a stanox/crs reload changed its
+    /// TIPLOCs), its held population was reduced against the old one: the
+    /// next cycle must download it again, not accept a `304`.
+    #[tokio::test]
+    async fn a_geometry_change_forces_a_refetch_instead_of_a_304() {
+        let server = MockServer::start().await;
+        let tokens = mock_token_cache(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/private/schedule-line-population"))
+            .and(header("if-none-match", "\"slp-7\""))
+            .respond_with(ResponseTemplate::new(304).insert_header("etag", "\"slp-7\""))
+            .with_priority(1)
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/private/schedule-line-population"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"slp-7\"")
+                    .set_body_string(BODY),
+            )
+            .with_priority(2)
+            .expect(4)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let lines = vec!["waterloo-reading".to_string()];
+        let today: chrono::NaiveDate = "2026-09-04".parse().unwrap();
+        let geometry = |tiplocs: &[&str]| {
+            let g = LineGeometry::new(
+                tiplocs
+                    .iter()
+                    .map(|t| (t.to_string(), t.to_string()))
+                    .collect(),
+                Default::default(),
+            );
+            let mut map = HashMap::new();
+            map.insert("waterloo-reading".to_string(), Arc::new(g));
+            map
+        };
+        let before = geometry(&["WATRLMN", "RDNGSTN"]);
+        let after = geometry(&["WATRLMN", "RDNGSTN", "WOKING"]);
+
+        let mut population = Population::default();
+        // Cycle 1: download. Cycle 2: same geometry, 304s. Cycle 3: the
+        // geometry changed, so both dates are downloaded again.
+        for g in [&before, &before, &after] {
+            let (next, outcome) = reload_cycle(
+                &client,
+                &url(&server),
+                &tokens,
+                &lines,
+                g,
+                &population,
+                today,
+            )
+            .await;
+            assert!(outcome.failed.is_empty());
+            population = next;
+        }
+        assert_eq!(
+            population
+                .line_pop("waterloo-reading", today)
+                .unwrap()
+                .geometry_hash,
+            after["waterloo-reading"].hash
+        );
         server.verify().await;
     }
 
@@ -402,8 +496,16 @@ pub(crate) mod tests {
         let mut population = Population::default();
 
         for _ in 0..2 {
-            let (next, _) =
-                reload_cycle(&client, &url(&server), &tokens, &lines, &population, today).await;
+            let (next, _) = reload_cycle(
+                &client,
+                &url(&server),
+                &tokens,
+                &lines,
+                &HashMap::new(),
+                &population,
+                today,
+            )
+            .await;
             population = next;
             assert_eq!(
                 population.uids_for("waterloo-reading", today),
@@ -412,6 +514,56 @@ pub(crate) mod tests {
             assert_eq!(population.etag_for("waterloo-reading", today), None);
         }
         server.verify().await;
+    }
+
+    /// Regression test: a rail-replacement bus (`train_status` `5`) or a
+    /// ship in the published population is left out, so it can no longer
+    /// count as a cancellation; a train, and an entry published without a
+    /// status (an older `schedule-reference`), are kept.
+    #[tokio::test]
+    async fn buses_and_ships_are_left_out_of_the_population() {
+        let server = MockServer::start().await;
+        let tokens = mock_token_cache(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/private/schedule-line-population"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[{"uid": "C11052", "calling_points": [], "train_status": "P", "operator_atoc": "SW"},
+                    {"uid": "B00001", "calling_points": [], "train_status": "5", "operator_atoc": "SW"},
+                    {"uid": "B00002", "calling_points": [], "train_status": "B"},
+                    {"uid": "S00001", "calling_points": [], "train_status": "S"},
+                    {"uid": "C22222", "calling_points": []}]"#,
+            ))
+            .mount(&server)
+            .await;
+        let today: chrono::NaiveDate = "2026-09-04".parse().unwrap();
+        let (next, outcome) = reload_cycle(
+            &reqwest::Client::new(),
+            &url(&server),
+            &tokens,
+            &["waterloo-reading".to_string()],
+            &HashMap::new(),
+            &Population::default(),
+            today,
+        )
+        .await;
+        assert!(outcome.failed.is_empty());
+        let mut uids = next.uids_for("waterloo-reading", today);
+        uids.sort_unstable();
+        assert_eq!(uids, vec!["C11052", "C22222"]);
+
+        let row = crate::stats::build_line_row(
+            "waterloo-reading",
+            today,
+            &uids,
+            &std::collections::HashMap::new(),
+            true,
+            false,
+            &common::Defaults::default(),
+        );
+        assert_eq!(
+            row.stats.total, 2,
+            "the buses are not in the closed-day row"
+        );
     }
 
     /// A failed fetch keeps the previous snapshot for that key -- a
@@ -434,6 +586,8 @@ pub(crate) mod tests {
             vec![schedule_query::LinePopulationEntry {
                 uid: "C11052".to_string(),
                 calling_points: vec![],
+                operator_atoc: None,
+                train_status: None,
             }],
         );
         let lines = vec!["waterloo-reading".to_string()];
@@ -442,6 +596,7 @@ pub(crate) mod tests {
             &url(&server),
             &tokens,
             &lines,
+            &HashMap::new(),
             &previous,
             today,
         )
@@ -467,6 +622,7 @@ pub(crate) mod tests {
             line_ids: Arc::new(ArcSwap::from_pointee(
                 lines.iter().map(|l| l.to_string()).collect(),
             )),
+            geometry: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             population: Arc::clone(&population),
             interval: Duration::from_secs(3600),
             min_retry: Duration::from_millis(20),

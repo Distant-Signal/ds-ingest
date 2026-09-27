@@ -93,6 +93,63 @@ ORDER BY service_date DESC;
 An upsert skips a row whose values have not changed. `updated_at` is
 therefore the time the row last changed, not the time it was last posted.
 
+## Windowed stats (2026-09-27)
+
+Design: `docs/superpowers/specs/2026-09-27-full-coverage-windowed-stats-design.md`
+(read its "Decisions (2026-09-27)" section first). Everything below is **off
+by default**; with the defaults the consumer and aggregator behave exactly as
+before.
+
+| Setting | Where | Default | Effect |
+| --- | --- | --- | --- |
+| `FULL_COVERAGE_WINDOWED_STATS` (`fullCoverageConsumer.windowedStats.enabled`) | consumer | `false` | `true`: per-train state, `recent`/`day_to_date` window POSTs every minute, `stats_version` 2 rows. |
+| `FULL_COVERAGE_RECENT_WINDOW_MINUTES` / `FULL_COVERAGE_GRACE_MINUTES` | consumer | 60 / 10 | `recent` covers trains due in `(now-10-60, now-10]`. |
+| `FULL_COVERAGE_ACTIVATIONS_MIN` / `FULL_COVERAGE_FEED_STALE_SECS` | consumer | 20 / 300 | Feed health: fewer Activations in the last hour, or a newest event older than this, marks the write `feed_stale` (no severity, no presumed cancellations). |
+| `FULL_COVERAGE_WINDOW_MODE` (`aggregator.fullCoverageWindow.mode`) | aggregator | `off` | `shadow`: record a verdict per line in `full_coverage_window_verdicts`, change nothing. `enforce`: also escalate allow-listed lines. |
+| `FULL_COVERAGE_WINDOW_ENFORCE_LINES` | aggregator | empty | Lines `enforce` may change (comma list, or `*`). Empty: nothing is enforced until lines are named. |
+| `FULL_COVERAGE_WINDOW_MIN_ESCALATION_RANK` | aggregator | 4 | Only Severe Delays / Part Suspended are enforced. Minor Delays / Reduced Service are recorded as `would_escalate_to` with `below_min_rank`. |
+| `FULL_COVERAGE_WINDOW_STATS_RETENTION_DAYS` | aggregator | 14 | Prunes both window tables, in every mode. |
+| `full_coverage_delay_threshold_minutes` / `full_coverage_min_sample_size` / `full_coverage_min_affected` | `Defaults`, per line via `severity_overrides` | 3 / 6 / 3 | Delayed = 3+ minutes late at the train's first report on the line; a window needs 6 evaluable trains and a tier 3 affected trains. |
+
+**Rollout.** Deploy `schedule-reference` and `api` first (the population then
+carries `operator_atoc`/`train_status`, and the route and migrations exist),
+then turn on the consumer flag, then `shadow` for at least 7 days including a
+weekend, then `enforce` with about five pilot lines of different volumes.
+Rollback at any stage: `FULL_COVERAGE_WINDOW_MODE=off`.
+
+**Evidence.** `compare_full_coverage --windows --all-lines --days 7 [--csv DIR]`
+reports bucket health, the would-escalate log (enforced tier vs lower tiers),
+the comparison with LDBWS, the closed-day audit rows, the aggregator's own
+verdicts, and per-line volume with suggested pilot lines.
+
+**Expect more "delayed" trains than the design measured.** It measured at 5
+minutes; the threshold is 3.
+
+**Version skew.** An older `api` answers the window POST with 404: counted in
+`full_coverage_consumer_errors_total{operation="post_window_stats"}` and
+logged at most every 10 minutes. A population from an older
+`schedule-reference` reads `relevance = 'stops_only'`: no presumed
+cancellations for that line and date.
+
+**Metrics** (windowed): `full_coverage_consumer_window_rows_posted_total`,
+`full_coverage_consumer_window_feed_stale` (gauge),
+`full_coverage_consumer_window_presumed_cancelled` and
+`full_coverage_consumer_pending_trains` (gauges over the last write's
+`recent` windows), `full_coverage_consumer_parked_messages` (0002/0005/0006
+waiting for their Activation), `full_coverage_consumer_unattributed_total{msg_type}`
+(given up at the rollover); aggregator
+`aggregator_full_coverage_window_verdicts_total{verdict}`,
+`aggregator_full_coverage_window_escalations_total{severity,mode,below_min_rank}`,
+`aggregator_full_coverage_window_stats_pruned_total`.
+
+**Fixes in the legacy row (all modes).** A late train's delay now comes
+from `timetable_variation` (`delayed` was always 0); a train cancelled before
+it moved is counted cancelled; the next day's Activations survive the
+rollover and a restart (the replay starts 6 h before the rail day and applies
+only that day's Activations from the lookback); rail-replacement buses and
+ships are left out of the population once `schedule-reference` publishes
+`train_status`.
+
 ## Metrics
 
 Every name has the usual `distant_signal_` prefix.

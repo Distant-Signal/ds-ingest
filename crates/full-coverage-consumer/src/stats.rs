@@ -99,6 +99,8 @@ pub fn build_line_row(
         .to_string(),
         stats,
         partial,
+        breakdown: None,
+        stats_version: None,
     }
 }
 

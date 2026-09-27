@@ -634,6 +634,7 @@ mod tests {
             loc_stanox: loc_stanox.map(str::to_string),
             toc_id: None,
             variation_status: variation_status.map(str::to_string),
+            timetable_variation: None,
         }
     }
 
@@ -739,6 +740,8 @@ mod tests {
     fn a_change_of_origin_is_always_dropped() {
         let message = TrustMessage::ChangeOfOrigin(trust_schema::schema::ChangeOfOrigin {
             train_id: "221832406".to_string(),
+            dep_timestamp: None,
+            loc_stanox: None,
         });
         let mut state = ProcessorState::default();
         let result = process_message(
@@ -1022,6 +1025,7 @@ mod tests {
             loc_stanox: Some("87212".to_string()),
             toc_id: None,
             variation_status: Some("ON TIME".to_string()),
+            timetable_variation: None,
         });
         let mut state = ProcessorState::default();
         // Deliberately a THIRD, unrelated date from both `today` and the
@@ -1061,6 +1065,7 @@ mod tests {
             loc_stanox: Some("87212".to_string()),
             toc_id: None,
             variation_status: Some("ON TIME".to_string()),
+            timetable_variation: None,
         });
         let mut state = ProcessorState::default();
         let result = process_message(
@@ -1228,6 +1233,8 @@ mod tests {
             canx_timestamp: Some("1787941920000".to_string()),
             canx_reason_code: None,
             canx_type: None,
+            dep_timestamp: None,
+            loc_stanox: None,
         });
         let mut state = ProcessorState::default();
         let result = process_message(
@@ -1259,6 +1266,8 @@ mod tests {
             canx_timestamp: Some("1788568200000".to_string()),
             canx_reason_code: None,
             canx_type: None,
+            dep_timestamp: None,
+            loc_stanox: None,
         });
         let mut state = ProcessorState::default();
         let unrelated_today: NaiveDate = "2026-09-01".parse().unwrap();
@@ -1288,6 +1297,8 @@ mod tests {
             canx_timestamp: None,
             canx_reason_code: None,
             canx_type: None,
+            dep_timestamp: None,
+            loc_stanox: None,
         });
         let mut state = ProcessorState::default();
         let result = process_message(
@@ -1315,6 +1326,8 @@ mod tests {
             canx_timestamp: None,
             canx_reason_code: None,
             canx_type: Some("AT ORIGIN".to_string()),
+            dep_timestamp: None,
+            loc_stanox: None,
         });
         let mut state = ProcessorState::default();
         let august = process_message(
@@ -1347,6 +1360,8 @@ mod tests {
             canx_timestamp: Some("1787941920000".to_string()),
             canx_reason_code: None,
             canx_type: None,
+            dep_timestamp: None,
+            loc_stanox: None,
         });
         let mut state = ProcessorState::default();
         let first = process_message(
@@ -1386,6 +1401,8 @@ mod tests {
             canx_timestamp: Some("1787941920000".to_string()),
             canx_reason_code: None,
             canx_type: None,
+            dep_timestamp: None,
+            loc_stanox: None,
         });
         // A later, genuinely different real-world cancellation for the SAME
         // train on the SAME rail day -- e.g. after a Reinstatement -- must
@@ -1395,6 +1412,8 @@ mod tests {
             canx_timestamp: Some("1787945520000".to_string()),
             canx_reason_code: None,
             canx_type: None,
+            dep_timestamp: None,
+            loc_stanox: None,
         });
         let mut state = ProcessorState::default();
         let first = process_message(
@@ -1428,6 +1447,7 @@ mod tests {
     fn a_reinstatement_is_recorded_into_the_backlog() {
         let reinstatement = TrustMessage::Reinstatement(trust_schema::schema::Reinstatement {
             train_id: "221832406".to_string(),
+            dep_timestamp: None,
         });
         let mut state = ProcessorState::default();
         let result = process_message(

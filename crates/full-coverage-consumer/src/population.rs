@@ -8,17 +8,356 @@ use std::sync::Arc;
 #[cfg(test)]
 use schedule_query::LinePopulationEntry;
 
-/// One `schedule-line-population` wire entry, reduced to the only field
-/// this crate reads. Deserializing into this instead of
-/// `schedule_query::LinePopulationEntry` skips each entry's
-/// `calling_points` array without building it (serde ignores unknown
-/// fields): the largest production line (3,357 entries, ~22 calling points
-/// each, 21 MB of JSON on 2026-09-27) used to be materialized in full --
-/// every `CallingPoint` of every entry -- just to take the uids and drop
-/// the rest. Now a line costs its body text plus its uids.
-#[derive(Debug, serde::Deserialize)]
-pub struct UidOnly {
-    pub uid: String,
+/// Whether a line's population for a date could apply the full relevance
+/// filter (windowed stats design section 4.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Relevance {
+    /// The population carried `operator_atoc`/`train_status`: buses and
+    /// ships are out, and a train must be run by one of the line's
+    /// operators and call at two of its stations.
+    Full,
+    /// An older `schedule-reference` published neither field: only the
+    /// two-stations rule applies, and buses cannot be told apart, so
+    /// presumed cancellation is off for the line and date.
+    #[default]
+    StopsOnly,
+}
+
+impl Relevance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Relevance::Full => "full",
+            Relevance::StopsOnly => "stops_only",
+        }
+    }
+}
+
+/// One relevant train of a line, reduced to what the windowed stats need:
+/// all times are UTC minutes since the Unix epoch. No calling points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineTrain {
+    pub uid: Box<str>,
+    /// First booked call at a station of the line (departure, else
+    /// arrival): when the train is "due" on it.
+    pub due_min: u32,
+    /// Last booked call at a station of the line.
+    pub last_due_min: u32,
+    /// The schedule's origin departure.
+    pub origin_dep_min: u32,
+}
+
+/// One line's population for one service date.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LinePop {
+    /// Every UID except buses and ships -- movement matching and the
+    /// legacy (flag-off) row, unchanged semantics.
+    pub uids: HashSet<String>,
+    /// The relevant trains (section 4.1), sorted by `due_min`. Empty
+    /// unless the line's geometry was known when the population was parsed
+    /// (only with `FULL_COVERAGE_WINDOWED_STATS=true`).
+    pub trains: Vec<LineTrain>,
+    pub relevance: Relevance,
+    /// [`LineGeometry::hash`] the trains were reduced with (0: none). A
+    /// reload re-fetches unconditionally when the line's geometry has
+    /// changed since, rather than accepting a `304` for trains reduced
+    /// against the old one.
+    pub geometry_hash: u64,
+    /// Buses and ships left out.
+    pub buses_excluded: u32,
+}
+
+/// What a line's population is reduced against: its stations' TIPLOCs
+/// (resolved through the same `stanox_crs` crosswalk as
+/// [`build_tiploc_index`]) and its operators.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LineGeometry {
+    /// Bare TIPLOC -> CRS, for the line's stations.
+    pub crs_by_tiploc: HashMap<String, String>,
+    pub operators: HashSet<String>,
+    /// Stable fingerprint of the two fields above.
+    pub hash: u64,
+}
+
+impl LineGeometry {
+    pub fn new(crs_by_tiploc: HashMap<String, String>, operators: HashSet<String>) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut pairs: Vec<(&String, &String)> = crs_by_tiploc.iter().collect();
+        pairs.sort();
+        let mut ops: Vec<&String> = operators.iter().collect();
+        ops.sort();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        pairs.hash(&mut hasher);
+        ops.hash(&mut hasher);
+        // Never 0, which means "no geometry".
+        let hash = hasher.finish().max(1);
+        Self {
+            crs_by_tiploc,
+            operators,
+            hash,
+        }
+    }
+}
+
+/// line_id -> its geometry, rebuilt on every stanox/crs reload.
+pub fn build_line_geometry(
+    lines: &[common::LineDefinition],
+    stanox_crs_records: &[common::StanoxCrsRecord],
+) -> HashMap<String, Arc<LineGeometry>> {
+    let crs_to_tiploc = crs_to_tiploc_map(stanox_crs_records);
+    lines
+        .iter()
+        .map(|line| {
+            let mut crs_by_tiploc = HashMap::new();
+            for station in &line.stations {
+                let crs = station.crs.to_uppercase();
+                for tiploc in crs_to_tiploc.get(&crs).into_iter().flatten() {
+                    crs_by_tiploc.insert(
+                        schedule_query::normalize_tiploc(tiploc).to_string(),
+                        crs.clone(),
+                    );
+                }
+            }
+            let operators = line.operators.iter().cloned().collect();
+            (
+                line.id.clone(),
+                Arc::new(LineGeometry::new(crs_by_tiploc, operators)),
+            )
+        })
+        .collect()
+}
+
+#[derive(serde::Deserialize)]
+struct CallingPointLite {
+    tiploc: String,
+    #[serde(default)]
+    booked_arrival: Option<chrono::NaiveTime>,
+    #[serde(default)]
+    booked_departure: Option<chrono::NaiveTime>,
+    #[serde(default)]
+    day_offset: u8,
+}
+
+/// One `schedule-line-population` wire entry, reduced on the spot -- see
+/// [`parse_line_population`]. `calling_points` is only deserialized when a
+/// geometry is given (serde skips it otherwise).
+#[derive(serde::Deserialize)]
+struct EntryLite {
+    uid: String,
+    #[serde(default)]
+    calling_points: Vec<CallingPointLite>,
+    #[serde(default)]
+    operator_atoc: Option<String>,
+    #[serde(default)]
+    train_status: Option<char>,
+}
+
+#[derive(serde::Deserialize)]
+struct EntryUidOnly {
+    uid: String,
+    #[serde(default)]
+    train_status: Option<char>,
+}
+
+struct Candidate {
+    train: LineTrain,
+    operator_ok: bool,
+}
+
+struct LinePopBuilder<'a> {
+    geometry: Option<&'a LineGeometry>,
+    date: chrono::NaiveDate,
+    pop: LinePop,
+    candidates: Vec<Candidate>,
+    saw_schedule_facts: bool,
+}
+
+fn utc_minutes(date: chrono::NaiveDate, day_offset: u8, time: chrono::NaiveTime) -> u32 {
+    let date = date + chrono::Duration::days(i64::from(day_offset));
+    let instant = common::rail_day::london_to_utc(date, time);
+    u32::try_from(instant.timestamp().div_euclid(60)).unwrap_or(0)
+}
+
+impl<'a> LinePopBuilder<'a> {
+    fn new(geometry: Option<&'a LineGeometry>, date: chrono::NaiveDate) -> Self {
+        Self {
+            geometry,
+            date,
+            pop: LinePop {
+                geometry_hash: geometry.map_or(0, |g| g.hash),
+                ..LinePop::default()
+            },
+            candidates: Vec::new(),
+            saw_schedule_facts: false,
+        }
+    }
+
+    /// Returns `false` for a bus or ship, which is left out entirely.
+    fn admit(&mut self, uid: &str, train_status: Option<char>, has_operator: bool) -> bool {
+        self.saw_schedule_facts |= train_status.is_some() || has_operator;
+        if schedule_query::is_bus_or_ship(train_status) {
+            self.pop.buses_excluded += 1;
+            return false;
+        }
+        self.pop.uids.insert(uid.to_string());
+        true
+    }
+
+    fn add(&mut self, entry: EntryLite) {
+        if !self.admit(
+            &entry.uid,
+            entry.train_status,
+            entry.operator_atoc.is_some(),
+        ) {
+            return;
+        }
+        let Some(geometry) = self.geometry else {
+            return;
+        };
+        let mut first: Option<u32> = None;
+        let mut last: Option<u32> = None;
+        let mut stations: Vec<&str> = Vec::new();
+        for cp in &entry.calling_points {
+            let tiploc = schedule_query::normalize_tiploc(&cp.tiploc);
+            let Some(crs) = geometry.crs_by_tiploc.get(tiploc) else {
+                continue;
+            };
+            let Some(time) = cp.booked_departure.or(cp.booked_arrival) else {
+                continue; // a pass, not a call
+            };
+            let minutes = utc_minutes(self.date, cp.day_offset, time);
+            first.get_or_insert(minutes);
+            last = Some(minutes);
+            if !stations.contains(&crs.as_str()) {
+                stations.push(crs);
+            }
+        }
+        let (Some(due_min), Some(last_due_min)) = (first, last) else {
+            return;
+        };
+        if stations.len() < 2 {
+            return;
+        }
+        let origin_dep_min = entry
+            .calling_points
+            .first()
+            .and_then(|cp| {
+                cp.booked_departure
+                    .or(cp.booked_arrival)
+                    .map(|t| utc_minutes(self.date, cp.day_offset, t))
+            })
+            .unwrap_or(due_min);
+        let operator_ok = geometry.operators.is_empty()
+            || entry
+                .operator_atoc
+                .as_deref()
+                .is_some_and(|op| geometry.operators.contains(op));
+        self.candidates.push(Candidate {
+            train: LineTrain {
+                uid: entry.uid.into_boxed_str(),
+                due_min,
+                last_due_min,
+                origin_dep_min,
+            },
+            operator_ok,
+        });
+    }
+
+    fn finish(mut self) -> LinePop {
+        self.pop.relevance = if self.saw_schedule_facts {
+            Relevance::Full
+        } else {
+            Relevance::StopsOnly
+        };
+        let full = self.pop.relevance == Relevance::Full;
+        self.pop.trains = self
+            .candidates
+            .into_iter()
+            .filter(|c| !full || c.operator_ok)
+            .map(|c| c.train)
+            .collect();
+        self.pop.trains.sort_by_key(|t| t.due_min);
+        self.pop.trains.shrink_to_fit();
+        self.pop
+    }
+}
+
+struct PopulationSeed<'a> {
+    geometry: Option<&'a LineGeometry>,
+    date: chrono::NaiveDate,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for PopulationSeed<'_> {
+    type Value = Option<LinePop>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_option(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for PopulationSeed<'_> {
+    type Value = Option<LinePop>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("null or an array of line-population entries")
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut builder = LinePopBuilder::new(self.geometry, self.date);
+        if self.geometry.is_some() {
+            while let Some(entry) = seq.next_element::<EntryLite>()? {
+                builder.add(entry);
+            }
+        } else {
+            // No geometry (the windowed flag off): read uids and status only,
+            // skipping every calling point -- the pre-2026-09-27 cost.
+            while let Some(entry) = seq.next_element::<EntryUidOnly>()? {
+                builder.admit(&entry.uid, entry.train_status, false);
+            }
+        }
+        Ok(Some(builder.finish()))
+    }
+}
+
+/// Parses one `schedule-line-population` body straight into a [`LinePop`],
+/// one entry at a time: each entry's calling points are reduced to a
+/// [`LineTrain`] (or nothing) and dropped as soon as they are read, so a
+/// line never costs more than its body text plus its reduced trains
+/// (2026-09-26/27 memory fixes). `Ok(None)` for a `null` body (nothing
+/// published yet).
+///
+/// Rail-replacement buses (`B`/`5`) and ships (`S`/`4`) are left out
+/// entirely: TRUST never reports them, so they read as cancellations all
+/// day (882 of the 891 population UIDs with no TRUST message at all on
+/// 2026-09-26). A population published without `train_status` (an older
+/// `schedule-reference`) keeps every entry, and reads `StopsOnly`.
+pub fn parse_line_population(
+    body: &str,
+    geometry: Option<&LineGeometry>,
+    date: chrono::NaiveDate,
+) -> serde_json::Result<Option<LinePop>> {
+    use serde::de::DeserializeSeed;
+    let mut deserializer = serde_json::Deserializer::from_str(body);
+    let pop = PopulationSeed { geometry, date }.deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(pop)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -36,7 +375,7 @@ pub struct Population {
     /// it replaces (a `304` just carries the old `Arc` over) instead of
     /// deep-copying the population on every cycle -- see
     /// `population_reload`.
-    by_line: HashMap<String, HashMap<chrono::NaiveDate, Arc<HashSet<String>>>>,
+    by_line: HashMap<String, HashMap<chrono::NaiveDate, Arc<LinePop>>>,
     /// `(line_id, service_date)` -> the `ETag` `api` sent with the
     /// population currently held in `by_line` for that key, if it sent one.
     ///
@@ -119,10 +458,8 @@ impl Population {
         self.insert_uids(line_id, service_date, uids, etag);
     }
 
-    /// Stores `(line_id, service_date)`'s uid set and the `ETag` it arrived
-    /// with (`None` clears any previous one -- the new data is no longer
-    /// described by it). What the reload calls, with uids parsed straight
-    /// off the wire by [`UidOnly`].
+    /// Stores `(line_id, service_date)`'s uid set alone (no trains).
+    #[cfg(test)]
     pub fn insert_uids(
         &mut self,
         line_id: &str,
@@ -130,10 +467,32 @@ impl Population {
         uids: HashSet<String>,
         etag: Option<String>,
     ) {
+        self.insert_line_pop(
+            line_id,
+            service_date,
+            LinePop {
+                uids,
+                ..LinePop::default()
+            },
+            etag,
+        );
+    }
+
+    /// Stores `(line_id, service_date)`'s population and the `ETag` it
+    /// arrived with (`None` clears any previous one -- the new data is no
+    /// longer described by it). What the reload calls, with the population
+    /// parsed straight off the wire by [`parse_line_population`].
+    pub fn insert_line_pop(
+        &mut self,
+        line_id: &str,
+        service_date: chrono::NaiveDate,
+        pop: LinePop,
+        etag: Option<String>,
+    ) {
         self.by_line
             .entry(line_id.to_string())
             .or_default()
-            .insert(service_date, Arc::new(uids));
+            .insert(service_date, Arc::new(pop));
         let key = (line_id.to_string(), service_date);
         match etag {
             Some(etag) => {
@@ -152,6 +511,34 @@ impl Population {
         self.etags
             .get(&(line_id.to_string(), service_date))
             .map(String::as_str)
+    }
+
+    /// [`Population::etag_for`], but only while the held population was
+    /// reduced against `geometry_hash` -- after a line's stations or
+    /// operators change, its population must be downloaded and reduced
+    /// again, not revalidated.
+    pub fn etag_if_current(
+        &self,
+        line_id: &str,
+        service_date: chrono::NaiveDate,
+        geometry_hash: u64,
+    ) -> Option<&str> {
+        let held = self.line_pop(line_id, service_date)?;
+        if held.geometry_hash != geometry_hash {
+            return None;
+        }
+        self.etag_for(line_id, service_date)
+    }
+
+    /// `(line_id, service_date)`'s population, if held.
+    pub fn line_pop(
+        &self,
+        line_id: &str,
+        service_date: chrono::NaiveDate,
+    ) -> Option<&Arc<LinePop>> {
+        self.by_line
+            .get(line_id)
+            .and_then(|by_date| by_date.get(&service_date))
     }
 
     /// Drops every stored date strictly older than `service_date`, and any
@@ -187,17 +574,13 @@ impl Population {
         line_id: &str,
         service_date: chrono::NaiveDate,
     ) {
-        let Some(uids) = previous
-            .by_line
-            .get(line_id)
-            .and_then(|by_date| by_date.get(&service_date))
-        else {
+        let Some(pop) = previous.line_pop(line_id, service_date) else {
             return;
         };
         self.by_line
             .entry(line_id.to_string())
             .or_default()
-            .insert(service_date, Arc::clone(uids));
+            .insert(service_date, Arc::clone(pop));
         let key = (line_id.to_string(), service_date);
         if let Some(etag) = previous.etags.get(&key) {
             self.etags.insert(key, etag.clone());
@@ -222,7 +605,22 @@ impl Population {
         self.by_line
             .get(line_id)
             .and_then(|by_date| by_date.get(&service_date))
-            .is_some_and(|uids| uids.contains(uid))
+            .is_some_and(|pop| pop.uids.contains(uid))
+    }
+
+    /// Every line whose `service_date` population contains `uid`. A scan of
+    /// the ~250 lines' hash sets, paid once per Cancellation, not per
+    /// Movement.
+    pub fn lines_containing(&self, service_date: chrono::NaiveDate, uid: &str) -> Vec<&str> {
+        self.by_line
+            .iter()
+            .filter(|(_, by_date)| {
+                by_date
+                    .get(&service_date)
+                    .is_some_and(|pop| pop.uids.contains(uid))
+            })
+            .map(|(line_id, _)| line_id.as_str())
+            .collect()
     }
 
     /// Total uids held across every line and date -- for the
@@ -231,7 +629,7 @@ impl Population {
         self.by_line
             .values()
             .flat_map(|by_date| by_date.values())
-            .map(|uids| uids.len())
+            .map(|pop| pop.uids.len())
             .sum()
     }
 
@@ -242,7 +640,7 @@ impl Population {
         self.by_line
             .get(line_id)
             .and_then(|by_date| by_date.get(&service_date))
-            .map(|uids| uids.iter().map(String::as_str).collect())
+            .map(|pop| pop.uids.iter().map(String::as_str).collect())
             .unwrap_or_default()
     }
 }
@@ -323,23 +721,270 @@ mod tests {
     }
 
     /// The reload parses the real wire shape (full calling points, as
-    /// `api` serves them) into uids alone; `null` (nothing published) still
-    /// parses as `None`.
+    /// `api` serves them) into uids alone when no geometry is given;
+    /// `null` (nothing published) still parses as `None`.
     #[test]
-    fn uid_only_parses_the_real_wire_shape_and_skips_calling_points() {
+    fn the_real_wire_shape_parses_into_uids_without_a_geometry() {
         let body = r#"[{"uid": "W45448", "calling_points": [{"kind": "Origin", "tiploc": "THBDGS ",
             "activity": "TB", "platform": "1", "day_offset": 0, "booked_arrival": null,
             "public_arrival": null, "booked_departure": "17:28:00", "public_departure": "17:28:00",
             "is_half_minute_arrival": false, "is_half_minute_departure": false}]},
             {"uid": "W45449", "calling_points": []}]"#;
-        let parsed: Option<Vec<UidOnly>> = serde_json::from_str(body).unwrap();
-        let uids: Vec<String> = parsed.unwrap().into_iter().map(|e| e.uid).collect();
+        let date: chrono::NaiveDate = "2026-09-04".parse().unwrap();
+        let pop = parse_line_population(body, None, date).unwrap().unwrap();
+        let mut uids: Vec<&str> = pop.uids.iter().map(String::as_str).collect();
+        uids.sort_unstable();
         assert_eq!(uids, vec!["W45448", "W45449"]);
-        assert!(
-            serde_json::from_str::<Option<Vec<UidOnly>>>("null")
-                .unwrap()
-                .is_none()
+        assert!(pop.trains.is_empty());
+        assert_eq!(pop.relevance, Relevance::StopsOnly);
+        assert!(parse_line_population("null", None, date).unwrap().is_none());
+        assert!(parse_line_population("[1]", None, date).is_err());
+    }
+
+    // --- 2026-09-27: windowed stats, due times and relevance ---
+
+    fn geometry(stations: &[(&str, &str)], operators: &[&str]) -> LineGeometry {
+        LineGeometry::new(
+            stations
+                .iter()
+                .map(|(t, c)| (t.to_string(), c.to_string()))
+                .collect(),
+            operators.iter().map(|o| o.to_string()).collect(),
+        )
+    }
+
+    fn cp(tiploc: &str, arr: Option<&str>, dep: Option<&str>, day_offset: u8) -> serde_json::Value {
+        serde_json::json!({"kind": "Intermediate", "tiploc": format!("{tiploc:<7}"),
+            "booked_arrival": arr, "booked_departure": dep, "day_offset": day_offset,
+            "is_half_minute_arrival": false, "is_half_minute_departure": false})
+    }
+
+    fn entry(
+        uid: &str,
+        op: Option<&str>,
+        status: Option<&str>,
+        cps: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut e = serde_json::json!({"uid": uid, "calling_points": cps});
+        if let Some(op) = op {
+            e["operator_atoc"] = op.into();
+        }
+        if let Some(status) = status {
+            e["train_status"] = status.into();
+        }
+        e
+    }
+
+    fn parse(entries: Vec<serde_json::Value>, g: &LineGeometry, date: &str) -> LinePop {
+        let body = serde_json::Value::Array(entries).to_string();
+        parse_line_population(&body, Some(g), date.parse().unwrap())
+            .unwrap()
+            .unwrap()
+    }
+
+    fn minutes(instant: &str) -> u32 {
+        (instant
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap()
+            .timestamp()
+            / 60) as u32
+    }
+
+    /// Due is the first call at a line station -- its departure, or its
+    /// arrival when it has none -- in UTC (BST here); last_due the last;
+    /// origin the schedule's first calling point.
+    #[test]
+    fn due_is_the_first_line_call_and_times_are_utc() {
+        let g = geometry(&[("LLJ", "LLJ"), ("BFF", "BFF")], &["AW"]);
+        let pop = parse(
+            vec![entry(
+                "C1",
+                Some("AW"),
+                Some("P"),
+                vec![
+                    cp("CREWE", None, Some("07:00:00"), 0),
+                    cp("LLJ", Some("08:10:00"), Some("08:12:00"), 0),
+                    cp("BFF", Some("09:05:00"), None, 0),
+                ],
+            )],
+            &g,
+            "2026-07-15",
         );
+        assert_eq!(pop.relevance, Relevance::Full);
+        assert_eq!(
+            pop.trains,
+            vec![LineTrain {
+                uid: "C1".into(),
+                due_min: minutes("2026-07-15T07:12:00Z"),
+                last_due_min: minutes("2026-07-15T08:05:00Z"),
+                origin_dep_min: minutes("2026-07-15T06:00:00Z"),
+            }]
+        );
+
+        // GMT, and after-midnight calls (day_offset 1).
+        let pop = parse(
+            vec![entry(
+                "C2",
+                Some("AW"),
+                Some("1"),
+                vec![
+                    cp("CREWE", None, Some("23:30:00"), 0),
+                    cp("LLJ", Some("00:40:00"), Some("00:41:00"), 1),
+                    cp("BFF", Some("01:20:00"), None, 1),
+                ],
+            )],
+            &g,
+            "2026-01-15",
+        );
+        assert_eq!(pop.trains[0].due_min, minutes("2026-01-16T00:41:00Z"));
+        assert_eq!(pop.trains[0].last_due_min, minutes("2026-01-16T01:20:00Z"));
+        assert_eq!(
+            pop.trains[0].origin_dep_min,
+            minutes("2026-01-15T23:30:00Z")
+        );
+
+        // Arrival only at the first line station.
+        let pop = parse(
+            vec![entry(
+                "C3",
+                Some("AW"),
+                Some("P"),
+                vec![
+                    cp("LLJ", Some("10:00:00"), None, 0),
+                    cp("BFF", Some("10:30:00"), None, 0),
+                ],
+            )],
+            &g,
+            "2026-01-15",
+        );
+        assert_eq!(pop.trains[0].due_min, minutes("2026-01-15T10:00:00Z"));
+    }
+
+    #[test]
+    fn buses_other_operators_and_one_station_trains_are_not_relevant() {
+        let g = geometry(&[("LLJ", "LLJ"), ("BFF", "BFF")], &["AW"]);
+        let calls = || {
+            vec![
+                cp("LLJ", None, Some("08:00:00"), 0),
+                cp("BFF", Some("09:00:00"), None, 0),
+            ]
+        };
+        let pop = parse(
+            vec![
+                entry("TRAIN", Some("AW"), Some("P"), calls()),
+                entry("BUS", Some("AW"), Some("5"), calls()),
+                entry("OTHEROP", Some("XC"), Some("P"), calls()),
+                entry(
+                    "ONESTN",
+                    Some("AW"),
+                    Some("P"),
+                    vec![
+                        cp("LLJ", None, Some("08:00:00"), 0),
+                        cp("CREWE", Some("09:00:00"), None, 0),
+                    ],
+                ),
+                entry(
+                    "PASSES",
+                    Some("AW"),
+                    Some("P"),
+                    vec![
+                        cp("LLJ", None, Some("08:00:00"), 0),
+                        cp("BFF", None, None, 0),
+                    ],
+                ),
+            ],
+            &g,
+            "2026-07-15",
+        );
+        assert_eq!(
+            pop.trains.iter().map(|t| &*t.uid).collect::<Vec<_>>(),
+            vec!["TRAIN"]
+        );
+        assert!(
+            !pop.uids.contains("BUS"),
+            "a bus is not in the population at all"
+        );
+        assert!(
+            pop.uids.contains("OTHEROP"),
+            "matching still sees every train"
+        );
+        assert_eq!(pop.buses_excluded, 1);
+    }
+
+    /// An older schedule-reference: no operator or status anywhere.
+    #[test]
+    fn a_population_without_schedule_facts_is_stops_only() {
+        let g = geometry(&[("LLJ", "LLJ"), ("BFF", "BFF")], &["AW"]);
+        let pop = parse(
+            vec![entry(
+                "C1",
+                None,
+                None,
+                vec![
+                    cp("LLJ", None, Some("08:00:00"), 0),
+                    cp("BFF", Some("09:00:00"), None, 0),
+                ],
+            )],
+            &g,
+            "2026-07-15",
+        );
+        assert_eq!(pop.relevance, Relevance::StopsOnly);
+        assert_eq!(pop.trains.len(), 1, "the two-stations rule still applies");
+    }
+
+    /// Memory regression: a line the size of the largest production one
+    /// (3,357 entries x 22 calls) reduces to fixed-size trains with no
+    /// calling points retained -- checked by type size, not allocator.
+    #[test]
+    fn a_large_line_body_reduces_to_no_calling_points() {
+        let stations: Vec<(String, String)> = (0..22)
+            .map(|i| (format!("T{i:05}"), format!("C{i:02}")))
+            .collect();
+        let g = LineGeometry::new(
+            stations.iter().cloned().collect(),
+            ["LM".to_string()].into_iter().collect(),
+        );
+        let entries: Vec<serde_json::Value> = (0..3357)
+            .map(|n| {
+                entry(
+                    &format!("U{n:05}"),
+                    Some("LM"),
+                    Some("P"),
+                    (0..22)
+                        .map(|i| {
+                            let t = format!("{:02}:{:02}:00", 6 + i / 2, (i % 2) * 30);
+                            cp(&stations[i].0, Some(&t), Some(&t), 0)
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let pop = parse(entries, &g, "2026-09-27");
+        assert_eq!(pop.trains.len(), 3357);
+        assert!(std::mem::size_of::<LineTrain>() <= 32);
+        let resident = pop.trains.capacity() * std::mem::size_of::<LineTrain>()
+            + pop.trains.iter().map(|t| t.uid.len()).sum::<usize>();
+        assert!(resident < 3357 * 40, "{resident} bytes");
+    }
+
+    #[test]
+    fn line_geometry_is_resolved_through_stanox_crs_and_fingerprinted() {
+        let lines = vec![fixture_line("line-a", &["SHR", "ZZA"])];
+        let records = vec![
+            fixture_stanox_crs_record("SHR", "SHARED"),
+            fixture_stanox_crs_record("ZZA", "ONLY_A"),
+        ];
+        let geometry = build_line_geometry(&lines, &records);
+        let g = &geometry["line-a"];
+        assert_eq!(
+            g.crs_by_tiploc.get("SHARED").map(String::as_str),
+            Some("SHR")
+        );
+        assert_ne!(g.hash, 0);
+        let again = build_line_geometry(&lines, &records);
+        assert_eq!(again["line-a"].hash, g.hash);
+        let fewer = build_line_geometry(&lines, &records[..1]);
+        assert_ne!(fewer["line-a"].hash, g.hash);
     }
 
     #[test]
@@ -352,6 +997,8 @@ mod tests {
             vec![LinePopulationEntry {
                 uid: "C11052".to_string(),
                 calling_points: vec![fixture_calling_point("WATRLMN")],
+                operator_atoc: None,
+                train_status: None,
             }],
         );
         assert_eq!(
@@ -371,6 +1018,8 @@ mod tests {
         let entry = |uid: &str| LinePopulationEntry {
             uid: uid.to_string(),
             calling_points: vec![fixture_calling_point("WATRLMN")],
+            operator_atoc: None,
+            train_status: None,
         };
 
         assert_eq!(population.etag_for("waterloo-reading", today), None);
@@ -453,6 +1102,8 @@ mod tests {
             vec![LinePopulationEntry {
                 uid: "C11052".to_string(),
                 calling_points: heavy_calling_points,
+                operator_atoc: None,
+                train_status: None,
             }],
         );
 
@@ -462,13 +1113,13 @@ mod tests {
             "membership must still work"
         );
 
-        let uids = population
+        let pop = population
             .by_line
             .get("waterloo-reading")
             .and_then(|by_date| by_date.get(&date))
             .expect("just inserted");
-        assert_eq!(uids.len(), 1);
-        assert!(uids.contains("C11052"));
+        assert_eq!(pop.uids.len(), 1);
+        assert!(pop.uids.contains("C11052"));
     }
 
     /// Stations are built with `tiploc: None` throughout -- the exact

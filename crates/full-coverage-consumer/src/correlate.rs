@@ -27,6 +27,38 @@ pub struct CorrelationState {
     pub resolved: HashMap<String, String>,
 }
 
+/// The day of the month a TRUST `train_id` was activated for: its last
+/// two characters (the origin departure's day of the month, by TRUST's own
+/// id convention). `None` for an id not ending in two digits.
+pub fn train_id_day_of_month(train_id: &str) -> Option<u32> {
+    let digits = train_id.get(train_id.len().checked_sub(2)?..)?;
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Which of `candidates` an Activation's train runs on: the date of its
+/// origin departure. From `tp_origin_timestamp` (a plain `YYYY-MM-DD`)
+/// when present, else from the `train_id`'s day-of-month digits, matched
+/// against `candidates` -- never from `schedule_start_date`, which is the
+/// CIF validity window's start. `None` when neither says.
+pub fn activation_service_date(
+    activation: &Activation,
+    candidates: &[chrono::NaiveDate],
+) -> Option<chrono::NaiveDate> {
+    use chrono::Datelike;
+    if let Some(date) = activation
+        .tp_origin_timestamp
+        .as_deref()
+        .and_then(|d| chrono::NaiveDate::parse_from_str(d.trim(), "%Y-%m-%d").ok())
+    {
+        return Some(date);
+    }
+    let day = train_id_day_of_month(&activation.train_id)?;
+    candidates.iter().copied().find(|date| date.day() == day)
+}
+
 pub fn apply_activation(state: &mut CorrelationState, activation: &Activation) {
     state
         .pending_activations
@@ -89,6 +121,15 @@ pub fn apply_movement(
             // module's exact pre-existing behavior (status only ever
             // "en_route"/"cancelled").
             *previous = trust_schema::journey::apply_movement(previous, movement, loc_crs, None);
+            // `journey::apply_movement` leaves a LATE report's delay as
+            // `None` for its caller to fill in, and this consumer never
+            // did, so `stats::synthesize_departure` read every late train
+            // as 0 minutes late and every row's `delayed` was 0 (windowed
+            // stats design, section 3.1). TRUST's own `timetable_variation`
+            // is the value.
+            if let Some(delay) = trust_schema::schema::movement_delay_minutes(movement) {
+                previous.delay_minutes = Some(delay);
+            }
             matched.push(key);
         }
     }
@@ -112,13 +153,36 @@ pub struct MovementMatch {
     pub loc_crs: Option<String>,
 }
 
+/// Flips every line of the cancelled train's UID to `"cancelled"`.
+///
+/// The UID comes from a matched Movement (`resolved`) OR, failing that, from
+/// the train's Activation (`pending_activations`), and every line whose
+/// `service_date` population holds the UID gets an entry, whether or not a
+/// Movement ever matched there. It used to need both a prior matched
+/// Movement and an existing `derived` entry, so a train cancelled before it
+/// moved -- most cancellations (windowed stats design, section 3.4) -- was
+/// ignored, and only read "cancelled" through the no-event rule, which a
+/// partial day switches off.
 pub fn apply_cancellation(
     state: &mut CorrelationState,
     cancellation: &Cancellation,
+    population: &Population,
+    service_date: chrono::NaiveDate,
 ) -> Vec<(String, String)> {
-    let Some(train_uid) = state.resolved.get(&cancellation.train_id).cloned() else {
+    let Some(train_uid) = state
+        .resolved
+        .get(&cancellation.train_id)
+        .or_else(|| state.pending_activations.get(&cancellation.train_id))
+        .cloned()
+    else {
         return vec![];
     };
+    for line_id in population.lines_containing(service_date, &train_uid) {
+        state
+            .derived
+            .entry((line_id.to_string(), train_uid.clone()))
+            .or_insert_with(DerivedState::awaiting_activation);
+    }
     let mut cancelled = vec![];
     for (key, derived) in state.derived.iter_mut() {
         if key.1 == train_uid {
@@ -126,6 +190,7 @@ pub fn apply_cancellation(
             cancelled.push(key.clone());
         }
     }
+    cancelled.sort();
     cancelled
 }
 
@@ -161,6 +226,8 @@ mod tests {
             vec![schedule_query::LinePopulationEntry {
                 uid: "C11052".to_string(),
                 calling_points: vec![],
+                operator_atoc: None,
+                train_status: None,
             }],
         );
         population
@@ -179,6 +246,25 @@ mod tests {
         }
     }
 
+    fn cancellation(train_id: &str) -> Cancellation {
+        Cancellation {
+            train_id: train_id.to_string(),
+            canx_timestamp: None,
+            canx_reason_code: None,
+            canx_type: Some("AT ORIGIN".to_string()),
+            dep_timestamp: None,
+            loc_stanox: None,
+        }
+    }
+
+    fn late_movement(train_id: &str, minutes: &str) -> Movement {
+        Movement {
+            variation_status: Some("LATE".to_string()),
+            timetable_variation: Some(minutes.to_string()),
+            ..movement(train_id)
+        }
+    }
+
     fn movement(train_id: &str) -> Movement {
         Movement {
             train_id: train_id.to_string(),
@@ -190,6 +276,7 @@ mod tests {
             loc_stanox: Some("87212".to_string()),
             toc_id: None,
             variation_status: Some("ON TIME".to_string()),
+            timetable_variation: None,
         }
     }
 
@@ -224,6 +311,50 @@ mod tests {
                 .derived
                 .contains_key(&("line-b".to_string(), "C11052".to_string()))
         );
+    }
+
+    /// Regression test: a LATE movement's delay comes from TRUST's
+    /// `timetable_variation`. It used to stay `None`, so every full-coverage
+    /// row read `delayed = 0`.
+    #[test]
+    fn a_late_movement_records_trusts_timetable_variation_as_the_delay() {
+        let mut state = CorrelationState::default();
+        let date: chrono::NaiveDate = "2026-09-04".parse().unwrap();
+        apply_activation(&mut state, &activation("T1", "C11052"));
+        apply_movement(
+            &mut state,
+            &late_movement("T1", "12"),
+            &stanox_table(),
+            &tiploc_index_sharing_one_tiploc(),
+            &population_with_uid_in_line_a(date),
+            date,
+        );
+        let key = ("line-a".to_string(), "C11052".to_string());
+        assert_eq!(state.derived[&key].delay_minutes, Some(12));
+
+        let row = crate::stats::build_line_row(
+            "line-a",
+            date,
+            &["C11052"],
+            &state.derived,
+            true,
+            false,
+            &common::Defaults::default(),
+        );
+        assert_eq!(row.stats.delayed, 1, "12 minutes late is delayed at 5");
+        assert_eq!(row.stats.avg_delay_minutes, 12.0);
+
+        // A later ON TIME report at the line overwrites it (last write
+        // wins, as for every other DerivedState field).
+        apply_movement(
+            &mut state,
+            &movement("T1"),
+            &stanox_table(),
+            &tiploc_index_sharing_one_tiploc(),
+            &population_with_uid_in_line_a(date),
+            date,
+        );
+        assert_eq!(state.derived[&key].delay_minutes, Some(0));
     }
 
     #[test]
@@ -286,12 +417,9 @@ mod tests {
 
         let cancelled = apply_cancellation(
             &mut state,
-            &Cancellation {
-                train_id: "T1".to_string(),
-                canx_timestamp: None,
-                canx_reason_code: None,
-                canx_type: None,
-            },
+            &cancellation("T1"),
+            &population_with_uid_in_line_a(date),
+            date,
         );
 
         assert_eq!(
@@ -301,5 +429,67 @@ mod tests {
         let derived = &state.derived[&("line-a".to_string(), "C11052".to_string())];
         assert_eq!(derived.status, "cancelled");
         assert_eq!(derived.last_reported_location, Some("WAT".to_string()));
+    }
+
+    /// Regression test: a train cancelled at origin never moves, so no
+    /// Movement ever resolved its `train_id`. Its 0002 used to be ignored;
+    /// now its Activation is enough, and every line whose population holds
+    /// the UID reads it cancelled -- which matters on a partial day, where
+    /// an unseen train is left out rather than presumed cancelled.
+    #[test]
+    fn a_cancellation_before_any_movement_cancels_the_train_on_its_lines() {
+        let mut state = CorrelationState::default();
+        let date: chrono::NaiveDate = "2026-09-04".parse().unwrap();
+        let population = population_with_uid_in_line_a(date);
+        apply_activation(&mut state, &activation("T1", "C11052"));
+
+        let cancelled = apply_cancellation(&mut state, &cancellation("T1"), &population, date);
+
+        assert_eq!(
+            cancelled,
+            vec![("line-a".to_string(), "C11052".to_string())]
+        );
+        let row = crate::stats::build_line_row(
+            "line-a",
+            date,
+            &["C11052"],
+            &state.derived,
+            true,
+            true, // partial: unseen trains are left out
+            &common::Defaults::default(),
+        );
+        assert_eq!(row.stats.total, 1, "the explicit cancellation is counted");
+        assert_eq!(row.stats.cancelled, 1);
+    }
+
+    /// A 0002 for a train this process never saw activated still does
+    /// nothing: there is no UID to attribute it to.
+    #[test]
+    fn a_cancellation_for_an_unknown_train_id_does_nothing() {
+        let mut state = CorrelationState::default();
+        let date: chrono::NaiveDate = "2026-09-04".parse().unwrap();
+        let cancelled = apply_cancellation(
+            &mut state,
+            &cancellation("T9"),
+            &population_with_uid_in_line_a(date),
+            date,
+        );
+        assert!(cancelled.is_empty());
+        assert!(state.derived.is_empty());
+    }
+
+    #[test]
+    fn an_activations_service_date_comes_from_tp_origin_then_the_train_id() {
+        let d: chrono::NaiveDate = "2026-09-26".parse().unwrap();
+        let next = d + chrono::Duration::days(1);
+        let mut a = activation("722N71MW27", "C11052");
+        a.tp_origin_timestamp = Some("2026-09-26".to_string());
+        assert_eq!(activation_service_date(&a, &[d, next]), Some(d));
+        a.tp_origin_timestamp = None;
+        assert_eq!(activation_service_date(&a, &[d, next]), Some(next));
+        assert_eq!(activation_service_date(&a, &[d]), None);
+        assert_eq!(train_id_day_of_month("722N71MW27"), Some(27));
+        assert_eq!(train_id_day_of_month("X"), None);
+        assert_eq!(train_id_day_of_month("722N71MWAB"), None);
     }
 }

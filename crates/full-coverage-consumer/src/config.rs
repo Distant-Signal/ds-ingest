@@ -133,6 +133,47 @@ pub struct Config {
     /// the `kafka` backend.
     #[arg(long, env, default_value_t = 60)]
     pub redis_gap_check_secs: u64,
+
+    #[command(flatten)]
+    pub windowed: WindowedStatsArgs,
+}
+
+/// Windowed full-coverage stats
+/// (docs/superpowers/specs/2026-09-27-full-coverage-windowed-stats-design.md).
+/// **Off by default**: with `FULL_COVERAGE_WINDOWED_STATS=false` the
+/// consumer builds exactly the legacy whole-day rows and posts no windows.
+#[derive(Debug, Clone, clap::Args)]
+pub struct WindowedStatsArgs {
+    /// `true`: v2 day-to-date/closed-day rows, and `recent`/`day_to_date`
+    /// window POSTs to `FULL_COVERAGE_WINDOW_STATS_URL` every stats write.
+    #[arg(
+        long = "full-coverage-windowed-stats",
+        env = "FULL_COVERAGE_WINDOWED_STATS",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    pub enabled: bool,
+    #[arg(
+        long,
+        env,
+        default_value = "http://api:8080/private/full-coverage-window-stats"
+    )]
+    pub full_coverage_window_stats_url: String,
+    /// W: the `recent` window covers trains due in the last W minutes.
+    #[arg(long, env, default_value_t = 60)]
+    pub full_coverage_recent_window_minutes: u32,
+    /// Windows end this many minutes ago (feed lag p99 plus the write
+    /// cadence).
+    #[arg(long, env, default_value_t = 10)]
+    pub full_coverage_grace_minutes: u32,
+    /// Feed health: fewer Activations than this in the last 60 minutes
+    /// marks the write `feed_stale`.
+    #[arg(long, env, default_value_t = 20)]
+    pub full_coverage_activations_min: u32,
+    /// Feed health: the newest consumed movement-events entry older than
+    /// this marks the write `feed_stale`.
+    #[arg(long, env, default_value_t = 300)]
+    pub full_coverage_feed_stale_secs: u64,
 }
 
 impl Config {
@@ -274,6 +315,14 @@ pub(crate) mod tests {
             redis_url: String::new(),
             redis_autoclaim_min_idle_secs: 30,
             redis_gap_check_secs: 60,
+            windowed: WindowedStatsArgs {
+                enabled: false,
+                full_coverage_window_stats_url: String::new(),
+                full_coverage_recent_window_minutes: 60,
+                full_coverage_grace_minutes: 10,
+                full_coverage_activations_min: 20,
+                full_coverage_feed_stale_secs: 300,
+            },
         }
     }
 
@@ -352,5 +401,11 @@ pub(crate) mod tests {
         .expect("minimal required args should parse");
 
         assert_eq!(config.movement_feed_backend, MovementFeedBackend::Kafka);
+        assert!(
+            !config.windowed.enabled,
+            "windowed stats are off unless FULL_COVERAGE_WINDOWED_STATS=true"
+        );
+        assert_eq!(config.windowed.full_coverage_recent_window_minutes, 60);
+        assert_eq!(config.windowed.full_coverage_grace_minutes, 10);
     }
 }
