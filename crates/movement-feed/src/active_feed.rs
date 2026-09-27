@@ -98,6 +98,16 @@ impl<K: MovementFeed> DeadLetterSink for ActiveFeed<K> {
 }
 
 impl<K: MovementFeed> ActiveFeed<K> {
+    /// The Redis Streams reader, for callers that need more than the
+    /// `MovementFeed` surface (e.g. a group-less `XRANGE` replay); `None`
+    /// under the Kafka backend, which has no equivalent.
+    pub fn redis_stream(&mut self) -> Option<&mut RedisStreamMovementFeed> {
+        match self {
+            ActiveFeed::Kafka(_) => None,
+            ActiveFeed::RedisStream(feed, _, _) => Some(feed),
+        }
+    }
+
     /// `Ok(None)` immediately for the `Kafka` variant (no analog);
     /// delegates to `RedisStreamMovementFeed::check_gap` for the
     /// `RedisStream` variant.

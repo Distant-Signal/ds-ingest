@@ -58,6 +58,13 @@ pub struct Config {
     // Reload cadences
     #[arg(long, env, default_value_t = 300)]
     pub population_reload_secs: u64,
+    /// How long the FIRST population load may keep failing for some lines
+    /// while others load before consumption starts anyway, with the failing
+    /// lines' stats marked partial for that rail day. While every fetch
+    /// fails (`api` down) consumption never starts, however long that takes
+    /// -- see `population_reload::Reloader`.
+    #[arg(long, env, default_value_t = 600)]
+    pub population_initial_wait_secs: u64,
     #[arg(long, env, default_value_t = 3600)]
     pub stanox_crs_reload_secs: u64,
     #[arg(long, env, default_value_t = 60)]
@@ -91,9 +98,10 @@ pub struct Config {
     /// legitimate one, every HTTP call in it being bounded by
     /// `common::ingest::CONSUMER_REQUEST_TIMEOUT` (60s).
     /// Larger than the other two consumers': one iteration here can also
-    /// run a full population reload and a stats write, each several
-    /// requests, and a restart costs this consumer its in-memory
-    /// correlation state for the rail day.
+    /// run a stats write (several requests), and a restart costs a startup
+    /// replay of the rail day so far (see `replay.rs`). The population
+    /// reload no longer runs in this loop, and startup waits (for `api`,
+    /// Redis) beat the watchdog themselves.
     #[arg(long, env, default_value_t = 900)]
     pub progress_stall_secs: u64,
     #[arg(long, env, default_value_t = 9093)]
@@ -251,6 +259,7 @@ pub(crate) mod tests {
                 internal_oauth_password: String::new(),
             },
             population_reload_secs: 300,
+            population_initial_wait_secs: 600,
             stanox_crs_reload_secs: 3600,
             stats_write_interval_secs: 60,
             shadow_lines: shadow_lines.to_string(),

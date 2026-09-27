@@ -69,10 +69,7 @@ pub fn apply_movement(
 
     let mut matched = vec![];
     for line_id in candidate_lines {
-        if population
-            .uids_for(&line_id, service_date)
-            .contains(&train_uid.as_str())
-        {
+        if population.contains(&line_id, service_date, &train_uid) {
             state
                 .resolved
                 .insert(movement.train_id.clone(), train_uid.clone());

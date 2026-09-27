@@ -3,8 +3,23 @@
 //! rows fetched via `GET /private/schedule-line-population`.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
+#[cfg(test)]
 use schedule_query::LinePopulationEntry;
+
+/// One `schedule-line-population` wire entry, reduced to the only field
+/// this crate reads. Deserializing into this instead of
+/// `schedule_query::LinePopulationEntry` skips each entry's
+/// `calling_points` array without building it (serde ignores unknown
+/// fields): the largest production line (3,357 entries, ~22 calling points
+/// each, 21 MB of JSON on 2026-09-27) used to be materialized in full --
+/// every `CallingPoint` of every entry -- just to take the uids and drop
+/// the rest. Now a line costs its body text plus its uids.
+#[derive(Debug, serde::Deserialize)]
+pub struct UidOnly {
+    pub uid: String,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct Population {
@@ -15,7 +30,13 @@ pub struct Population {
     /// `insert`'s own doc comment for why retaining it was a real
     /// production memory-pressure bug (found during the 2026-09-26
     /// crash-loop investigation), not a deliberate design choice.
-    by_line: HashMap<String, HashMap<chrono::NaiveDate, HashSet<String>>>,
+    ///
+    /// Each set is behind an `Arc` (2026-09-27) so the background reloader
+    /// can build the next snapshot sharing every unchanged set with the one
+    /// it replaces (a `304` just carries the old `Arc` over) instead of
+    /// deep-copying the population on every cycle -- see
+    /// `population_reload`.
+    by_line: HashMap<String, HashMap<chrono::NaiveDate, Arc<HashSet<String>>>>,
     /// `(line_id, service_date)` -> the `ETag` `api` sent with the
     /// population currently held in `by_line` for that key, if it sent one.
     ///
@@ -71,8 +92,8 @@ impl Population {
     /// except the data driving that footprint was never actually read at
     /// runtime, so the fix is to stop retaining it, not to raise the limit.
     ///
-    /// Test-only since 2026-09-26: the reload loop calls
-    /// [`Population::insert_with_etag`], which this delegates to.
+    /// Test-only since 2026-09-26: the reload calls
+    /// [`Population::insert_uids`].
     #[cfg(test)]
     pub fn insert(
         &mut self,
@@ -84,8 +105,9 @@ impl Population {
     }
 
     /// [`Population::insert`], also recording the `ETag` the population
-    /// arrived with (`None` when `api` sent none, which clears any previous
+    /// arrived with. Test-only: see [`Population::insert_uids`] (`None` when `api` sent none, which clears any previous
     /// one for this key -- the new data is no longer described by it).
+    #[cfg(test)]
     pub fn insert_with_etag(
         &mut self,
         line_id: &str,
@@ -94,10 +116,24 @@ impl Population {
         etag: Option<String>,
     ) {
         let uids: HashSet<String> = entries.into_iter().map(|e| e.uid).collect();
+        self.insert_uids(line_id, service_date, uids, etag);
+    }
+
+    /// Stores `(line_id, service_date)`'s uid set and the `ETag` it arrived
+    /// with (`None` clears any previous one -- the new data is no longer
+    /// described by it). What the reload calls, with uids parsed straight
+    /// off the wire by [`UidOnly`].
+    pub fn insert_uids(
+        &mut self,
+        line_id: &str,
+        service_date: chrono::NaiveDate,
+        uids: HashSet<String>,
+        etag: Option<String>,
+    ) {
         self.by_line
             .entry(line_id.to_string())
             .or_default()
-            .insert(service_date, uids);
+            .insert(service_date, Arc::new(uids));
         let key = (line_id.to_string(), service_date);
         match etag {
             Some(etag) => {
@@ -128,12 +164,75 @@ impl Population {
     /// only ever asked about the current `service_date`. Called at each
     /// rail-day rollover and at the end of each reload, so the resident set
     /// stays at today+tomorrow.
+    ///
+    /// Test-only since 2026-09-27: `population_reload::reload_cycle` builds
+    /// each snapshot from scratch with only today's and tomorrow's dates, so
+    /// an older date is dropped by construction.
+    #[cfg(test)]
     pub fn retain_from(&mut self, service_date: chrono::NaiveDate) {
         self.by_line.retain(|_line_id, by_date| {
             by_date.retain(|date, _| *date >= service_date);
             !by_date.is_empty()
         });
         self.etags.retain(|(_, date), _| *date >= service_date);
+    }
+
+    /// Carries `(line_id, service_date)`'s population -- its uid set and
+    /// `ETag` -- over from `previous` unchanged, sharing the set rather than
+    /// copying it. Used for a `304` and for a fetch that failed (keep the
+    /// previous snapshot). A no-op when `previous` holds nothing for it.
+    pub fn carry_over(
+        &mut self,
+        previous: &Population,
+        line_id: &str,
+        service_date: chrono::NaiveDate,
+    ) {
+        let Some(uids) = previous
+            .by_line
+            .get(line_id)
+            .and_then(|by_date| by_date.get(&service_date))
+        else {
+            return;
+        };
+        self.by_line
+            .entry(line_id.to_string())
+            .or_default()
+            .insert(service_date, Arc::clone(uids));
+        let key = (line_id.to_string(), service_date);
+        if let Some(etag) = previous.etags.get(&key) {
+            self.etags.insert(key, etag.clone());
+        }
+    }
+
+    /// Whether a population (possibly empty) is held for
+    /// `(line_id, service_date)`.
+    #[cfg(test)]
+    pub fn has(&self, line_id: &str, service_date: chrono::NaiveDate) -> bool {
+        self.by_line
+            .get(line_id)
+            .is_some_and(|by_date| by_date.contains_key(&service_date))
+    }
+
+    /// Whether `uid` is in `line_id`'s population for `service_date` --
+    /// the per-Movement membership test. A hash lookup: the previous
+    /// `uids_for(..).contains(..)` collected the line's whole uid set into
+    /// a `Vec` for every candidate line of every Movement, which is what a
+    /// startup replay of a full rail day (~1M entries) would otherwise pay.
+    pub fn contains(&self, line_id: &str, service_date: chrono::NaiveDate, uid: &str) -> bool {
+        self.by_line
+            .get(line_id)
+            .and_then(|by_date| by_date.get(&service_date))
+            .is_some_and(|uids| uids.contains(uid))
+    }
+
+    /// Total uids held across every line and date -- for the
+    /// `population_uids` gauge and memory sizing.
+    pub fn total_uids(&self) -> usize {
+        self.by_line
+            .values()
+            .flat_map(|by_date| by_date.values())
+            .map(|uids| uids.len())
+            .sum()
     }
 
     /// Every UID this line's population contains for `service_date`,
@@ -221,6 +320,26 @@ mod tests {
             public_departure: None,
             platform: None,
         }
+    }
+
+    /// The reload parses the real wire shape (full calling points, as
+    /// `api` serves them) into uids alone; `null` (nothing published) still
+    /// parses as `None`.
+    #[test]
+    fn uid_only_parses_the_real_wire_shape_and_skips_calling_points() {
+        let body = r#"[{"uid": "W45448", "calling_points": [{"kind": "Origin", "tiploc": "THBDGS ",
+            "activity": "TB", "platform": "1", "day_offset": 0, "booked_arrival": null,
+            "public_arrival": null, "booked_departure": "17:28:00", "public_departure": "17:28:00",
+            "is_half_minute_arrival": false, "is_half_minute_departure": false}]},
+            {"uid": "W45449", "calling_points": []}]"#;
+        let parsed: Option<Vec<UidOnly>> = serde_json::from_str(body).unwrap();
+        let uids: Vec<String> = parsed.unwrap().into_iter().map(|e| e.uid).collect();
+        assert_eq!(uids, vec!["W45448", "W45449"]);
+        assert!(
+            serde_json::from_str::<Option<Vec<UidOnly>>>("null")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

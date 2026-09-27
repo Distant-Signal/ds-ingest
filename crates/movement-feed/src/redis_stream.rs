@@ -175,6 +175,20 @@ impl RedisStreamMovementFeed {
         .await
     }
 
+    /// [`Self::connect`] against an explicitly named stream, for other
+    /// crates' own `#[ignore]`-gated stream tests (each wants a unique
+    /// stream so it never collides with another test or a deployment).
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn connect_to_named_stream(
+        redis_url: &str,
+        stream: &str,
+        group: impl Into<String>,
+        consumer: impl Into<String>,
+        autoclaim_min_idle: Duration,
+    ) -> anyhow::Result<Self> {
+        Self::connect_to_stream(redis_url, stream, group, consumer, autoclaim_min_idle).await
+    }
+
     async fn connect_to_stream(
         redis_url: &str,
         stream: &str,
@@ -715,79 +729,316 @@ impl RedisStreamMovementFeed {
         Ok(())
     }
 
-    /// Compares this group's `last-delivered-id` (via `XINFO GROUPS`)
-    /// against the stream's current oldest retained entry (via `XINFO
-    /// STREAM`'s `first-entry`). `Some(GapInfo)` means entries between
-    /// those two IDs were trimmed (`MAXLEN`) before this group ever read
-    /// them -- a provable gap, not a suspicion. Call on the same cadence
-    /// this crate's caller already reloads its other periodic state (see
-    /// Task 4) -- cheap, two Redis round-trips, no new polling loop.
+    /// Reports whether events were lost to trimming before this group
+    /// could finish with them -- a provable loss, not a suspicion. Two
+    /// round trips for `XINFO GROUPS`/`XINFO STREAM` plus one `XPENDING`
+    /// summary, via [`Self::stream_positions`]; see [`detect_gap`] for the
+    /// exact rule.
+    ///
+    /// **Changed 2026-09-27** (full-coverage lag review): this used to flag
+    /// a gap whenever `last-delivered-id < first-entry`, which is also true
+    /// when the first retained entry is simply the group's next unread one
+    /// (a false alarm), and it ignored entries that had been delivered but
+    /// not yet ACKed and were then trimmed out from under the PEL.
     pub async fn check_gap(&mut self) -> anyhow::Result<Option<GapInfo>> {
+        let positions = self.stream_positions().await?;
+        Ok(detect_gap(&positions))
+    }
+
+    /// Where this group and the stream stand, from `XINFO GROUPS`,
+    /// `XINFO STREAM` and the `XPENDING` summary form. Used by
+    /// [`Self::check_gap`] and by `full-coverage-consumer`'s startup replay
+    /// (which needs the group's read position and whether the start of the
+    /// rail day is still retained).
+    pub async fn stream_positions(&mut self) -> anyhow::Result<StreamPositions> {
         let groups: Vec<redis::Value> = redis::cmd("XINFO")
             .arg("GROUPS")
             .arg(&self.stream)
             .query_async(&mut self.conn)
             .await?;
-        let Some(last_delivered_id) = find_group_field(&groups, &self.group, "last-delivered-id")?
-        else {
-            return Ok(None); // group doesn't exist yet -- nothing to compare.
-        };
+        let group = find_group_fields(&groups, &self.group)?;
+        let group_field = |name: &str| group.as_ref().and_then(|fields| fields.get(name));
 
         let stream_info: Vec<redis::Value> = redis::cmd("XINFO")
             .arg("STREAM")
             .arg(&self.stream)
             .query_async(&mut self.conn)
             .await?;
-        let Some(first_entry_id) = find_stream_first_entry_id(&stream_info)? else {
-            return Ok(None); // empty stream -- nothing trimmed yet.
+        let stream = flat_fields(&stream_info)?;
+        let stream_field = |name: &str| stream.get(name);
+
+        let (pending_count, pending_min_id) = if group.is_some() {
+            let summary: Vec<redis::Value> = redis::cmd("XPENDING")
+                .arg(&self.stream)
+                .arg(&self.group)
+                .query_async(&mut self.conn)
+                .await?;
+            let count = summary
+                .first()
+                .map(optional_u64)
+                .transpose()?
+                .flatten()
+                .unwrap_or(0);
+            let min = summary.get(1).map(optional_string).transpose()?.flatten();
+            (count, min)
+        } else {
+            (0, None)
         };
 
-        if stream_id_less_than(&last_delivered_id, &first_entry_id) {
-            Ok(Some(GapInfo {
-                group_last_delivered_id: last_delivered_id,
-                stream_first_entry_id: first_entry_id,
-            }))
-        } else {
-            Ok(None)
-        }
+        Ok(StreamPositions {
+            group_last_delivered_id: group_field("last-delivered-id")
+                .map(optional_string)
+                .transpose()?
+                .flatten(),
+            group_entries_read: group_field("entries-read")
+                .map(optional_u64)
+                .transpose()?
+                .flatten(),
+            pending_count,
+            pending_min_id,
+            stream_length: stream_field("length")
+                .map(optional_u64)
+                .transpose()?
+                .flatten()
+                .unwrap_or(0),
+            stream_first_entry_id: find_stream_first_entry_id(&stream_info)?,
+            stream_last_generated_id: stream_field("last-generated-id")
+                .map(optional_string)
+                .transpose()?
+                .flatten(),
+            stream_entries_added: stream_field("entries-added")
+                .map(optional_u64)
+                .transpose()?
+                .flatten(),
+            stream_max_deleted_entry_id: stream_field("max-deleted-entry-id")
+                .map(optional_string)
+                .transpose()?
+                .flatten(),
+        })
     }
+
+    /// Group-less `XRANGE start end COUNT count` over this feed's stream --
+    /// NOT a consumer-group read: nothing is delivered, claimed or ACKed,
+    /// and the group's position is untouched. `start`/`end` take any
+    /// `XRANGE` bound, including an exclusive `(<id>` (Redis >= 6.2).
+    ///
+    /// Returns `(id, payload)` for every entry with a usable `payload`
+    /// field, plus the id of the last entry read at all (so a caller paging
+    /// through the range can continue after a page made entirely of
+    /// malformed entries). Malformed entries are only skipped here -- the
+    /// consumer-group path is what dead-letters them.
+    pub async fn read_range(
+        &mut self,
+        start: &str,
+        end: &str,
+        count: usize,
+    ) -> anyhow::Result<RangePage> {
+        let reply: redis::streams::StreamRangeReply = self
+            .conn
+            .xrange_count(&self.stream, start, end, count)
+            .await?;
+        let last_id = reply.ids.last().map(|entry| entry.id.clone());
+        let (entries, _malformed) = split_deliverable_and_malformed(reply.ids);
+        Ok(RangePage { entries, last_id })
+    }
+
+    /// Every entry id currently in this GROUP's pending-entries list (all
+    /// consumer names, not just this one), paged `PEL_REPLAY_BATCH_COUNT`
+    /// at a time. These are the entries the group will hand out again
+    /// (startup PEL replay or `XAUTOCLAIM`), so a caller replaying the
+    /// stream by `XRANGE` skips them to avoid dispatching them twice.
+    pub async fn group_pending_ids(&mut self) -> anyhow::Result<std::collections::HashSet<String>> {
+        let mut ids = std::collections::HashSet::new();
+        let mut start = "-".to_string();
+        loop {
+            let reply: redis::streams::StreamPendingCountReply = self
+                .conn
+                .xpending_count(
+                    &self.stream,
+                    &self.group,
+                    &start,
+                    "+",
+                    PEL_REPLAY_BATCH_COUNT,
+                )
+                .await?;
+            let page = reply.ids.len();
+            let Some(last) = reply.ids.last().map(|p| p.id.clone()) else {
+                break;
+            };
+            ids.extend(reply.ids.into_iter().map(|p| p.id));
+            if page < PEL_REPLAY_BATCH_COUNT {
+                break;
+            }
+            start = format!("({last}");
+        }
+        Ok(ids)
+    }
+}
+
+/// One page of [`RedisStreamMovementFeed::read_range`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RangePage {
+    /// `(id, payload)` of every deliverable entry, in stream order.
+    pub entries: Vec<(String, String)>,
+    /// The id of the last entry `XRANGE` returned, deliverable or not --
+    /// `None` only when the range held nothing at all.
+    pub last_id: Option<String>,
+}
+
+/// Snapshot of a consumer group's and its stream's positions -- see
+/// [`RedisStreamMovementFeed::stream_positions`]. Every field Redis may
+/// report as nil (or an older server may omit) is an `Option`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StreamPositions {
+    /// `None` when the group does not exist.
+    pub group_last_delivered_id: Option<String>,
+    /// The group's logical read counter; nil in Redis when it cannot be
+    /// known (e.g. a group created at an arbitrary id).
+    pub group_entries_read: Option<u64>,
+    /// Entries delivered to the group but not yet ACKed.
+    pub pending_count: u64,
+    /// The smallest id in the group's PEL, if any.
+    pub pending_min_id: Option<String>,
+    pub stream_length: u64,
+    /// `None` when the stream is empty.
+    pub stream_first_entry_id: Option<String>,
+    pub stream_last_generated_id: Option<String>,
+    /// Every entry ever added (Redis >= 7.0).
+    pub stream_entries_added: Option<u64>,
+    /// Highest id removed by `XDEL` (Redis >= 7.0). **Not** advanced by
+    /// `MAXLEN`/`MINID` trimming -- checked against valkey 9 -- so it says
+    /// nothing about trimming.
+    pub stream_max_deleted_entry_id: Option<String>,
+}
+
+impl StreamPositions {
+    /// How many entries have ever left the stream (trimmed or deleted),
+    /// when the server reports `entries-added`.
+    pub fn entries_removed(&self) -> Option<u64> {
+        self.stream_entries_added
+            .map(|added| added.saturating_sub(self.stream_length))
+    }
+}
+
+/// The exact gap rule behind [`RedisStreamMovementFeed::check_gap`]. A gap
+/// is either or both of:
+///
+/// - **Unread entries trimmed.** The group's read position is older than
+///   the stream's first retained entry AND more entries were added after
+///   that position than the stream still holds:
+///   `entries-added - entries-read > length`; the difference is the number
+///   lost. The id comparison alone is not enough: when the first retained
+///   entry is the group's very next unread one, nothing was lost (the old
+///   check's false alarm). When the server cannot report `entries-read`
+///   the count is unknown and the rule falls back to "the position is
+///   older than the first entry and something has been removed" --
+///   conservative, `unread_entries_lost: None`. The id condition is kept
+///   even when the counters are known: Redis's `entries-read` accounting
+///   drifts by a few hundred across AOF reloads (seen in production), and
+///   that drift alone must not raise an alarm while the group is inside
+///   the retained window.
+/// - **Pending entries trimmed.** The group's PEL holds an id older than
+///   the first retained entry: delivered, never ACKed, and now gone, so a
+///   redelivery can only hand back an empty entry.
+pub fn detect_gap(positions: &StreamPositions) -> Option<GapInfo> {
+    let last_delivered = positions.group_last_delivered_id.as_deref()?;
+    // An empty stream: nothing retained to compare against. Unchanged from
+    // the previous behaviour -- reported as no gap.
+    let first_entry = positions.stream_first_entry_id.as_deref()?;
+
+    let behind_first_entry = stream_id_less_than(last_delivered, first_entry);
+    let unread_lost: Option<Option<u64>> = if !behind_first_entry {
+        None
+    } else {
+        match (positions.stream_entries_added, positions.group_entries_read) {
+            (Some(added), Some(read)) => {
+                let lost = added
+                    .saturating_sub(read)
+                    .saturating_sub(positions.stream_length);
+                (lost > 0).then_some(Some(lost))
+            }
+            _ => match positions.entries_removed() {
+                Some(0) => None,
+                _ => Some(None),
+            },
+        }
+    };
+
+    let pending_trimmed = positions
+        .pending_min_id
+        .as_deref()
+        .is_some_and(|min| stream_id_less_than(min, first_entry));
+
+    if unread_lost.is_none() && !pending_trimmed {
+        return None;
+    }
+    Some(GapInfo {
+        group_last_delivered_id: last_delivered.to_string(),
+        stream_first_entry_id: first_entry.to_string(),
+        unread_entries_lost: unread_lost.flatten(),
+        pending_entries_trimmed: pending_trimmed,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GapInfo {
     pub group_last_delivered_id: String,
     pub stream_first_entry_id: String,
+    /// How many never-read entries were trimmed, when the server's
+    /// counters allow an exact figure; `None` when the loss is certain or
+    /// suspected but its size unknown (or when only the PEL was hit).
+    pub unread_entries_lost: Option<u64>,
+    /// At least one delivered-but-unACKed entry was trimmed.
+    pub pending_entries_trimmed: bool,
 }
 
-/// `XINFO GROUPS`'s reply is an array of per-group entries, each a flat
-/// array of alternating field name/value pairs -- same shape
-/// `enricher::stream::group_lag` already parses. Pulls out `field` for the
-/// group named `group`.
-fn find_group_field(
+/// `XINFO`'s flat `[name, value, name, value, ...]` array as a map.
+fn flat_fields(
+    values: &[redis::Value],
+) -> anyhow::Result<std::collections::HashMap<String, redis::Value>> {
+    let mut map = std::collections::HashMap::new();
+    let mut it = values.iter();
+    while let (Some(k), Some(v)) = (it.next(), it.next()) {
+        let k: String = redis::from_redis_value(k)?;
+        map.insert(k, v.clone());
+    }
+    Ok(map)
+}
+
+/// The field map of the group named `group` in an `XINFO GROUPS` reply.
+fn find_group_fields(
     groups: &[redis::Value],
     group: &str,
-    field: &str,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<std::collections::HashMap<String, redis::Value>>> {
     for entry in groups {
-        let redis::Value::Array(fields) = entry else {
-            continue;
-        };
-        let mut name: Option<String> = None;
-        let mut value: Option<String> = None;
-        let mut it = fields.iter();
-        while let (Some(k), Some(v)) = (it.next(), it.next()) {
-            let k: String = redis::from_redis_value(k)?;
-            if k == "name" {
-                name = redis::from_redis_value(v).ok();
-            } else if k == field {
-                value = redis::from_redis_value(v).ok();
+        // RESP2 replies each group as a flat array; RESP3 as a map.
+        let fields = match entry {
+            redis::Value::Array(fields) => flat_fields(fields)?,
+            redis::Value::Map(pairs) => {
+                let mut map = std::collections::HashMap::new();
+                for (k, v) in pairs {
+                    map.insert(redis::from_redis_value::<String>(k)?, v.clone());
+                }
+                map
             }
-        }
+            _ => continue,
+        };
+        let name: Option<String> = fields
+            .get("name")
+            .and_then(|v| redis::from_redis_value(v).ok());
         if name.as_deref() == Some(group) {
-            return Ok(value);
+            return Ok(Some(fields));
         }
     }
     Ok(None)
+}
+
+fn optional_string(value: &redis::Value) -> anyhow::Result<Option<String>> {
+    Ok(redis::from_redis_value::<Option<String>>(value)?)
+}
+
+fn optional_u64(value: &redis::Value) -> anyhow::Result<Option<u64>> {
+    Ok(redis::from_redis_value::<Option<u64>>(value)?)
 }
 
 /// `XINFO STREAM`'s reply is itself a flat array of alternating field
@@ -818,7 +1069,7 @@ fn find_stream_first_entry_id(stream_info: &[redis::Value]) -> anyhow::Result<Op
 /// a pair of integers (never as a bare string -- `"9-0" < "10-0"`
 /// lexicographically is false but numerically true, so this must NOT be a
 /// plain string `<` comparison).
-fn stream_id_less_than(a: &str, b: &str) -> bool {
+pub fn stream_id_less_than(a: &str, b: &str) -> bool {
     fn parts(id: &str) -> (u64, u64) {
         let mut it = id.splitn(2, '-');
         let ms = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -893,6 +1144,80 @@ mod split_deliverable_and_malformed_tests {
 
         assert_eq!(entries, vec![("1-0".to_string(), "ok".to_string())]);
         assert_eq!(malformed_ids, vec![("2-0".to_string(), String::new())]);
+    }
+}
+
+#[cfg(test)]
+mod detect_gap_tests {
+    use super::*;
+
+    /// A group that has read up to `last` of a stream now starting at
+    /// `first`, with exact counters.
+    fn positions(last: &str, first: &str, added: u64, read: u64, length: u64) -> StreamPositions {
+        StreamPositions {
+            group_last_delivered_id: Some(last.to_string()),
+            group_entries_read: Some(read),
+            stream_length: length,
+            stream_first_entry_id: Some(first.to_string()),
+            stream_entries_added: Some(added),
+            ..StreamPositions::default()
+        }
+    }
+
+    /// The old check's false alarm: everything the group read has been
+    /// trimmed, and the first retained entry is simply its next unread one.
+    /// `last-delivered-id < first-entry`, but nothing was lost.
+    #[test]
+    fn the_immediate_successor_being_first_is_not_a_gap() {
+        assert_eq!(detect_gap(&positions("3-0", "4-0", 4, 3, 1)), None);
+    }
+
+    #[test]
+    fn unread_entries_trimmed_are_counted_exactly() {
+        let gap = detect_gap(&positions("2-0", "12-0", 12, 2, 1)).expect("9 unread entries lost");
+        assert_eq!(gap.unread_entries_lost, Some(9));
+        assert!(!gap.pending_entries_trimmed);
+    }
+
+    /// Redis's `entries-read` drifts by a few hundred across AOF reloads
+    /// (a lag floor of ~282 with the group fully caught up, seen in
+    /// production). Counters alone would call that loss on a short stream;
+    /// the id condition keeps it quiet while the group is inside the
+    /// retained window.
+    #[test]
+    fn counter_drift_inside_the_retained_window_is_not_a_gap() {
+        assert_eq!(detect_gap(&positions("50-0", "10-0", 1000, 400, 100)), None);
+    }
+
+    #[test]
+    fn a_trimmed_pending_entry_is_a_gap_even_with_nothing_unread_lost() {
+        let mut p = positions("2-0", "3-0", 3, 2, 1);
+        p.pending_count = 2;
+        p.pending_min_id = Some("1-0".to_string());
+        let gap = detect_gap(&p).expect("the PEL points at trimmed entries");
+        assert!(gap.pending_entries_trimmed);
+        assert_eq!(gap.unread_entries_lost, None);
+    }
+
+    #[test]
+    fn unknown_entries_read_falls_back_to_the_id_comparison() {
+        let mut p = positions("2-0", "12-0", 12, 0, 1);
+        p.group_entries_read = None;
+        let gap = detect_gap(&p).expect("conservative: position older than the first entry");
+        assert_eq!(gap.unread_entries_lost, None);
+
+        // ...but not when nothing has ever been removed from the stream.
+        let mut p = positions("0-0", "12-0", 1, 0, 1);
+        p.group_entries_read = None;
+        assert_eq!(detect_gap(&p), None);
+    }
+
+    #[test]
+    fn no_group_or_an_empty_stream_is_not_a_gap() {
+        assert_eq!(detect_gap(&StreamPositions::default()), None);
+        let mut p = positions("2-0", "3-0", 3, 2, 1);
+        p.stream_first_entry_id = None;
+        assert_eq!(detect_gap(&p), None);
     }
 }
 
@@ -1665,6 +1990,11 @@ mod redis_tests {
 
         let gap = feed.check_gap().await.unwrap();
         let gap = gap.expect("a gap should be detected");
+        assert_eq!(
+            gap.unread_entries_lost,
+            Some(9),
+            "filler-0..=filler-8 were trimmed before the group read them"
+        );
         assert!(
             stream_id_less_than(&gap.group_last_delivered_id, &gap.stream_first_entry_id),
             "last-delivered-id ({}) must be provably older than the new first-entry ({})",
@@ -1699,6 +2029,125 @@ mod redis_tests {
         let gap = feed.check_gap().await.unwrap();
         assert_eq!(gap, None, "no trimming has happened, so there is no gap");
 
+        cleanup(&stream).await;
+    }
+
+    /// The old check's false alarm, against a real server: the group has
+    /// read and ACKed everything, then those entries are trimmed. The first
+    /// retained entry is the group's next unread one -- nothing was lost.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn check_gap_is_quiet_when_only_already_read_entries_were_trimmed() {
+        let stream = unique_stream("gap-successor");
+        let mut feed = connect(&stream).await;
+        for i in 0..3 {
+            xadd(&stream, &format!("read-{i}")).await;
+        }
+        feed.next_batch().await.unwrap(); // drain empty startup PEL
+        assert_eq!(feed.next_batch().await.unwrap().len(), 3);
+        feed.commit().await.unwrap();
+
+        let _: String = redis::cmd("XADD")
+            .arg(&stream)
+            .arg("MAXLEN")
+            .arg(1)
+            .arg("*")
+            .arg("payload")
+            .arg("unread")
+            .query_async(&mut feed.conn)
+            .await
+            .unwrap();
+
+        let positions = feed.stream_positions().await.unwrap();
+        assert!(
+            stream_id_less_than(
+                positions.group_last_delivered_id.as_deref().unwrap(),
+                positions.stream_first_entry_id.as_deref().unwrap()
+            ),
+            "the shape the old id-only check flagged as a gap"
+        );
+        assert_eq!(feed.check_gap().await.unwrap(), None);
+        cleanup(&stream).await;
+    }
+
+    /// Delivered, never ACKed, then trimmed: the PEL now points at entries
+    /// that no longer exist. The old check could not see this at all.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn check_gap_reports_pending_entries_trimmed_before_their_ack() {
+        let stream = unique_stream("gap-pending");
+        let mut feed = connect(&stream).await;
+        xadd(&stream, "a").await;
+        xadd(&stream, "b").await;
+        feed.next_batch().await.unwrap(); // drain empty startup PEL
+        assert_eq!(feed.next_batch().await.unwrap().len(), 2);
+        // No commit: both stay pending.
+        let _: String = redis::cmd("XADD")
+            .arg(&stream)
+            .arg("MAXLEN")
+            .arg(1)
+            .arg("*")
+            .arg("payload")
+            .arg("c")
+            .query_async(&mut feed.conn)
+            .await
+            .unwrap();
+
+        let gap = feed
+            .check_gap()
+            .await
+            .unwrap()
+            .expect("pending entries were trimmed");
+        assert!(gap.pending_entries_trimmed);
+        assert_eq!(
+            gap.unread_entries_lost, None,
+            "every unread entry is still there"
+        );
+        cleanup(&stream).await;
+    }
+
+    /// `read_range` is a group-less XRANGE: it pages the stream by id
+    /// without delivering anything to the group, and `group_pending_ids`
+    /// lists exactly the group's PEL.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn read_range_pages_without_touching_the_group() {
+        let stream = unique_stream("read-range");
+        let mut feed = connect(&stream).await;
+        for i in 0..5 {
+            xadd(&stream, &format!("p{i}")).await;
+        }
+        let first = feed.read_range("-", "+", 2).await.unwrap();
+        assert_eq!(
+            first
+                .entries
+                .iter()
+                .map(|(_, p)| p.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p0", "p1"]
+        );
+        let after = format!("({}", first.last_id.unwrap());
+        let rest = feed.read_range(&after, "+", 10).await.unwrap();
+        assert_eq!(
+            rest.entries
+                .iter()
+                .map(|(_, p)| p.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p2", "p3", "p4"]
+        );
+
+        let positions = feed.stream_positions().await.unwrap();
+        assert_eq!(positions.pending_count, 0, "XRANGE delivers nothing");
+        assert_eq!(positions.stream_length, 5);
+        assert_eq!(positions.stream_entries_added, Some(5));
+
+        feed.next_batch().await.unwrap(); // drain empty startup PEL
+        assert_eq!(feed.next_batch().await.unwrap().len(), 5);
+        let pending = feed.group_pending_ids().await.unwrap();
+        assert_eq!(pending.len(), 5);
+        let positions = feed.stream_positions().await.unwrap();
+        assert_eq!(positions.pending_count, 5);
+        assert!(pending.contains(positions.pending_min_id.as_deref().unwrap()));
         cleanup(&stream).await;
     }
 
