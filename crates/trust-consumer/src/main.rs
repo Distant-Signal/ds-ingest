@@ -1,8 +1,14 @@
-//! `trust-consumer`: persistent Kafka consumer for Network Rail's TRUST
-//! Train Movements feed (via RDM), filtered to exactly the currently
-//! user-tracked `(train_uid, date)` set. NOT a cron-style poller -- see
+//! `trust-consumer`: persistent consumer for Network Rail's TRUST Train
+//! Movements feed (via RDM), filtered to exactly the currently
+//! user-tracked `(train_uid, date)` set. By default
+//! (`--movement-feed-backend redis-stream`) it reads the `movement-events`
+//! Redis Stream that `movement-relay` fans the RDM Kafka topic into; the
+//! `kafka` backend (a direct RDM Kafka consumer) is only used when asked
+//! for by name. Matched events are forwarded to `api`'s `/private/*`
+//! ingest endpoints. NOT a cron-style poller -- see
 //! docs/superpowers/plans/2026-08-28-train-tracking.md's Global
-//! Constraints for why this crate isn't named `poller-trust`.
+//! Constraints (plan since pruned; see history, commit `ec42cf95`) for
+//! why this crate isn't named `poller-trust`.
 
 mod config;
 mod eta;

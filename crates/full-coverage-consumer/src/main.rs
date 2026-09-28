@@ -1,13 +1,17 @@
-//! `full-coverage-consumer`: a second, independent Kafka consumer against
-//! the same RDM Train Movements feed `trust-consumer` reads, correlating
-//! every event against the FULL scheduled population of every
-//! shadow-computed line (not a small pinned-train set) -- see
+//! `full-coverage-consumer`: a second, independent consumer of the same RDM
+//! Train Movements feed `trust-consumer` reads -- by default its own
+//! consumer group on the `movement-events` Redis Stream that
+//! `movement-relay` fills (`--movement-feed-backend kafka` reads RDM's
+//! Kafka topic directly instead) -- correlating every event against the
+//! FULL scheduled population of every shadow-computed line (not a small
+//! pinned-train set) -- see
 //! docs/superpowers/specs/2026-09-04-option-b-live-consumer-design.md and
 //! docs/superpowers/plans/2026-09-04-option-b-live-consumer-plan.md.
-//! SHADOW MODE ONLY: writes real per-line/per-station stats, but nothing
-//! reads them into a real line's severity/DataQuality while
-//! `LineDefinition.full_coverage_enabled` stays false everywhere (see the
-//! design doc's binding condition).
+//! Writes per-line/per-station stats for every shadow-computed line; the
+//! aggregator only reads them into a line's severity/`DataQuality` for a
+//! line that is full-coverage-enabled (`LineDefinition.full_coverage_enabled`,
+//! or the aggregator's `--full-coverage-enabled-default`) -- see
+//! `aggregator::aggregation::merge_full_coverage`.
 //!
 //! # Startup (2026-09-27)
 //!

@@ -2,7 +2,7 @@
 
 `stanox-crs.csv` maps a TRUST Train Movements STANOX (`loc_stanox`) to its
 National Rail CRS code, for `crates/trust-consumer/src/stanox_crs.rs`'s
-loader. This file is the full extraction methodology and exclusion policy
+loader (and its copy, `crates/trust-backlog-consumer/src/stanox_crs.rs`). This file is the full extraction methodology and exclusion policy
 the data was generated under; the Rust module's doc comment only summarises
 and points here.
 
@@ -19,9 +19,11 @@ STANOX->CRS table to bridge the two.
 
 ## Where the data comes from
 
-This crate ships no live CIF feed connection (that's a separate, larger,
-unbuilt ingestion pipeline -- see
-docs/superpowers/specs/2026-08-30-schedule-feed-ingress-design.md). Instead,
+When this table was built, the crate had no live CIF feed connection (that
+was a separate, larger, then-unbuilt ingestion pipeline -- see
+docs/superpowers/specs/2026-08-30-schedule-feed-ingress-design.md; it has
+since shipped as `schedule-ingest` + `schedule-reference`, see "This file's
+role since the live table" below). Instead,
 `stanox-crs.csv` is a **generated, checked-in snapshot**, extracted once
 from a real CIF full-timetable extract already available in this repo's
 example payload: `timetable_full.zip` (not committed to git -- 73MB

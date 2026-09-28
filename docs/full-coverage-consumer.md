@@ -2,8 +2,12 @@
 
 `full-coverage-consumer` correlates every TRUST movement against the full
 scheduled population of each shadow line and writes one
-`full_coverage_line_stats` row per line per rail day. It is shadow-only while
-every line's `full_coverage_enabled` is false.
+`full_coverage_line_stats` row per line per rail day. The aggregator merges
+those rows into a line's status only for full-coverage-enabled lines: a line
+whose TOML sets `full_coverage_enabled = true`, or every line when
+`FULL_COVERAGE_ENABLED_DEFAULT` is true (binary default `false`; the chart's
+`aggregator.fullCoverageEnabledDefault` and `api.fullCoverageEnabledDefault`
+default to `true`). Otherwise its output is shadow-only.
 
 Code: `crates/full-coverage-consumer/src/{main,replay,population_reload,day,stats}.rs`.
 
@@ -81,12 +85,12 @@ Rows written before 2026-09-27 were all marked `partial` by migration
 The table is keyed by `(line_id, service_date)`, one row per line per rail
 day, so earlier days can be audited. The aggregator deletes rows older than
 `FULL_COVERAGE_LINE_STATS_RETENTION_DAYS` (default 90). To see one line's
-history, run `cargo run -p api --bin compare_full_coverage` or query the
+history, run `cargo run -p api --bin compare_full_coverage -- --line-id <id>` or query the
 table:
 
 ```sql
 SELECT service_date, availability, partial, total, cancelled
-FROM full_coverage_line_stats WHERE line_id = 'waterloo-reading'
+FROM full_coverage_line_stats WHERE line_id = 'swr-waterloo-reading'
 ORDER BY service_date DESC;
 ```
 

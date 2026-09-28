@@ -1,5 +1,6 @@
-//! `MovementFeed`: the shared trait between `crates/trust-consumer` and
-//! `crates/full-coverage-consumer`'s consume loops and their transport.
+//! `MovementFeed`: the shared trait between the `movement-events` consume
+//! loops (`crates/trust-consumer`, `crates/full-coverage-consumer`, and
+//! `crates/trust-backlog-consumer`) and their transport.
 //! Historically each crate hand-duplicated this trait plus its own Kafka
 //! implementation (`crates/trust-consumer/src/feed/{mod,kafka}.rs`,
 //! `crates/full-coverage-consumer/src/feed/{mod,kafka}.rs`) -- that
@@ -13,7 +14,7 @@
 //!
 //! `crates/movement-relay`'s own Kafka consume loop does NOT depend on
 //! this crate -- it is a producer/publisher into `movement-events`, not a
-//! `MovementFeed` implementer. This crate is consumed only by the two
+//! `MovementFeed` implementer. This crate is consumed only by the three
 //! downstream Redis Streams readers.
 
 pub mod active_feed;

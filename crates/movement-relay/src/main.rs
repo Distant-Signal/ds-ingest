@@ -1,7 +1,8 @@
 //! `movement-relay`: the sole real Kafka client against RDM's Train
 //! Movements product from Deploy B onward, fanning out into the
-//! `movement-events` Redis Stream both `trust-consumer` and
-//! `full-coverage-consumer` read from. See
+//! `movement-events` Redis Stream that `trust-consumer`,
+//! `full-coverage-consumer` and `trust-backlog-consumer` each read from
+//! under their own consumer group. See
 //! docs/superpowers/specs/2026-09-04-movement-relay-design.md and
 //! docs/superpowers/plans/2026-09-04-movement-relay-plan.md.
 
