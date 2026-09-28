@@ -78,8 +78,12 @@ async fn main() -> anyhow::Result<()> {
     // so `ActiveFeed<RedisStreamMovementFeed>` type-checks even though the
     // `Kafka` variant is never constructed.
     let mut feed: ActiveFeed<RedisStreamMovementFeed> = ActiveFeed::RedisStream(
+        // Redis down at startup is waited for (each attempt logged, beating
+        // progress so /livez stays 200); afterwards every Redis command is
+        // bounded and a failure is retried by this loop. See
+        // `common::redis_conn`.
         Box::new(
-            RedisStreamMovementFeed::connect(
+            RedisStreamMovementFeed::connect_until_ready(
                 common::redis_auth::redis_url_with_password(
                     &config.redis_url,
                     config.redis_password.as_ref(),
@@ -88,6 +92,8 @@ async fn main() -> anyhow::Result<()> {
                 "trust-event-backlog",
                 "trust-event-backlog-1",
                 Duration::from_secs(config.redis_autoclaim_min_idle_secs),
+                common::startup::CONNECT_BACKOFF,
+                &progress,
             )
             .await?,
         ),

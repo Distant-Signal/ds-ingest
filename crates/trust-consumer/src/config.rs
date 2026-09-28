@@ -90,7 +90,11 @@ pub struct Config {
     /// of this). A healthy iteration takes a few seconds (the `XREADGROUP`
     /// blocks for at most 5s); this is sized well above the worst
     /// legitimate one, every HTTP call in it being bounded by
-    /// `common::ingest::CONSUMER_REQUEST_TIMEOUT` (60s).
+    /// `common::ingest::CONSUMER_REQUEST_TIMEOUT` (60s) and every Redis
+    /// command by `common::redis_conn` (one reconnect attempt of at most
+    /// 5s, a reply within 30s; a failed command ends the cycle). A Redis
+    /// outage is therefore a run of fast failed cycles, each beating
+    /// progress, never one stalled iteration.
     #[arg(long, env, default_value_t = 300)]
     pub progress_stall_secs: u64,
 

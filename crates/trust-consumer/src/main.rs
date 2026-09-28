@@ -55,17 +55,7 @@ async fn main() -> anyhow::Result<()> {
         }
         MovementFeedBackend::RedisStream => ActiveFeed::RedisStream(
             Box::new(
-                RedisStreamMovementFeed::connect(
-                    common::redis_auth::redis_url_with_password(
-                        &config.redis_url,
-                        config.redis_password.as_ref(),
-                    )?
-                    .expose(),
-                    "trust-consumer",
-                    "trust-consumer-1",
-                    Duration::from_secs(config.redis_autoclaim_min_idle_secs),
-                )
-                .await?,
+                connect_redis_feed(&config, common::startup::CONNECT_BACKOFF, &progress).await?,
             ),
             connection_state,
             "trust_consumer_ready",
@@ -236,6 +226,36 @@ async fn main() -> anyhow::Result<()> {
         // `health_http::Progress`.
         progress.beat();
     }
+}
+
+/// The Redis Streams backend, connected once Redis is reachable. Redis
+/// being down at startup (its pod recreated by the same rollout) is waited
+/// for with every attempt logged and beating `progress`, so `/livez` stays
+/// 200 through a Redis outage well past `PROGRESS_STALL_SECS` (300s by
+/// default) instead of the pod being killed or exiting into
+/// CrashLoopBackOff. After startup each Redis command is bounded (see
+/// `common::redis_conn`) and a failure is a `Cycle::Failed`: backed off by
+/// `ERROR_BACKOFF`, progress beaten, retried.
+async fn connect_redis_feed(
+    config: &Config,
+    backoff: common::backoff::Backoff,
+    progress: &health_http::Progress,
+) -> anyhow::Result<RedisStreamMovementFeed> {
+    // REDIS_PASSWORD, when set, is applied here (common::redis_auth). The
+    // result carries the password: pass it on, never log it.
+    let redis_url = common::redis_auth::redis_url_with_password(
+        &config.redis_url,
+        config.redis_password.as_ref(),
+    )?;
+    RedisStreamMovementFeed::connect_until_ready(
+        redis_url.expose(),
+        "trust-consumer",
+        "trust-consumer-1",
+        Duration::from_secs(config.redis_autoclaim_min_idle_secs),
+        backoff,
+        progress,
+    )
+    .await
 }
 
 /// How long to wait before retrying after a failed cycle. See its one use
@@ -1084,5 +1104,128 @@ mod tests {
         )
         .await;
         assert_eq!(outcome, Cycle::Committed);
+    }
+}
+
+/// Redis unreachable while trust-consumer starts (the Redis pod recreated
+/// by the same rollout): same guarantee as movement-relay's
+/// `livez_stays_ok_while_redis_is_unreachable`.
+#[cfg(test)]
+mod redis_outage_tests {
+    use clap::Parser;
+
+    use super::*;
+
+    /// A local port with nothing listening on it (bound, then released).
+    fn closed_local_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn config(redis_url: &str) -> Config {
+        let stanox_crs_file = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../reference-data/stanox-crs.csv");
+        Config::try_parse_from([
+            "trust-consumer",
+            "--kafka-brokers",
+            "kafka.example.com:9092",
+            "--kafka-topic",
+            "test-topic",
+            "--kafka-sasl-username",
+            "user",
+            "--kafka-sasl-password",
+            "pass",
+            "--kafka-sasl-mechanism",
+            "PLAIN",
+            "--internal-oauth-token-url",
+            "http://auth.example.com/token",
+            "--internal-oauth-client-id",
+            "client-id",
+            "--internal-oauth-username",
+            "svc-user",
+            "--internal-oauth-password",
+            "svc-pass",
+            "--stanox-crs-file",
+            stanox_crs_file.to_str().unwrap(),
+            "--redis-url",
+            redis_url,
+        ])
+        .expect("minimal required args should parse")
+    }
+
+    /// `GET path` against the health listener, as `(status, body)`.
+    /// Retries briefly, since the listener binds in a spawned task.
+    async fn get(port: u16, path: &str) -> (u16, String) {
+        let http = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}{path}");
+        for _ in 0..100 {
+            if let Ok(response) = http.get(&url).send().await {
+                let status = response.status().as_u16();
+                return (status, response.text().await.unwrap());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("health listener never came up");
+    }
+
+    /// While Redis is unreachable, `/livez` stays 200 -- well past the
+    /// stall window -- and only readiness (`/healthz`) is 503. With
+    /// redis-rs's default connection manager the connect sat in unlogged
+    /// internal retries for minutes, beating nothing.
+    #[tokio::test]
+    async fn livez_stays_ok_while_redis_is_unreachable() {
+        let health_port = closed_local_port();
+        let config = config(&format!("redis://127.0.0.1:{}", closed_local_port()));
+        assert_eq!(
+            config.movement_feed_backend,
+            MovementFeedBackend::RedisStream
+        );
+        let stall_after = Duration::from_secs(1);
+        let (_ready, progress) = health_http::spawn_with_progress(
+            format!("127.0.0.1:{health_port}"),
+            "connected",
+            "disconnected",
+            stall_after,
+        );
+
+        let connecting = tokio::spawn(async move {
+            connect_redis_feed(
+                &config,
+                common::backoff::Backoff::new(
+                    Duration::from_millis(50),
+                    Duration::from_millis(200),
+                ),
+                &progress,
+            )
+            .await
+            .map(|_| ())
+        });
+
+        // 4x the stall window.
+        for _ in 0..16 {
+            assert_eq!(
+                get(health_port, "/livez").await,
+                (200, "alive".to_string()),
+                "liveness must not depend on Redis"
+            );
+            assert_eq!(get(health_port, "/healthz").await.0, 503, "not ready");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert!(
+            !connecting.is_finished(),
+            "an unreachable Redis is waited for, not exited on"
+        );
+
+        // Control: the same window with nothing beating IS a stall, so the
+        // loop above really was kept alive by the connect retries.
+        connecting.abort();
+        tokio::time::sleep(stall_after * 2).await;
+        assert_eq!(
+            get(health_port, "/livez").await,
+            (503, "stalled".to_string())
+        );
     }
 }

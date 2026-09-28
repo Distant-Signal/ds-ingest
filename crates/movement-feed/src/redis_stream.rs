@@ -93,6 +93,17 @@ const PEL_REPLAY_BATCH_COUNT: usize = 1000;
 /// was raised.
 const LIVE_READ_BATCH_COUNT: usize = 100;
 
+/// How long an ordinary `>` read waits server-side for new entries
+/// (`XREADGROUP ... BLOCK`). PEL-replay reads pass `BLOCK 0`, which Redis
+/// ignores for an explicit id.
+const LIVE_READ_BLOCK_MS: usize = 5000;
+
+// Every command is bounded by `common::redis_conn::RESPONSE_TIMEOUT`, so a
+// blocking read must return well within it or a quiet stream would look
+// like a dead connection.
+const _: () =
+    assert!((LIVE_READ_BLOCK_MS as u128) * 2 < common::redis_conn::RESPONSE_TIMEOUT.as_millis());
+
 pub struct RedisStreamMovementFeed {
     conn: ConnectionManager,
     stream: String,
@@ -143,13 +154,69 @@ impl RedisStreamMovementFeed {
     /// `"trust-consumer-1"`), matching `enricher::stream::CONSUMER`'s own
     /// one-fixed-name convention and this design's own
     /// single-replica constraint (design doc Decision 2).
+    ///
+    /// One bounded attempt (see `common::redis_conn`): errors within
+    /// seconds if Redis is unreachable. Services start through
+    /// [`Self::connect_until_ready`] instead.
     pub async fn connect(
         redis_url: &str,
         group: impl Into<String>,
         consumer: impl Into<String>,
         autoclaim_min_idle: Duration,
     ) -> anyhow::Result<Self> {
-        Self::connect_to_stream(redis_url, STREAM, group, consumer, autoclaim_min_idle).await
+        let client = redis::Client::open(redis_url)?;
+        Self::connect_to_stream(&client, STREAM, group, consumer, autoclaim_min_idle).await
+    }
+
+    /// [`Self::connect`], retried on `backoff` until it succeeds (INF-5):
+    /// Redis unreachable, still loading its AOF (`LOADING`), or failing
+    /// the consumer-group setup is waited for, not exited on. Each failed
+    /// attempt is logged and beats `progress`, so the worker's `/livez`
+    /// stays 200 while this waits and a Redis outage at startup cannot get
+    /// the pod killed. Pass `common::startup::CONNECT_BACKOFF` outside
+    /// tests. Only an unparseable `redis_url` is an error.
+    ///
+    /// Once connected, every command is bounded (one reconnect attempt of
+    /// at most `common::redis_conn::CONNECT_TIMEOUT`, a reply within
+    /// `RESPONSE_TIMEOUT`) and returns its error to the caller, whose loop
+    /// backs off and retries -- redis-rs never retries internally.
+    pub async fn connect_until_ready(
+        redis_url: &str,
+        group: &str,
+        consumer: &str,
+        autoclaim_min_idle: Duration,
+        backoff: common::backoff::Backoff,
+        progress: &health_http::Progress,
+    ) -> anyhow::Result<Self> {
+        Self::connect_stream_until_ready(
+            redis_url,
+            STREAM,
+            group,
+            consumer,
+            autoclaim_min_idle,
+            backoff,
+            progress,
+        )
+        .await
+    }
+
+    async fn connect_stream_until_ready(
+        redis_url: &str,
+        stream: &str,
+        group: &str,
+        consumer: &str,
+        autoclaim_min_idle: Duration,
+        backoff: common::backoff::Backoff,
+        progress: &health_http::Progress,
+    ) -> anyhow::Result<Self> {
+        let client = redis::Client::open(redis_url)?;
+        Ok(common::startup::retry_until_ready(
+            "Redis movement-events stream",
+            backoff,
+            Some(progress),
+            || Self::connect_to_stream(&client, stream, group, consumer, autoclaim_min_idle),
+        )
+        .await)
     }
 
     /// Test-only constructor: connects against an explicit stream name
@@ -165,14 +232,8 @@ impl RedisStreamMovementFeed {
         consumer: impl Into<String>,
         autoclaim_min_idle: Duration,
     ) -> anyhow::Result<Self> {
-        Self::connect_to_stream(
-            redis_url,
-            &stream.into(),
-            group,
-            consumer,
-            autoclaim_min_idle,
-        )
-        .await
+        let client = redis::Client::open(redis_url)?;
+        Self::connect_to_stream(&client, &stream.into(), group, consumer, autoclaim_min_idle).await
     }
 
     /// [`Self::connect`] against an explicitly named stream, for other
@@ -186,18 +247,21 @@ impl RedisStreamMovementFeed {
         consumer: impl Into<String>,
         autoclaim_min_idle: Duration,
     ) -> anyhow::Result<Self> {
-        Self::connect_to_stream(redis_url, stream, group, consumer, autoclaim_min_idle).await
+        let client = redis::Client::open(redis_url)?;
+        Self::connect_to_stream(&client, stream, group, consumer, autoclaim_min_idle).await
     }
 
+    /// One bounded connect attempt plus the consumer-group setup; any
+    /// failure is returned (see [`Self::connect_until_ready`] for the
+    /// retrying form).
     async fn connect_to_stream(
-        redis_url: &str,
+        client: &redis::Client,
         stream: &str,
         group: impl Into<String>,
         consumer: impl Into<String>,
         autoclaim_min_idle: Duration,
     ) -> anyhow::Result<Self> {
-        let client = redis::Client::open(redis_url)?;
-        let mut conn = client.get_connection_manager().await?;
+        let mut conn = common::redis_conn::connect(client).await?;
         let group = group.into();
 
         ensure_group(&mut conn, stream, &group).await?;
@@ -576,9 +640,70 @@ fn next_pel_replay_cursor(
     }
 }
 
+/// Whether a feed error is Redis reporting that the stream or this
+/// consumer group does not exist (`-NOGROUP ...`).
+fn is_nogroup(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<redis::RedisError>()
+        .and_then(redis::RedisError::code)
+        == Some("NOGROUP")
+}
+
 #[async_trait]
 impl MovementFeed for RedisStreamMovementFeed {
+    /// See [`Self::read_next_batch`]. A `NOGROUP` failure (Redis came back
+    /// from an outage without its data: the stream, and with it this
+    /// consumer group, is gone) also recreates the group, exactly as a
+    /// restart would (`XGROUP CREATE ... $ MKSTREAM`), so the next call
+    /// reads again instead of every call failing `NOGROUP` until someone
+    /// restarts the pod -- which `/livez` never would, since each failed
+    /// cycle beats progress. The error is still returned, so the caller's
+    /// loop backs off as for any failed read. Same self-heal as `enricher`.
     async fn next_batch(&mut self) -> anyhow::Result<Vec<String>> {
+        let result = self.read_next_batch().await;
+        if let Err(err) = &result
+            && is_nogroup(err)
+        {
+            self.recreate_group().await;
+        }
+        result
+    }
+
+    async fn commit(&mut self) -> anyhow::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<String> = std::mem::take(&mut self.pending)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let _: i64 = self.conn.xack(&self.stream, &self.group, &ids).await?;
+        Ok(())
+    }
+
+    async fn reject_batch(&mut self, detail: &str) -> anyhow::Result<()> {
+        RedisStreamMovementFeed::reject_batch(self, detail).await
+    }
+}
+
+impl RedisStreamMovementFeed {
+    /// After `NOGROUP`: recreates the consumer group (and the stream, if
+    /// missing) and starts over from an empty pending-entries list. A
+    /// failure is only logged; the next `NOGROUP` read tries again.
+    async fn recreate_group(&mut self) {
+        tracing::warn!(
+            stream = %self.stream,
+            group = %self.group,
+            "consumer group is missing (Redis lost its data?); recreating it to read new entries"
+        );
+        self.pending.clear();
+        self.isolating = false;
+        self.pel_replay_cursor = Some("0".to_string());
+        if let Err(err) = ensure_group(&mut self.conn, &self.stream, &self.group).await {
+            tracing::error!(error = ?err, group = %self.group, "failed to recreate the consumer group");
+        }
+    }
+
+    async fn read_next_batch(&mut self) -> anyhow::Result<Vec<String>> {
         // Periodic XAUTOCLAIM sweep, checked once per call -- cheap
         // (skips immediately if not due) and keeps this on the same
         // "checked every loop iteration" shape every existing multi-cadence
@@ -617,7 +742,7 @@ impl MovementFeed for RedisStreamMovementFeed {
                     // (and isolation reads one entry at a time, see
                     // `isolating`).
                     .count(count)
-                    .block(if replaying_pel { 0 } else { 5000 }),
+                    .block(if replaying_pel { 0 } else { LIVE_READ_BLOCK_MS }),
             )
             .await?;
 
@@ -676,24 +801,6 @@ impl MovementFeed for RedisStreamMovementFeed {
         Ok(payloads)
     }
 
-    async fn commit(&mut self) -> anyhow::Result<()> {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
-        let ids: Vec<String> = std::mem::take(&mut self.pending)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-        let _: i64 = self.conn.xack(&self.stream, &self.group, &ids).await?;
-        Ok(())
-    }
-
-    async fn reject_batch(&mut self, detail: &str) -> anyhow::Result<()> {
-        RedisStreamMovementFeed::reject_batch(self, detail).await
-    }
-}
-
-impl RedisStreamMovementFeed {
     /// Reclaims entries that have sat unacked in the consumer group's
     /// pending-entries list for at least `autoclaim_min_idle` -- the
     /// general safety net for entries stuck under a genuinely dead
@@ -2291,5 +2398,234 @@ mod redis_tests {
         );
 
         cleanup(&stream).await;
+    }
+
+    /// Redis back from an outage without its data (stream and group gone):
+    /// the read that hits `NOGROUP` fails, recreates the group, and the
+    /// following read works -- no restart needed.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn a_lost_consumer_group_is_recreated_after_nogroup() {
+        let stream = unique_stream("nogroup");
+        let mut feed = connect(&stream).await;
+        assert!(feed.next_batch().await.unwrap().is_empty());
+
+        cleanup(&stream).await;
+        let err = feed.next_batch().await.expect_err("the group is gone");
+        assert!(is_nogroup(&err), "{err:?}");
+
+        assert!(feed.next_batch().await.unwrap().is_empty());
+        let client = redis::Client::open(redis_url()).unwrap();
+        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        let _: String = redis::cmd("XADD")
+            .arg(&stream)
+            .arg("*")
+            .arg("payload")
+            .arg("after-recreate")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(feed.next_batch().await.unwrap(), vec!["after-recreate"]);
+        feed.commit().await.unwrap();
+        cleanup(&stream).await;
+    }
+}
+
+/// A Redis outage must never park a consumer inside redis-rs: startup waits
+/// visibly (logged, beating progress), and once running every command fails
+/// within seconds so the consumer's own loop retries. See
+/// `common::redis_conn`.
+#[cfg(test)]
+mod outage_tests {
+
+    use redis::IntoConnectionInfo;
+
+    use super::*;
+
+    /// A local port with nothing listening on it (bound, then released).
+    fn closed_local_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// Redis unreachable at startup: `connect_until_ready` keeps retrying
+    /// (it does not return an error for the consumer to exit on) and every
+    /// failed attempt beats progress, so a stall watchdog never fires.
+    #[tokio::test]
+    async fn connect_until_ready_waits_for_an_unreachable_redis_and_beats_progress() {
+        let redis_url = format!("redis://127.0.0.1:{}", closed_local_port());
+        let progress = health_http::Progress::new(Duration::from_millis(500));
+        let watcher = progress.clone();
+        let connecting = tokio::spawn(async move {
+            RedisStreamMovementFeed::connect_until_ready(
+                &redis_url,
+                "trust-consumer",
+                "trust-consumer-1",
+                Duration::from_secs(30),
+                common::backoff::Backoff::new(
+                    Duration::from_millis(20),
+                    Duration::from_millis(100),
+                ),
+                &progress,
+            )
+            .await
+            .map(|_| ())
+        });
+        // 4x the stall window.
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!watcher.is_stalled(), "failed attempts must beat progress");
+        }
+        assert!(
+            !connecting.is_finished(),
+            "an unreachable Redis is waited for, not exited on"
+        );
+        connecting.abort();
+    }
+
+    /// Only an unparseable URL is an error; it is not retried forever.
+    #[tokio::test]
+    async fn connect_until_ready_rejects_an_unparseable_url() {
+        let progress = health_http::Progress::new(Duration::from_secs(60));
+        let result = RedisStreamMovementFeed::connect_until_ready(
+            "not a url",
+            "g",
+            "c",
+            Duration::from_secs(30),
+            common::startup::CONNECT_BACKOFF,
+            &progress,
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    /// A TCP proxy in front of the real Redis that the test can take down
+    /// (closing every proxied connection, then refusing new ones) and bring
+    /// back on the same port: a Redis pod restart, without touching the
+    /// shared local Redis.
+    struct Proxy {
+        port: u16,
+        tasks: tokio::task::JoinSet<()>,
+        upstream: String,
+    }
+
+    impl Proxy {
+        async fn start(upstream: String) -> Self {
+            let mut proxy = Self {
+                port: closed_local_port(),
+                tasks: tokio::task::JoinSet::new(),
+                upstream,
+            };
+            proxy.bring_up().await;
+            proxy
+        }
+
+        async fn bring_up(&mut self) {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", self.port))
+                .await
+                .expect("rebind the proxy port");
+            let upstream = self.upstream.clone();
+            self.tasks.spawn(async move {
+                // Dropped (aborting, and so closing, every proxied
+                // connection) together with the listener when this task is
+                // aborted by `take_down`.
+                let mut connections = tokio::task::JoinSet::new();
+                while let Ok((mut client, _)) = listener.accept().await {
+                    let upstream = upstream.clone();
+                    connections.spawn(async move {
+                        if let Ok(mut server) = tokio::net::TcpStream::connect(&upstream).await {
+                            let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                        }
+                    });
+                }
+            });
+        }
+
+        /// Stops listening and closes every proxied connection.
+        async fn take_down(&mut self) {
+            self.tasks.shutdown().await;
+        }
+    }
+
+    /// `REDIS_URL` (plus `REDIS_PASSWORD`), as the services combine them.
+    fn direct_redis_url() -> String {
+        let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
+        with_password(&url)
+    }
+
+    fn with_password(url: &str) -> String {
+        let password = std::env::var("REDIS_PASSWORD")
+            .ok()
+            .map(common::secret::Secret::from);
+        common::redis_auth::redis_url_with_password(url, password.as_ref())
+            .unwrap()
+            .expose()
+            .to_owned()
+    }
+
+    fn upstream_addr() -> String {
+        match direct_redis_url().into_connection_info().unwrap().addr {
+            redis::ConnectionAddr::Tcp(host, port) => format!("{host}:{port}"),
+            other => panic!("this test needs a TCP REDIS_URL, got {other:?}"),
+        }
+    }
+
+    /// Redis goes away mid-run and comes back. While it is down every read
+    /// fails within seconds (one bounded reconnect attempt, no redis-rs
+    /// backoff), so the consumer loop can log, back off and beat progress;
+    /// once it is back the same feed reads again, with no restart.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn reads_fail_fast_during_a_redis_outage_and_recover_after_it() {
+        let mut proxy = Proxy::start(upstream_addr()).await;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stream = format!("movement-events-test-outage-{nanos}");
+        let mut feed = RedisStreamMovementFeed::connect_for_test(
+            &with_password(&format!("redis://127.0.0.1:{}", proxy.port)),
+            &stream,
+            "test-group",
+            "test-consumer",
+            Duration::from_secs(3600),
+        )
+        .await
+        .expect("connects through the proxy");
+        assert!(feed.next_batch().await.unwrap().is_empty());
+
+        proxy.take_down().await;
+        for attempt in 0..4 {
+            let started = std::time::Instant::now();
+            let result = feed.next_batch().await;
+            let took = started.elapsed();
+            assert!(result.is_err(), "attempt {attempt}: Redis is down");
+            assert!(
+                took < common::redis_conn::CONNECT_TIMEOUT + Duration::from_secs(1),
+                "attempt {attempt} took {took:?}: a read during an outage must fail fast"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        proxy.bring_up().await;
+        // The first read after the outage may still see the last failed
+        // reconnect attempt; the consumer loop's retry reconnects.
+        let mut recovered = false;
+        for _ in 0..10 {
+            if feed.next_batch().await.is_ok() {
+                recovered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(recovered, "the same feed reads again once Redis is back");
+
+        let client = redis::Client::open(direct_redis_url()).unwrap();
+        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        let _: redis::RedisResult<i64> =
+            redis::cmd("DEL").arg(&stream).query_async(&mut conn).await;
     }
 }

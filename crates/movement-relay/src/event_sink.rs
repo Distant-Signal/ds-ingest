@@ -6,10 +6,8 @@
 //! crates/trust-consumer/src/feed/mod.rs's now-shared `FakeMovementFeed`),
 //! applied here on the producer side for the first time in this codebase.
 
-use std::time::Duration;
-
 use async_trait::async_trait;
-use redis::aio::{ConnectionManager, ConnectionManagerConfig};
+use redis::aio::ConnectionManager;
 
 const STREAM: &str = "movement-events";
 
@@ -68,30 +66,6 @@ pub struct RedisEventSink {
     maxlen: u64,
 }
 
-/// Upper bound on one TCP/handshake attempt to Redis, so a blackholed
-/// address fails the attempt instead of hanging on the kernel's own
-/// ~2-minute SYN timeout.
-const REDIS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The `ConnectionManager` settings every movement-relay Redis connection
-/// uses: one attempt per (re)connect, bounded by `REDIS_CONNECT_TIMEOUT`.
-///
-/// redis-rs's defaults retry a failed (re)connect 6 more times on a backoff
-/// of 1s then 60s (capped) each, plus jitter -- minutes, with nothing
-/// logged. That is what made movement-relay unready (and, with liveness on
-/// `/healthz`, killed at ~2 minutes) whenever it started while the Redis
-/// pod was being recreated: it sat inside the initial connect, never
-/// polled Kafka, so never got a partition assignment. The retrying lives
-/// in movement-relay itself instead: `connect_until_ready` at startup
-/// (logged, and beating liveness progress), and `main::run_cycle`'s
-/// `ERROR_BACKOFF` afterwards (each failed XADD triggers one background
-/// reconnect, which the next cycle's XADD awaits).
-pub fn redis_connection_config() -> ConnectionManagerConfig {
-    ConnectionManagerConfig::new()
-        .set_number_of_retries(0)
-        .set_connection_timeout(REDIS_CONNECT_TIMEOUT)
-}
-
 impl RedisEventSink {
     /// Connects to Redis, retrying on `backoff` until it is reachable
     /// (INF-5: an unreachable Redis at startup -- e.g. its pod being
@@ -105,10 +79,14 @@ impl RedisEventSink {
         progress: &health_http::Progress,
     ) -> anyhow::Result<Self> {
         let client = redis::Client::open(redis_url)?;
-        let conn = common::startup::retry_until_ready("Redis", backoff, Some(progress), || {
-            client.get_connection_manager_with_config(redis_connection_config())
-        })
-        .await;
+        // Bounded attempts (`common::redis_conn`): a failed attempt is
+        // logged and beats `progress` instead of redis-rs retrying for
+        // minutes, unlogged. Later reconnects ride on `main::run_cycle`'s
+        // `ERROR_BACKOFF` (each failed XADD starts one background
+        // reconnect, which the next cycle's XADD awaits).
+        let conn =
+            common::redis_conn::connect_until_ready("Redis", &client, backoff, Some(progress))
+                .await;
         Ok(Self { conn, maxlen })
     }
 }
@@ -179,6 +157,8 @@ impl EventSink for FakeEventSink {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     /// A local port with nothing listening on it (bound, then released).

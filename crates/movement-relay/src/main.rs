@@ -259,11 +259,9 @@ trait LagConnection: Sized + Send + 'static {
 impl LagConnection for redis::aio::ConnectionManager {
     async fn connect(redis_url: &str) -> anyhow::Result<Self> {
         let client = redis::Client::open(redis_url)?;
-        // One bounded attempt per tick (see `redis_connection_config`):
+        // One bounded attempt per tick (see `common::redis_conn`):
         // `run_lag_tick` already retries every tick.
-        Ok(client
-            .get_connection_manager_with_config(event_sink::redis_connection_config())
-            .await?)
+        Ok(common::redis_conn::connect(&client).await?)
     }
 
     async fn group_lag(&mut self, group: &str) -> anyhow::Result<Option<i64>> {
