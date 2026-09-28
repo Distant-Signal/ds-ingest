@@ -25,6 +25,8 @@ pub(crate) fn synthesize_departure(uid: &str, derived: &DerivedState) -> Station
         // TRUST-derived synthesis, not a real LDBWS sample.
         platform: None,
         planned_platform: None,
+        rsid: None,
+        calling_points: Vec::new(),
     }
 }
 
@@ -77,6 +79,8 @@ pub fn build_line_row(
                     skipped_stations: vec![],
                     platform: None,
                     planned_platform: None,
+                    rsid: None,
+                    calling_points: Vec::new(),
                 }),
             },
         )
