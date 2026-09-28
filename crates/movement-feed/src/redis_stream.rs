@@ -584,11 +584,7 @@ async fn ensure_group(
 /// The group's `last-delivered-id` from `XINFO GROUPS`, or `None` (logged)
 /// if it cannot be read -- the caller then only loses the precise
 /// `NOGROUP` recovery position, see [`recreate_start_id`].
-async fn seed_last_delivered_id(
-    conn: &mut RedisConn,
-    stream: &str,
-    group: &str,
-) -> Option<String> {
+async fn seed_last_delivered_id(conn: &mut RedisConn, stream: &str, group: &str) -> Option<String> {
     let result: anyhow::Result<Option<String>> = async {
         let groups: Vec<redis::Value> = redis::cmd("XINFO")
             .arg("GROUPS")
