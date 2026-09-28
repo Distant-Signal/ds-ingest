@@ -5,10 +5,9 @@
 //! Redis Stream that `movement-relay` fans the RDM Kafka topic into; the
 //! `kafka` backend (a direct RDM Kafka consumer) is only used when asked
 //! for by name. Matched events are forwarded to `api`'s `/private/*`
-//! ingest endpoints. NOT a cron-style poller -- see
-//! docs/superpowers/plans/2026-08-28-train-tracking.md's Global
-//! Constraints (plan since pruned; see history, commit `ec42cf95`) for
-//! why this crate isn't named `poller-trust`.
+//! ingest endpoints. NOT a cron-style poller (it consumes a push stream
+//! continuously rather than fetching on an interval), which is why it is
+//! not named `poller-trust`.
 
 mod config;
 mod eta;

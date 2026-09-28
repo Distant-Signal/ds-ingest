@@ -1,15 +1,16 @@
 //! Best-effort resolution of a user's pin (origin CRS + scheduled
-//! departure time, date -- no train_uid) against the live TRUST feed. See
-//! this plan's Task 10 for why this matches on the first origin-station
-//! Movement event rather than on Activation alone (this app has no CIF
-//! schedule lookup to bridge Activation's train_uid to a departure time).
-//! A heuristic, not a guaranteed join -- same posture the design doc takes
-//! on Darwin correlation.
+//! departure time, date -- no train_uid) against the live TRUST feed, by
+//! matching the first Movement event at the origin station near the
+//! scheduled time. trust-consumer does no CIF schedule lookup itself, so an
+//! Activation alone cannot be tied to a pin that lacks a train_uid. A
+//! heuristic, not a guaranteed join.
 //!
-//! This is the fallback path. The reliable path is
-//! `process::Reference::by_train_uid`'s Activation fast path, which knows
-//! the train's real identity; everything here exists for the pins that
-//! genuinely don't have one yet.
+//! This is the fallback path. api's schedule-first matching
+//! (`crates/api/src/data/schedule_matching.rs`, using
+//! `schedule_query::match_pin`) gives most pins a train_uid before any
+//! TRUST event arrives, and those resolve on
+//! `process::Reference::by_train_uid`'s Activation fast path; everything
+//! here exists for the pins that still don't have one.
 
 use chrono::{DateTime, Duration, Utc};
 

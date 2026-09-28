@@ -56,8 +56,14 @@ To free space, re-inject or delete records (see below).
 
 ## Inspecting
 
+`<fullname>` is the chart's full name: `<release>-distant-signal`, or just
+`<release>` when the release name already contains `distant-signal` (so
+`distant-signal-redis` for a release named `distant-signal`). With
+`redis.auth` on, the Redis container already has `REDISCLI_AUTH` set, so
+`redis-cli` run through `kubectl exec` authenticates by itself.
+
 ```sh
-REDIS="kubectl -n <namespace> exec deploy/<release>-redis -- redis-cli"
+REDIS="kubectl -n <namespace> exec deploy/<fullname>-redis -- redis-cli"
 $REDIS XLEN movement-events-deadletter
 $REDIS XRANGE movement-events-deadletter - + COUNT 20
 ```
