@@ -7,7 +7,7 @@
 //! applied here on the producer side for the first time in this codebase.
 
 use async_trait::async_trait;
-use redis::aio::ConnectionManager;
+use common::redis_conn::RedisConn;
 
 const STREAM: &str = "movement-events";
 
@@ -62,7 +62,7 @@ fn is_oom(err: &redis::RedisError) -> bool {
 }
 
 pub struct RedisEventSink {
-    conn: ConnectionManager,
+    conn: RedisConn,
     maxlen: u64,
 }
 
@@ -83,7 +83,9 @@ impl RedisEventSink {
         // logged and beats `progress` instead of redis-rs retrying for
         // minutes, unlogged. Later reconnects ride on `main::run_cycle`'s
         // `ERROR_BACKOFF` (each failed XADD starts one background
-        // reconnect, which the next cycle's XADD awaits).
+        // reconnect, which the next cycle's XADD awaits; a timed-out one
+        // -- possibly a half-open connection -- makes the next XADD open a
+        // new connection, see `common::redis_conn::RedisConn`).
         let conn =
             common::redis_conn::connect_until_ready("Redis", &client, backoff, Some(progress))
                 .await;

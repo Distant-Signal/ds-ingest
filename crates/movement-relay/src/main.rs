@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     let mut source = KafkaRawSource::connect(&config, ready, progress.clone())?;
 
-    tokio::spawn(stream_lag_loop::<redis::aio::ConnectionManager>(
+    tokio::spawn(stream_lag_loop::<common::redis_conn::RedisConn>(
         redis_url.expose().to_owned(),
         Duration::from_secs(config.stream_lag_poll_secs),
         config.movement_stream_maxlen,
@@ -242,7 +242,7 @@ const STREAM_LAG_GROUPS: [&str; 3] = [
 ];
 
 /// A Redis connection capable of computing `movement-events` consumer-group
-/// lag -- split out from a concrete `redis::aio::ConnectionManager` purely so
+/// lag -- split out from a concrete `common::redis_conn::RedisConn` purely so
 /// `stream_lag_loop`'s retry state machine (`run_lag_tick`) is unit-testable
 /// against a fake that can be told to fail its first N connect attempts,
 /// without a real Redis. Same fake-behind-a-trait shape `RawKafkaSource` /
@@ -256,7 +256,7 @@ trait LagConnection: Sized + Send + 'static {
 }
 
 #[async_trait::async_trait]
-impl LagConnection for redis::aio::ConnectionManager {
+impl LagConnection for common::redis_conn::RedisConn {
     async fn connect(redis_url: &str) -> anyhow::Result<Self> {
         let client = redis::Client::open(redis_url)?;
         // One bounded attempt per tick (see `common::redis_conn`):
@@ -389,7 +389,7 @@ async fn run_lag_tick<C: LagConnection>(redis_url: &str, conn: &mut Option<C>) -
 /// generalized over group name (this function serves three group names from
 /// one binary; enricher's own copy only ever serves one, `"enricher"`).
 async fn group_lag(
-    conn: &mut redis::aio::ConnectionManager,
+    conn: &mut common::redis_conn::RedisConn,
     group: &str,
 ) -> anyhow::Result<Option<i64>> {
     let reply: Vec<redis::Value> = redis::cmd("XINFO")

@@ -9,8 +9,8 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use common::redis_conn::RedisConn;
 use redis::AsyncCommands;
-use redis::aio::ConnectionManager;
 
 use crate::{DeadLetter, DeadLetterSink, MovementFeed};
 
@@ -105,7 +105,7 @@ const _: () =
     assert!((LIVE_READ_BLOCK_MS as u128) * 2 < common::redis_conn::RESPONSE_TIMEOUT.as_millis());
 
 pub struct RedisStreamMovementFeed {
-    conn: ConnectionManager,
+    conn: RedisConn,
     stream: String,
     group: String,
     consumer: String,
@@ -548,11 +548,7 @@ impl DeadLetterSink for RedisStreamMovementFeed {
 /// stream/group name (this crate serves two different group names -- and,
 /// in tests, many different stream names -- from one implementation,
 /// unlike enricher's single hardcoded `STREAM`/`GROUP`).
-async fn ensure_group(
-    conn: &mut ConnectionManager,
-    stream: &str,
-    group: &str,
-) -> anyhow::Result<()> {
+async fn ensure_group(conn: &mut RedisConn, stream: &str, group: &str) -> anyhow::Result<()> {
     let result: redis::RedisResult<()> = redis::cmd("XGROUP")
         .arg("CREATE")
         .arg(stream)
@@ -1455,7 +1451,7 @@ mod redis_tests {
 
     async fn cleanup(stream: &str) {
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut conn = client.get_connection_manager().await.unwrap();
+        let mut conn = common::redis_conn::connect(&client).await.unwrap();
         let _: redis::RedisResult<i64> = redis::cmd("DEL")
             .arg(stream)
             .arg(format!("{stream}{DEAD_LETTER_SUFFIX}"))
@@ -1466,7 +1462,7 @@ mod redis_tests {
     /// `(field -> value)` maps of every entry in `stream`'s dead-letter stream.
     async fn dead_letters(stream: &str) -> Vec<std::collections::HashMap<String, String>> {
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut conn = client.get_connection_manager().await.unwrap();
+        let mut conn = common::redis_conn::connect(&client).await.unwrap();
         let reply: redis::streams::StreamRangeReply = conn
             .xrange_all(format!("{stream}{DEAD_LETTER_SUFFIX}"))
             .await
@@ -1706,7 +1702,7 @@ mod redis_tests {
 
     async fn xadd(stream: &str, payload: &str) {
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut conn = client.get_connection_manager().await.unwrap();
+        let mut conn = common::redis_conn::connect(&client).await.unwrap();
         let _: String = redis::cmd("XADD")
             .arg(stream)
             .arg("*")
@@ -1741,7 +1737,7 @@ mod redis_tests {
         // deliberately written with a raw XADD rather than this module's own
         // `xadd` helper, which always sets "payload".
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut raw_conn = client.get_connection_manager().await.unwrap();
+        let mut raw_conn = common::redis_conn::connect(&client).await.unwrap();
         let _: String = redis::cmd("XADD")
             .arg(&stream)
             .arg("*")
@@ -1991,7 +1987,7 @@ mod redis_tests {
         .unwrap();
 
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut raw_conn = client.get_connection_manager().await.unwrap();
+        let mut raw_conn = common::redis_conn::connect(&client).await.unwrap();
         let mut pipe = redis::pipe();
         for i in 0..BACKLOG {
             pipe.cmd("XADD")
@@ -2067,7 +2063,7 @@ mod redis_tests {
         // Creates the group (at `$`) before anything is added.
         drop(connect().await);
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut conn = client.get_connection_manager().await.unwrap();
+        let mut conn = common::redis_conn::connect(&client).await.unwrap();
         let mut pipe = redis::pipe();
         for i in 0..total {
             pipe.cmd("XADD")
@@ -2141,7 +2137,7 @@ mod redis_tests {
         // Force aggressive trimming past what the group has read, via a
         // separate client (MAXLEN on XADD only trims on write).
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut raw_conn = client.get_connection_manager().await.unwrap();
+        let mut raw_conn = common::redis_conn::connect(&client).await.unwrap();
         for i in 0..10 {
             let _: String = redis::cmd("XADD")
                 .arg(&stream)
