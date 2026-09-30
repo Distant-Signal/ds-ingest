@@ -382,6 +382,8 @@ fn test_config() -> Config {
         metrics_enabled: false,
         stream_lag_poll_secs: 30,
         movement_stream_maxlen: crate::config::DEFAULT_STREAM_MAXLEN,
+        movement_consumer_groups: Vec::new(),
+        deadletter_max_age_secs: crate::deadletter::MAX_DEADLETTER_AGE_SECS,
     }
 }
 

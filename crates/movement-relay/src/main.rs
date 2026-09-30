@@ -7,6 +7,7 @@
 //! docs/superpowers/plans/2026-09-04-movement-relay-plan.md.
 
 mod config;
+mod deadletter;
 mod event_sink;
 mod health;
 mod kafka_source;
@@ -53,16 +54,24 @@ async fn main() -> anyhow::Result<()> {
     let mut sink = RedisEventSink::connect_until_ready(
         redis_url.expose(),
         config.movement_stream_maxlen,
+        config.movement_consumer_groups.clone(),
         common::startup::CONNECT_BACKOFF,
         &progress,
     )
     .await?;
+    // D2: a fresh (missing or empty) stream gets every consumer group at
+    // its start before the first entry. Best effort: a failure is logged,
+    // and a missing stream is still handled by the first publish.
+    if let Err(err) = sink.prepare_stream().await {
+        tracing::warn!(error = ?err, "could not create the consumer groups on a fresh movement-events stream");
+    }
     let mut source = KafkaRawSource::connect(&config, ready, progress.clone())?;
 
     tokio::spawn(stream_lag_loop::<common::redis_conn::RedisConn>(
         redis_url.expose().to_owned(),
         Duration::from_secs(config.stream_lag_poll_secs),
         config.movement_stream_maxlen,
+        Duration::from_secs(config.deadletter_max_age_secs),
     ));
 
     loop {
@@ -236,11 +245,7 @@ where
 /// `RedisStreamMovementFeed::connect(.., "trust-event-backlog", ..)` call).
 /// That group's lag was silently never reported: not an error, just a gap
 /// nobody watching the gauge would notice was missing.
-const STREAM_LAG_GROUPS: [&str; 3] = [
-    "trust-consumer",
-    "full-coverage-consumer",
-    "trust-event-backlog",
-];
+const STREAM_LAG_GROUPS: [&str; 3] = event_sink::DEFAULT_CONSUMER_GROUPS;
 
 /// A Redis connection capable of computing `movement-events` consumer-group
 /// lag -- split out from a concrete `common::redis_conn::RedisConn` purely so
@@ -262,6 +267,11 @@ trait LagConnection: Sized + Send + 'static {
     async fn deadletter_len(&mut self) -> anyhow::Result<u64>;
     /// The raw `INFO persistence` reply (see [`parse_persistence_info`]).
     async fn persistence_info(&mut self) -> anyhow::Result<String>;
+    /// `XTRIM movement-events-deadletter MINID <min_id>`: how many records
+    /// were removed (see `deadletter::trim_older_than`).
+    async fn trim_deadletter(&mut self, min_id: &str) -> anyhow::Result<u64>;
+    /// The oldest dead-letter record's id, `None` when there is none.
+    async fn deadletter_oldest_id(&mut self) -> anyhow::Result<Option<String>>;
 }
 
 #[async_trait::async_trait]
@@ -301,12 +311,17 @@ impl LagConnection for common::redis_conn::RedisConn {
             .query_async(self)
             .await?)
     }
+
+    async fn trim_deadletter(&mut self, min_id: &str) -> anyhow::Result<u64> {
+        deadletter::trim_older_than(self, DEADLETTER_STREAM, min_id).await
+    }
+
+    async fn deadletter_oldest_id(&mut self) -> anyhow::Result<Option<String>> {
+        deadletter::oldest_id(self, DEADLETTER_STREAM).await
+    }
 }
 
-/// movement-feed's shared dead-letter stream (`movement_feed::redis_stream`
-/// names it `<stream>-deadletter`; this crate does not depend on
-/// movement-feed, see `stream_lag_loop`).
-const DEADLETTER_STREAM: &str = "movement-events-deadletter";
+use deadletter::DEADLETTER_STREAM;
 
 /// What `INFO persistence` says about the AOF, the only persistence this
 /// chart's Redis runs (`--appendonly yes`, RDB snapshots off).
@@ -373,6 +388,13 @@ const STREAM_MAXLEN_METRIC: &str = "movement_relay_stream_maxlen";
 /// operator drains the stream, so DistantSignalDeadLetterNearFull reads
 /// this one instead.
 const DEADLETTER_LENGTH_METRIC: &str = "movement_relay_deadletter_length";
+/// Counter of dead-letter records removed for being older than
+/// `--deadletter-max-age-secs` (D5; see `deadletter`).
+const DEADLETTER_TRIMMED_METRIC: &str = "movement_relay_deadletter_trimmed_total";
+/// Age in seconds of the oldest dead-letter record (0 when there is
+/// none), for DistantSignalDeadLetterExpiring: it fires hours before the
+/// trim removes the record, while it can still be re-injected.
+const DEADLETTER_OLDEST_AGE_METRIC: &str = "movement_relay_deadletter_oldest_age_seconds";
 /// `INFO persistence` as 1/0 gauges (see [`PersistenceStatus`]), for the
 /// chart's DistantSignalRedisPersistenceFailing alert. The chart ships no
 /// redis_exporter, so without these nothing in it can see a failing AOF.
@@ -395,6 +417,11 @@ struct LagSample {
     group_pending: Vec<(&'static str, i64)>,
     /// `None` when there was no connection this tick or `XLEN` failed.
     deadletter_length: Option<u64>,
+    /// Records the age trim removed this tick; `None` if it failed.
+    deadletter_trimmed: Option<u64>,
+    /// The oldest remaining record's age (0 when there is none); `None`
+    /// if it could not be read.
+    deadletter_oldest_age_secs: Option<u64>,
     /// `None` when there was no connection this tick, `INFO` failed or its
     /// reply could not be parsed.
     persistence: Option<PersistenceStatus>,
@@ -421,6 +448,13 @@ fn publish_lag_sample(sample: &LagSample, maxlen: u64) {
             "group" => *group
         )
         .set(*pending as f64);
+    }
+    if let Some(trimmed) = sample.deadletter_trimmed {
+        metrics::counter!(common::metrics::metric_name(DEADLETTER_TRIMMED_METRIC))
+            .increment(trimmed);
+    }
+    if let Some(age) = sample.deadletter_oldest_age_secs {
+        metrics::gauge!(common::metrics::metric_name(DEADLETTER_OLDEST_AGE_METRIC)).set(age as f64);
     }
     if let Some(len) = sample.deadletter_length {
         metrics::gauge!(
@@ -462,18 +496,36 @@ fn publish_lag_sample(sample: &LagSample, maxlen: u64) {
 /// cap (`maxlen`) alongside the per-group lag, so lag can be alerted on as
 /// a fraction of the cap; the dead-letter stream's length; and the AOF's
 /// health from `INFO persistence` (see [`PersistenceStatus`]).
-async fn stream_lag_loop<C: LagConnection>(redis_url: String, interval: Duration, maxlen: u64) {
+///
+/// Each tick also trims dead letters older than `deadletter_max_age` and
+/// reports the oldest remaining one's age (see `deadletter`).
+async fn stream_lag_loop<C: LagConnection>(
+    redis_url: String,
+    interval: Duration,
+    maxlen: u64,
+    deadletter_max_age: Duration,
+) {
     let mut conn: Option<C> = None;
+    // Registered at 0 so a trim shows up in `increase()` from the first one.
+    metrics::counter!(common::metrics::metric_name(DEADLETTER_TRIMMED_METRIC)).increment(0);
     loop {
         tokio::time::sleep(interval).await;
-        let sample = run_lag_tick(&redis_url, &mut conn).await;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        let sample = run_lag_tick(&redis_url, &mut conn, deadletter_max_age, now_ms).await;
         publish_lag_sample(&sample, maxlen);
     }
 }
 
 /// One tick's worth of `stream_lag_loop` work, split out so it's callable
 /// (and its retry behaviour testable) without an actual `sleep`.
-async fn run_lag_tick<C: LagConnection>(redis_url: &str, conn: &mut Option<C>) -> LagSample {
+async fn run_lag_tick<C: LagConnection>(
+    redis_url: &str,
+    conn: &mut Option<C>,
+    deadletter_max_age: Duration,
+    now_ms: u64,
+) -> LagSample {
     let mut sample = LagSample::default();
     if conn.is_none() {
         match C::connect(redis_url).await {
@@ -512,6 +564,38 @@ async fn run_lag_tick<C: LagConnection>(redis_url: &str, conn: &mut Option<C>) -
             Err(err) => {
                 tracing::warn!(error = ?err, group, "stream_lag_loop: failed to fetch XINFO GROUPS");
             }
+        }
+    }
+    // Trim first, so the length and oldest age below are what remains.
+    match active
+        .trim_deadletter(&deadletter::min_id(now_ms, deadletter_max_age))
+        .await
+    {
+        Ok(trimmed) => {
+            if trimmed > 0 {
+                tracing::warn!(
+                    stream = DEADLETTER_STREAM,
+                    trimmed,
+                    max_age_secs = deadletter_max_age.as_secs(),
+                    "deleted dead-letter records older than the TRUST retention limit"
+                );
+            }
+            sample.deadletter_trimmed = Some(trimmed);
+        }
+        Err(err) => {
+            tracing::warn!(error = ?err, "stream_lag_loop: failed to trim old dead letters");
+        }
+    }
+    match active.deadletter_oldest_id().await {
+        Ok(id) => {
+            sample.deadletter_oldest_age_secs = Some(
+                id.as_deref()
+                    .and_then(|id| deadletter::age_secs(id, now_ms))
+                    .unwrap_or(0),
+            );
+        }
+        Err(err) => {
+            tracing::warn!(error = ?err, "stream_lag_loop: failed to read the oldest dead letter");
         }
     }
     match active.deadletter_len().await {
@@ -932,7 +1016,16 @@ mod tests {
         deadletter_len: Option<u64>,
         /// `None` makes `persistence_info` fail.
         persistence_info: Option<String>,
+        /// Every `min_id` `trim_deadletter` was called with.
+        trimmed_with: Vec<String>,
+        /// `None` makes `trim_deadletter` fail.
+        trim_result: Option<u64>,
+        /// `Err` (as `None`) makes `deadletter_oldest_id` fail.
+        oldest_id: Option<Option<String>>,
     }
+
+    const TEST_MAX_AGE: Duration = Duration::from_secs(86_400);
+    const TEST_NOW_MS: u64 = 1_790_000_000_000;
 
     // `LagConnection::connect` is an associated function (no `&self`), so it
     // cannot read per-test instance state; these live in thread-locals
@@ -964,6 +1057,10 @@ mod tests {
                 stream_len: Some(282),
                 deadletter_len: Some(3),
                 persistence_info: Some(HEALTHY_INFO_PERSISTENCE.to_string()),
+                trimmed_with: Vec::new(),
+                trim_result: Some(2),
+                // 20 hours old at TEST_NOW_MS.
+                oldest_id: Some(Some(format!("{}-0", TEST_NOW_MS - 20 * 3_600_000))),
             })
         }
 
@@ -996,6 +1093,18 @@ mod tests {
             self.persistence_info
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("simulated INFO failure"))
+        }
+
+        async fn trim_deadletter(&mut self, min_id: &str) -> anyhow::Result<u64> {
+            self.trimmed_with.push(min_id.to_string());
+            self.trim_result
+                .ok_or_else(|| anyhow::anyhow!("simulated XTRIM failure"))
+        }
+
+        async fn deadletter_oldest_id(&mut self) -> anyhow::Result<Option<String>> {
+            self.oldest_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("simulated XRANGE failure"))
         }
     }
 
@@ -1070,13 +1179,13 @@ mod tests {
         let mut conn: Option<FakeLagConnection> = None;
 
         // Two ticks fail to connect at all -- the gauge must not give up.
-        run_lag_tick("redis://fake", &mut conn).await;
+        run_lag_tick("redis://fake", &mut conn, TEST_MAX_AGE, TEST_NOW_MS).await;
         assert!(conn.is_none());
-        run_lag_tick("redis://fake", &mut conn).await;
+        run_lag_tick("redis://fake", &mut conn, TEST_MAX_AGE, TEST_NOW_MS).await;
         assert!(conn.is_none());
 
         // Third tick: the simulated outage has cleared.
-        run_lag_tick("redis://fake", &mut conn).await;
+        run_lag_tick("redis://fake", &mut conn, TEST_MAX_AGE, TEST_NOW_MS).await;
         assert!(
             conn.is_some(),
             "a later tick must succeed instead of the gauge staying disabled forever"
@@ -1089,7 +1198,7 @@ mod tests {
 
         // And once connected, it stays connected across ticks rather than
         // reconnecting every time.
-        run_lag_tick("redis://fake", &mut conn).await;
+        run_lag_tick("redis://fake", &mut conn, TEST_MAX_AGE, TEST_NOW_MS).await;
         assert_eq!(
             CONNECT_ATTEMPTS.with(|c| c.get()),
             3,
@@ -1104,7 +1213,7 @@ mod tests {
         CONNECT_FAILURES_REMAINING.with(|c| c.set(0));
         let mut conn: Option<FakeLagConnection> = None;
 
-        run_lag_tick("redis://fake", &mut conn).await;
+        run_lag_tick("redis://fake", &mut conn, TEST_MAX_AGE, TEST_NOW_MS).await;
 
         let conn = conn.expect("connect succeeds immediately here");
         assert_eq!(
@@ -1122,7 +1231,7 @@ mod tests {
         CONNECT_FAILURES_REMAINING.with(|c| c.set(0));
         let mut conn: Option<FakeLagConnection> = None;
 
-        let sample = run_lag_tick("redis://fake", &mut conn).await;
+        let sample = run_lag_tick("redis://fake", &mut conn, TEST_MAX_AGE, TEST_NOW_MS).await;
 
         assert_eq!(
             sample,
@@ -1139,9 +1248,55 @@ mod tests {
                     ("trust-event-backlog", 90),
                 ],
                 deadletter_length: Some(3),
+                deadletter_trimmed: Some(2),
+                deadletter_oldest_age_secs: Some(20 * 3600),
                 persistence: Some(HEALTHY),
             }
         );
+    }
+
+    /// D5: every tick trims at exactly `now - max age`, and an empty
+    /// dead-letter stream reports an oldest age of 0.
+    #[tokio::test]
+    async fn every_tick_trims_dead_letters_older_than_the_max_age() {
+        CONNECT_FAILURES_REMAINING.with(|c| c.set(0));
+        let mut conn: Option<FakeLagConnection> = None;
+        run_lag_tick("redis://fake", &mut conn, TEST_MAX_AGE, TEST_NOW_MS).await;
+        conn.as_mut().expect("connected").oldest_id = Some(None);
+
+        let sample = run_lag_tick(
+            "redis://fake",
+            &mut conn,
+            Duration::from_secs(3_600),
+            TEST_NOW_MS,
+        )
+        .await;
+
+        assert_eq!(
+            conn.expect("connected").trimmed_with,
+            [
+                format!("{}-0", TEST_NOW_MS - 86_400_000),
+                format!("{}-0", TEST_NOW_MS - 3_600_000),
+            ]
+        );
+        assert_eq!(sample.deadletter_oldest_age_secs, Some(0));
+    }
+
+    /// A failed trim or oldest-record read costs only its own reading.
+    #[tokio::test]
+    async fn a_failed_trim_still_reports_the_rest() {
+        CONNECT_FAILURES_REMAINING.with(|c| c.set(0));
+        let mut conn: Option<FakeLagConnection> = None;
+        run_lag_tick("redis://fake", &mut conn, TEST_MAX_AGE, TEST_NOW_MS).await;
+        let active = conn.as_mut().expect("connected");
+        active.trim_result = None;
+        active.oldest_id = None;
+
+        let sample = run_lag_tick("redis://fake", &mut conn, TEST_MAX_AGE, TEST_NOW_MS).await;
+
+        assert_eq!(sample.deadletter_trimmed, None);
+        assert_eq!(sample.deadletter_oldest_age_secs, None);
+        assert_eq!(sample.deadletter_length, Some(3));
     }
 
     /// A failed dead-letter XLEN or INFO costs only its own reading.
@@ -1149,12 +1304,12 @@ mod tests {
     async fn a_failed_deadletter_xlen_or_info_still_reports_the_rest() {
         CONNECT_FAILURES_REMAINING.with(|c| c.set(0));
         let mut conn: Option<FakeLagConnection> = None;
-        run_lag_tick("redis://fake", &mut conn).await;
+        run_lag_tick("redis://fake", &mut conn, TEST_MAX_AGE, TEST_NOW_MS).await;
         let active = conn.as_mut().expect("connected");
         active.deadletter_len = None;
         active.persistence_info = None;
 
-        let sample = run_lag_tick("redis://fake", &mut conn).await;
+        let sample = run_lag_tick("redis://fake", &mut conn, TEST_MAX_AGE, TEST_NOW_MS).await;
 
         assert_eq!(sample.deadletter_length, None);
         assert_eq!(sample.persistence, None);
@@ -1167,10 +1322,10 @@ mod tests {
     async fn an_xlen_failure_still_reports_group_lag() {
         CONNECT_FAILURES_REMAINING.with(|c| c.set(0));
         let mut conn: Option<FakeLagConnection> = None;
-        run_lag_tick("redis://fake", &mut conn).await;
+        run_lag_tick("redis://fake", &mut conn, TEST_MAX_AGE, TEST_NOW_MS).await;
         conn.as_mut().expect("connected").stream_len = None;
 
-        let sample = run_lag_tick("redis://fake", &mut conn).await;
+        let sample = run_lag_tick("redis://fake", &mut conn, TEST_MAX_AGE, TEST_NOW_MS).await;
 
         assert_eq!(sample.stream_length, None);
         assert_eq!(sample.group_lags.len(), 3);
@@ -1183,7 +1338,7 @@ mod tests {
         CONNECT_FAILURES_REMAINING.with(|c| c.set(1));
         let mut conn: Option<FakeLagConnection> = None;
 
-        let sample = run_lag_tick("redis://fake", &mut conn).await;
+        let sample = run_lag_tick("redis://fake", &mut conn, TEST_MAX_AGE, TEST_NOW_MS).await;
 
         assert_eq!(sample, LagSample::default());
     }
@@ -1214,6 +1369,14 @@ mod tests {
             "distant_signal_movement_relay_deadletter_length"
         );
         assert_eq!(
+            common::metrics::metric_name(DEADLETTER_TRIMMED_METRIC),
+            "distant_signal_movement_relay_deadletter_trimmed_total"
+        );
+        assert_eq!(
+            common::metrics::metric_name(DEADLETTER_OLDEST_AGE_METRIC),
+            "distant_signal_movement_relay_deadletter_oldest_age_seconds"
+        );
+        assert_eq!(
             common::metrics::metric_name(AOF_ENABLED_METRIC),
             "distant_signal_redis_aof_enabled"
         );
@@ -1238,6 +1401,8 @@ mod tests {
                 group_lags: vec![("trust-consumer", 1)],
                 group_pending: vec![("trust-consumer", 1)],
                 deadletter_length: Some(0),
+                deadletter_trimmed: Some(0),
+                deadletter_oldest_age_secs: Some(0),
                 persistence: Some(HEALTHY),
             },
             1_048_576,

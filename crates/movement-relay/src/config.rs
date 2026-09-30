@@ -72,6 +72,33 @@ pub struct Config {
         value_parser = clap::value_parser!(u64).range(MIN_STREAM_MAXLEN..)
     )]
     pub movement_stream_maxlen: u64,
+
+    /// Consumer groups created at the start of a fresh `movement-events`
+    /// stream (missing, or empty at startup), comma-separated -- see
+    /// `event_sink::create_groups`. Only groups whose consumer actually
+    /// reads the stream belong here: a group nobody reads would show the
+    /// whole stream as lag. The chart derives the list from each
+    /// consumer's `movementFeed`.
+    #[arg(
+        long,
+        env,
+        value_delimiter = ',',
+        default_values_t = crate::event_sink::DEFAULT_CONSUMER_GROUPS.map(String::from)
+    )]
+    pub movement_consumer_groups: Vec<String>,
+
+    /// Dead-letter records older than this are deleted (D5; see
+    /// `deadletter`). At most 24 hours -- the TRUST 1-day retention
+    /// safeguard -- and at least one hour.
+    #[arg(
+        long,
+        env,
+        default_value_t = crate::deadletter::MAX_DEADLETTER_AGE_SECS,
+        value_parser = clap::value_parser!(u64).range(
+            crate::deadletter::MIN_DEADLETTER_AGE_SECS..=crate::deadletter::MAX_DEADLETTER_AGE_SECS
+        )
+    )]
+    pub deadletter_max_age_secs: u64,
 }
 
 /// Memory the `movement-events` stream is allowed to occupy in Redis at

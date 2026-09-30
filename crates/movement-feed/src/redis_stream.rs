@@ -20,8 +20,8 @@ const STREAM: &str = "movement-events";
 /// `movement-events-deadletter` and each test stream gets its own.
 const DEAD_LETTER_SUFFIX: &str = "-deadletter";
 
-/// Hard cap on the dead-letter stream's length. It is **never trimmed**:
-/// it only ever holds genuinely poison records (explicit data rejections
+/// Hard cap on the dead-letter stream's length. It is **never trimmed to
+/// this cap** (by count): it only ever holds genuinely poison records (explicit data rejections
 /// and malformed entries, see [`RedisStreamMovementFeed::reject_batch`]),
 /// so a full stream means something systemic is wrong, and silently
 /// evicting the oldest poison record to make room would lose it. Instead a
@@ -32,6 +32,11 @@ const DEAD_LETTER_SUFFIX: &str = "-deadletter";
 /// `docs/movement-events-deadletter.md`). Records are well under 1KB, so
 /// this bounds it to roughly 10MB. Shared by all three consumer groups;
 /// each record carries its `group`.
+///
+/// Records are trimmed by AGE, though: movement-relay deletes any record
+/// older than `--deadletter-max-age-secs` (at most 24h, the TRUST 1-day
+/// retention safeguard; `crates/movement-relay/src/deadletter.rs`), and
+/// alerts hours beforehand so it can be re-injected first.
 const DEAD_LETTER_MAX_LEN: usize = 10_000;
 
 /// Counter (labelled `group`) of consumer groups recreated after `NOGROUP`

@@ -37,22 +37,52 @@ that is rejected alone is dead-lettered.
 - Every dead-lettered record logs a warning ("dead-lettered a poison record
   ...") with its group, reason, detail and payload, and increments
   `distant_signal_movement_feed_deadlettered_total{group, reason}`.
-- `distant_signal_movement_feed_deadletter_length{stream}` is the stream's
-  length after the last write.
+- `distant_signal_movement_relay_deadletter_length{stream}` is the stream's
+  length, read by movement-relay every 30s.
+  (`distant_signal_movement_feed_deadletter_length{stream}` is the
+  consumers' own copy, set only when they write one.)
+- `distant_signal_movement_relay_deadletter_oldest_age_seconds` is the
+  oldest record's age (0 when there is none), and
+  `distant_signal_movement_relay_deadletter_trimmed_total` counts records
+  deleted for age (see below).
 - `trust-backlog-consumer` also keeps its own
   `distant_signal_trust_backlog_consumer_deadlettered_total{reason}`.
 
 Alert on any increase of `deadlettered_total`. It should normally stay at 0.
+The chart does (`DistantSignalDeadLetterGrowing`), and also alerts when the
+stream is nearly full (`DistantSignalDeadLetterNearFull`), full
+(`DistantSignalDeadLetterFull`), or holds a record about to be deleted for
+age (`DistantSignalDeadLetterExpiring`).
 
-## Capacity: never trimmed
+## Retention: deleted after 24 hours
+
+Dead letters are raw TRUST data, so the TRUST 1-day retention safeguard
+applies to them. **movement-relay deletes every record older than
+`movementRelay.deadLetterMaxAgeSecs`** (default and maximum 86400, 24 hours;
+the chart and the binary both refuse a longer value). It runs `XTRIM
+movement-events-deadletter MINID <now - max age>` every 30s and logs a
+warning ("deleted dead-letter records older than the TRUST retention
+limit") with the count.
+
+`DistantSignalDeadLetterExpiring` fires when the oldest record is within
+4 hours of that limit (about 20 hours old at the default,
+`metrics.prometheusRule.deadLetterExpiring.warnBeforeTrimSecs`). **When it
+fires:** find the cause and re-inject the record (below) before it is
+deleted, or decide it can go. There is no way to keep a record past the
+limit. Do not copy dead letters out of the cluster to keep them longer;
+that would defeat the safeguard. A record deleted for age is gone: treat
+that event as lost, the same as a stream gap.
+
+## Capacity: never trimmed by count
 
 The stream is capped at 10,000 records (well under 1KB each, so about 10MB)
-but is **never trimmed**. Trimming would silently lose the oldest poison
-record. When a write would go over the cap, it is refused instead: an error
-log ("dead-letter stream is full ..."), and
+but is **never trimmed to that cap**. Trimming by count would silently lose
+the newest poison record's predecessors. When a write would go over the cap,
+it is refused instead: an error log ("dead-letter stream is full ..."), and
 `distant_signal_movement_feed_deadletter_full_total{group}` goes up. The
 affected entry stays pending in its group, so it is delayed but not lost.
-To free space, re-inject or delete records (see below).
+To free space, re-inject or delete records (see below). The age limit above
+also frees space, a day at a time.
 
 ## Inspecting
 

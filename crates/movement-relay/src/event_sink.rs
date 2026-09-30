@@ -11,6 +11,21 @@ use common::redis_conn::RedisConn;
 
 const STREAM: &str = "movement-events";
 
+/// Every consumer group that reads `movement-events` -- the default for
+/// `--movement-consumer-groups` (the chart passes only the groups whose
+/// consumer actually reads the stream).
+pub const DEFAULT_CONSUMER_GROUPS: [&str; 3] = [
+    "trust-consumer",
+    "full-coverage-consumer",
+    "trust-event-backlog",
+];
+
+/// Counter of `movement-events` streams this relay found missing while
+/// running and recreated, together with every consumer group (see
+/// [`RedisEventSink::publish`]). Registered at 0 on connect, so the chart's
+/// DistantSignalMovementGroupRecreated alert can use a plain `increase()`.
+const STREAM_CREATED_METRIC: &str = "movement_relay_stream_created_total";
+
 #[async_trait]
 pub trait EventSink: Send {
     /// XADDs one surviving envelope. `msg_type` is the redundant
@@ -32,10 +47,27 @@ pub trait EventSink: Send {
 /// without a Redis. `MAXLEN ~` (approximate) trims whole stream nodes
 /// from the head, oldest first -- Decision 2's deliberate eviction
 /// direction -- at no per-write O(removed) cost.
-fn xadd_cmd(maxlen: u64, msg_type: &str, payload: &str) -> redis::Cmd {
+///
+/// `NOMKSTREAM`: an `XADD` never creates the stream. When it is missing
+/// (Redis lost its data, or a fresh install) the reply is nil and
+/// [`RedisEventSink::publish`] creates it together with every consumer
+/// group first; see [`create_groups`].
+///
+/// `create_stream` drops `NOMKSTREAM`: only the retry right after
+/// [`create_groups`] uses it, so an empty group list still gets its stream.
+fn xadd_cmd(
+    stream: &str,
+    maxlen: u64,
+    create_stream: bool,
+    msg_type: &str,
+    payload: &str,
+) -> redis::Cmd {
     let mut cmd = redis::cmd("XADD");
-    cmd.arg(STREAM)
-        .arg("MAXLEN")
+    cmd.arg(stream);
+    if !create_stream {
+        cmd.arg("NOMKSTREAM");
+    }
+    cmd.arg("MAXLEN")
         .arg("~")
         .arg(maxlen)
         .arg("*")
@@ -49,9 +81,9 @@ fn xadd_cmd(maxlen: u64, msg_type: &str, payload: &str) -> redis::Cmd {
 /// The `XTRIM` issued after an `OOM` rejection. Redis flags `XADD` as
 /// `denyoom` but not `XTRIM`, so this still runs once `used_memory` is
 /// past `maxmemory`.
-fn xtrim_cmd(maxlen: u64) -> redis::Cmd {
+fn xtrim_cmd(stream: &str, maxlen: u64) -> redis::Cmd {
     let mut cmd = redis::cmd("XTRIM");
-    cmd.arg(STREAM).arg("MAXLEN").arg("~").arg(maxlen);
+    cmd.arg(stream).arg("MAXLEN").arg("~").arg(maxlen);
     cmd
 }
 
@@ -61,9 +93,49 @@ fn is_oom(err: &redis::RedisError) -> bool {
     err.code() == Some("OOM")
 }
 
+/// `XGROUP CREATE <stream> <group> 0 MKSTREAM` for every group, so each one
+/// reads the stream from its very first entry. `BUSYGROUP` (the group
+/// already exists) is success: an existing group keeps its position.
+/// Returns how many groups were newly created.
+///
+/// **Why the relay does this (D2, 2026-09-30).** A consumer creates its
+/// own group at startup at `$`, the stream's tail
+/// (`movement_feed::redis_stream`). After Redis loses its data, the relay's
+/// next `XADD` used to recreate the stream with no groups at all; a
+/// consumer (re)started after that created its group at `$` and silently
+/// skipped everything the relay had published in between -- after an
+/// outage, a Kafka backlog drained as fast as Redis would take it. With
+/// the groups created at `0` before the first entry, no entry predates
+/// them.
+pub(crate) async fn create_groups<C: redis::aio::ConnectionLike + Send>(
+    conn: &mut C,
+    stream: &str,
+    groups: &[String],
+) -> anyhow::Result<usize> {
+    let mut created = 0;
+    for group in groups {
+        let result: redis::RedisResult<()> = redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(stream)
+            .arg(group)
+            .arg("0")
+            .arg("MKSTREAM")
+            .query_async(conn)
+            .await;
+        match result {
+            Ok(()) => created += 1,
+            Err(err) if err.code() == Some("BUSYGROUP") => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(created)
+}
+
 pub struct RedisEventSink {
     conn: RedisConn,
+    stream: String,
     maxlen: u64,
+    groups: Vec<String>,
 }
 
 impl RedisEventSink {
@@ -72,9 +144,13 @@ impl RedisEventSink {
     /// recreated by the same rollout -- is waited for, not exited on).
     /// Every failed attempt beats `progress`, so `/livez` stays 200 while
     /// this waits. Only an unparseable `redis_url` is an error.
+    ///
+    /// `groups` are the consumer groups created at `0` whenever the stream
+    /// is fresh (see [`create_groups`] and [`Self::prepare_stream`]).
     pub async fn connect_until_ready(
         redis_url: &str,
         maxlen: u64,
+        groups: Vec<String>,
         backoff: common::backoff::Backoff,
         progress: &health_http::Progress,
     ) -> anyhow::Result<Self> {
@@ -89,7 +165,81 @@ impl RedisEventSink {
         let conn =
             common::redis_conn::connect_until_ready("Redis", &client, backoff, Some(progress))
                 .await;
-        Ok(Self { conn, maxlen })
+        metrics::counter!(common::metrics::metric_name(STREAM_CREATED_METRIC)).increment(0);
+        Ok(Self::new(conn, STREAM, maxlen, groups))
+    }
+
+    fn new(conn: RedisConn, stream: &str, maxlen: u64, groups: Vec<String>) -> Self {
+        let groups = groups.into_iter().filter(|g| !g.is_empty()).collect();
+        Self {
+            conn,
+            stream: stream.to_string(),
+            maxlen,
+            groups,
+        }
+    }
+
+    /// Startup step, before the first publish: when the stream is missing
+    /// or empty, create every consumer group at `0` (a consumer that
+    /// started first may have created the stream with only its own
+    /// group). A stream that already holds entries is left alone: a group
+    /// missing from it is a consumer that has not been deployed yet, which
+    /// must start at the tail, not replay the whole stream.
+    ///
+    /// Not counted as a recreation: a fresh install looks the same.
+    pub async fn prepare_stream(&mut self) -> anyhow::Result<()> {
+        let len: u64 = redis::cmd("XLEN")
+            .arg(&self.stream)
+            .query_async(&mut self.conn)
+            .await?;
+        if len > 0 {
+            return Ok(());
+        }
+        let created = create_groups(&mut self.conn, &self.stream, &self.groups).await?;
+        if created > 0 {
+            tracing::info!(
+                stream = %self.stream,
+                created,
+                groups = ?self.groups,
+                "movement-events is empty; created the missing consumer groups at its start"
+            );
+        }
+        Ok(())
+    }
+
+    /// One `XADD`: `Ok(None)` when the stream does not exist
+    /// (`NOMKSTREAM`). See [`EventSink::publish`] for the `OOM` path.
+    async fn xadd(
+        &mut self,
+        create_stream: bool,
+        msg_type: &str,
+        payload: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let result: redis::RedisResult<Option<String>> =
+            xadd_cmd(&self.stream, self.maxlen, create_stream, msg_type, payload)
+                .query_async(&mut self.conn)
+                .await;
+        match result {
+            Ok(id) => Ok(id),
+            Err(err) if is_oom(&err) => {
+                let trimmed: redis::RedisResult<i64> = xtrim_cmd(&self.stream, self.maxlen)
+                    .query_async(&mut self.conn)
+                    .await;
+                tracing::warn!(
+                    maxlen = self.maxlen,
+                    trimmed = ?trimmed,
+                    "Redis rejected XADD at maxmemory; trimmed movement-events to its cap, \
+                     holding the Kafka record for retry"
+                );
+                metrics::counter!(
+                    common::metrics::metric_name("movement_relay_errors_total"),
+                    "operation" => "redis_oom"
+                )
+                .increment(1);
+                Err(err.into())
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 }
 
@@ -109,30 +259,27 @@ impl EventSink for RedisEventSink {
     /// recover by LOWERING `--movement-stream-maxlen`: the next rejected
     /// write trims the stream to the new cap, memory frees, and the retry
     /// succeeds. At an unchanged cap it is a cheap no-op.
+    ///
+    /// **A missing stream** (Redis lost its data while this relay was
+    /// running): the stream is recreated with every consumer group at `0`
+    /// before the entry is added, so no consumer that (re)starts later can
+    /// skip it (see [`create_groups`]). Logged, and counted as
+    /// `distant_signal_movement_relay_stream_created_total`.
     async fn publish(&mut self, msg_type: &str, payload: &str) -> anyhow::Result<()> {
-        let result: redis::RedisResult<String> = xadd_cmd(self.maxlen, msg_type, payload)
-            .query_async(&mut self.conn)
-            .await;
-        match result {
-            Ok(_) => Ok(()),
-            Err(err) if is_oom(&err) => {
-                let trimmed: redis::RedisResult<i64> =
-                    xtrim_cmd(self.maxlen).query_async(&mut self.conn).await;
-                tracing::warn!(
-                    maxlen = self.maxlen,
-                    trimmed = ?trimmed,
-                    "Redis rejected XADD at maxmemory; trimmed movement-events to its cap, \
-                     holding the Kafka record for retry"
-                );
-                metrics::counter!(
-                    common::metrics::metric_name("movement_relay_errors_total"),
-                    "operation" => "redis_oom"
-                )
-                .increment(1);
-                Err(err.into())
-            }
-            Err(err) => Err(err.into()),
+        if self.xadd(false, msg_type, payload).await?.is_some() {
+            return Ok(());
         }
+        let created = create_groups(&mut self.conn, &self.stream, &self.groups).await?;
+        tracing::warn!(
+            stream = %self.stream,
+            created,
+            groups = ?self.groups,
+            "movement-events is missing (Redis lost its data?); recreated it with every \
+             consumer group at its start"
+        );
+        metrics::counter!(common::metrics::metric_name(STREAM_CREATED_METRIC)).increment(1);
+        self.xadd(true, msg_type, payload).await?;
+        Ok(())
     }
 }
 
@@ -227,6 +374,7 @@ mod tests {
             RedisEventSink::connect_until_ready(
                 &redis_url,
                 1_000,
+                Vec::new(),
                 common::backoff::Backoff::new(
                     Duration::from_millis(50),
                     Duration::from_millis(200),
@@ -272,12 +420,13 @@ mod tests {
 
     #[test]
     fn xadd_uses_the_configured_approximate_maxlen_and_both_fields() {
-        let cmd = xadd_cmd(524_288, "0003", r#"{"header":{}}"#);
+        let cmd = xadd_cmd(STREAM, 524_288, false, "0003", r#"{"header":{}}"#);
         assert_eq!(
             args(&cmd),
             [
                 "XADD",
                 "movement-events",
+                "NOMKSTREAM",
                 "MAXLEN",
                 "~",
                 "524288",
@@ -292,14 +441,23 @@ mod tests {
 
     #[test]
     fn xadd_carries_a_non_default_cap_through_verbatim() {
-        let cmd = xadd_cmd(250_000, "0001", "{}");
-        assert_eq!(args(&cmd)[4], "250000");
+        let cmd = xadd_cmd(STREAM, 250_000, false, "0001", "{}");
+        assert_eq!(args(&cmd)[5], "250000");
+    }
+
+    /// Only the retry right after the groups were created may create the
+    /// stream itself.
+    #[test]
+    fn only_the_retry_after_creating_the_groups_may_create_the_stream() {
+        assert!(
+            !args(&xadd_cmd(STREAM, 1_000, true, "0001", "{}")).contains(&"NOMKSTREAM".to_string())
+        );
     }
 
     #[test]
     fn xtrim_after_oom_uses_the_same_cap() {
         assert_eq!(
-            args(&xtrim_cmd(250_000)),
+            args(&xtrim_cmd(STREAM, 250_000)),
             ["XTRIM", "movement-events", "MAXLEN", "~", "250000"]
         );
     }
@@ -316,5 +474,194 @@ mod tests {
         let other = parse(b"-ERR something else\r\n");
         assert!(is_oom(&oom));
         assert!(!is_oom(&other));
+    }
+
+    /// `#[ignore]`d tests against a real Redis/valkey (`REDIS_URL`, default
+    /// the local one), each on its own uniquely named stream:
+    /// `cargo test -p movement-relay -- --ignored --test-threads=1`.
+    mod redis_tests {
+        use super::super::*;
+
+        fn redis_url() -> String {
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
+        }
+
+        fn unique_stream(name: &str) -> String {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            format!("relay-test-{name}-{nanos}")
+        }
+
+        async fn conn() -> RedisConn {
+            let client = redis::Client::open(redis_url()).unwrap();
+            common::redis_conn::connect(&client).await.unwrap()
+        }
+
+        fn groups() -> Vec<String> {
+            ["g-a", "g-b", "g-c"].map(String::from).to_vec()
+        }
+
+        async fn sink(stream: &str) -> RedisEventSink {
+            RedisEventSink::new(conn().await, stream, 1_000, groups())
+        }
+
+        /// What `XREADGROUP ... >` hands `group` now, as payloads.
+        async fn read_new(stream: &str, group: &str) -> Vec<String> {
+            let mut conn = conn().await;
+            let reply: redis::streams::StreamReadReply = redis::cmd("XREADGROUP")
+                .arg("GROUP")
+                .arg(group)
+                .arg("test-consumer")
+                .arg("STREAMS")
+                .arg(stream)
+                .arg(">")
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            reply
+                .keys
+                .into_iter()
+                .flat_map(|k| k.ids)
+                .map(|id| redis::from_redis_value::<String>(&id.map["payload"]).unwrap())
+                .collect()
+        }
+
+        async fn group_names(stream: &str) -> Vec<String> {
+            let mut conn = conn().await;
+            let reply: redis::streams::StreamInfoGroupsReply = redis::cmd("XINFO")
+                .arg("GROUPS")
+                .arg(stream)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            let mut names: Vec<String> = reply.groups.into_iter().map(|g| g.name).collect();
+            names.sort();
+            names
+        }
+
+        async fn xgroup_create(stream: &str, group: &str, start: &str) {
+            let mut conn = conn().await;
+            let _: () = redis::cmd("XGROUP")
+                .arg("CREATE")
+                .arg(stream)
+                .arg(group)
+                .arg(start)
+                .arg("MKSTREAM")
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+        }
+
+        async fn cleanup(stream: &str) {
+            let mut conn = conn().await;
+            let _: i64 = redis::cmd("DEL")
+                .arg(stream)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+        }
+
+        /// D2: Redis lost its data while the relay ran. The next publish
+        /// recreates the stream with every group at `0`, so the entry (and
+        /// everything after it) reaches every group, however late its
+        /// consumer (re)starts.
+        #[tokio::test]
+        #[ignore = "requires a live Redis/valkey at REDIS_URL"]
+        async fn publishing_to_a_missing_stream_creates_every_group_at_its_start() {
+            let stream = unique_stream("missing");
+            let mut sink = sink(&stream).await;
+
+            sink.publish("0003", "first").await.unwrap();
+            sink.publish("0003", "second").await.unwrap();
+
+            assert_eq!(group_names(&stream).await, groups());
+            for group in groups() {
+                assert_eq!(
+                    read_new(&stream, &group).await,
+                    ["first", "second"],
+                    "{group}"
+                );
+            }
+            cleanup(&stream).await;
+        }
+
+        /// A consumer that started first created the (empty) stream with
+        /// only its own group. The relay's startup step adds the others at
+        /// `0` and leaves the existing one where it was.
+        #[tokio::test]
+        #[ignore = "requires a live Redis/valkey at REDIS_URL"]
+        async fn prepare_adds_the_missing_groups_to_an_empty_stream() {
+            let stream = unique_stream("empty");
+            xgroup_create(&stream, "g-a", "$").await;
+            let mut sink = sink(&stream).await;
+
+            sink.prepare_stream().await.unwrap();
+            sink.publish("0003", "first").await.unwrap();
+
+            assert_eq!(group_names(&stream).await, groups());
+            for group in groups() {
+                assert_eq!(read_new(&stream, &group).await, ["first"], "{group}");
+            }
+            cleanup(&stream).await;
+        }
+
+        /// A stream that already holds entries is left alone: a group
+        /// missing from it belongs to a consumer not deployed yet, which
+        /// must not replay the whole stream.
+        #[tokio::test]
+        #[ignore = "requires a live Redis/valkey at REDIS_URL"]
+        async fn prepare_leaves_a_populated_stream_alone() {
+            let stream = unique_stream("populated");
+            xgroup_create(&stream, "g-a", "$").await;
+            let mut sink = sink(&stream).await;
+            sink.publish("0003", "already-there").await.unwrap();
+
+            sink.prepare_stream().await.unwrap();
+
+            assert_eq!(group_names(&stream).await, ["g-a"]);
+            cleanup(&stream).await;
+        }
+
+        /// `BUSYGROUP` is success, and an existing group keeps its
+        /// position (it is not moved back to `0`).
+        #[tokio::test]
+        #[ignore = "requires a live Redis/valkey at REDIS_URL"]
+        async fn creating_groups_again_keeps_existing_positions() {
+            let stream = unique_stream("busy");
+            let mut sink = sink(&stream).await;
+            sink.publish("0003", "first").await.unwrap();
+            assert_eq!(read_new(&stream, "g-a").await, ["first"]);
+
+            let mut conn = conn().await;
+            let created = create_groups(&mut conn, &stream, &groups()).await.unwrap();
+
+            assert_eq!(created, 0);
+            assert!(
+                read_new(&stream, "g-a").await.is_empty(),
+                "g-a must not be rewound"
+            );
+            cleanup(&stream).await;
+        }
+
+        /// With no groups configured the stream is still created.
+        #[tokio::test]
+        #[ignore = "requires a live Redis/valkey at REDIS_URL"]
+        async fn a_missing_stream_is_created_even_with_no_groups() {
+            let stream = unique_stream("nogroups");
+            let mut sink = RedisEventSink::new(conn().await, &stream, 1_000, vec![String::new()]);
+
+            sink.publish("0003", "first").await.unwrap();
+
+            let mut conn = conn().await;
+            let len: u64 = redis::cmd("XLEN")
+                .arg(&stream)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(len, 1);
+            cleanup(&stream).await;
+        }
     }
 }
