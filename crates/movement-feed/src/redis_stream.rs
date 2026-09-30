@@ -34,6 +34,16 @@ const DEAD_LETTER_SUFFIX: &str = "-deadletter";
 /// each record carries its `group`.
 const DEAD_LETTER_MAX_LEN: usize = 10_000;
 
+/// Counter (labelled `group`) of consumer groups recreated after `NOGROUP`
+/// ([`RedisStreamMovementFeed::recreate_group`]): Redis came back without
+/// its data (a lost or unreadable AOF, a replaced volume) or someone deleted
+/// the group. Either way the group's pending entries and, after an empty
+/// restart, every entry it had not yet read are gone, and `check_gap`
+/// cannot see it (the new stream has no trimmed range). Registered at 0 so
+/// the chart's DistantSignalMovementGroupRecreated alert can use a plain
+/// `increase()`.
+const GROUP_RECREATED_METRIC: &str = "movement_feed_group_recreated_total";
+
 /// Delivery count past which a pending entry the PEL replay hands out again
 /// is reported as long-pending (a warn log plus
 /// `distant_signal_movement_feed_long_pending_total`). **Visibility only**:
@@ -288,6 +298,11 @@ impl RedisStreamMovementFeed {
         }
         metrics::counter!(
             common::metrics::metric_name("movement_feed_deadletter_full_total"),
+            "group" => group.clone()
+        )
+        .increment(0);
+        metrics::counter!(
+            common::metrics::metric_name(GROUP_RECREATED_METRIC),
             "group" => group.clone()
         )
         .increment(0);
@@ -829,6 +844,11 @@ impl RedisStreamMovementFeed {
             tracing::error!(error = ?err, group = %self.group, "failed to recreate the consumer group");
             return;
         }
+        metrics::counter!(
+            common::metrics::metric_name(GROUP_RECREATED_METRIC),
+            "group" => self.group.clone()
+        )
+        .increment(1);
         if let Some(id) = seed_last_delivered_id(&mut self.conn, &self.stream, &self.group).await {
             self.last_delivered_id = Some(id);
         }
@@ -1507,6 +1527,16 @@ mod recreate_start_id_tests {
         assert_eq!(recreate_start_id(Some("100-3"), Some("100-2")), "0");
         // Recreated but still empty (`0-0`): same.
         assert_eq!(recreate_start_id(Some("100-3"), Some("0-0")), "0");
+    }
+
+    /// charts/distant-signal/templates/prometheusrule.yaml's
+    /// DistantSignalMovementGroupRecreated reads this exact name.
+    #[test]
+    fn the_group_recreated_counter_name_matches_the_chart_alert() {
+        assert_eq!(
+            common::metrics::metric_name(GROUP_RECREATED_METRIC),
+            "distant_signal_movement_feed_group_recreated_total"
+        );
     }
 
     #[test]
