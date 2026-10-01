@@ -193,8 +193,7 @@ mod tests {
         // value_parser opens and parses the file) even when this test never
         // touches STANOX/CRS behavior -- mirrors main.rs's own
         // TEST_STANOX_CRS test fixture path.
-        let stanox_crs_file = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../reference-data/stanox-crs.csv");
+        let stanox_crs_file = common::manifest_dir!().join("../../reference-data/stanox-crs.csv");
 
         let config = Config::try_parse_from([
             "trust-consumer",

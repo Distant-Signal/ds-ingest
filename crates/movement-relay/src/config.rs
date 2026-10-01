@@ -222,7 +222,7 @@ mod chart_env_wiring_tests {
     /// (it is the only container), so a var named only in a leading comment
     /// cannot satisfy the check.
     fn relay_container_block() -> String {
-        let chart = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        let chart = common::manifest_dir!()
             .join("../../charts/distant-signal/templates/movement-relay-deployment.yaml");
         let rendered = std::fs::read_to_string(&chart)
             .unwrap_or_else(|err| panic!("read {}: {err}", chart.display()));

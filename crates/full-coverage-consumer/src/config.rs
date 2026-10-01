@@ -357,7 +357,7 @@ pub(crate) mod tests {
     /// never Kafka directly.
     #[test]
     fn movement_feed_backend_defaults_to_redis_stream_when_unset() {
-        let lines_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lines");
+        let lines_dir = common::manifest_dir!().join("../../lines");
 
         let config = Config::try_parse_from([
             "full-coverage-consumer",

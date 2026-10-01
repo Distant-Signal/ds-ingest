@@ -206,7 +206,6 @@ fn field_at<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
 
@@ -215,8 +214,7 @@ mod tests {
     /// `lines/` directory directly (e.g. `crates/aggregator/src/segments.rs`'s
     /// `load_all_lines`), rather than a synthetic stand-in.
     fn load_real_table() -> StanoxCrsTable {
-        let path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../reference-data/stanox-crs.csv");
+        let path = common::manifest_dir!().join("../../reference-data/stanox-crs.csv");
         StanoxCrsTable::from_file(&path).expect("reference-data/stanox-crs.csv should parse")
     }
 
