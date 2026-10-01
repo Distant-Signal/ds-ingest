@@ -104,11 +104,13 @@ use stats::current_rail_service_date;
 use day::dispatch_message;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
+    common::logging::exit_code(run().await)
+}
+
+async fn run() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    common::logging::init("full-coverage-consumer");
     let config = Config::parse();
     if config.metrics.metrics_enabled {
         common::metrics::install(config.metrics_port)?;
