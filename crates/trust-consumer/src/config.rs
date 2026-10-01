@@ -12,13 +12,13 @@ fn parse_stanox_crs(path: &str) -> anyhow::Result<StanoxCrsTable> {
 /// `movement_feed`, re-exported here so every existing
 /// `use config::{Config, MovementFeedBackend};` import keeps resolving
 /// unchanged.
-pub use movement_feed::MovementFeedBackend;
+pub(crate) use movement_feed::MovementFeedBackend;
 
 /// CLI/env configuration for the `trust-consumer` service. It reads the
 /// `movement-events` Redis stream movement-relay publishes and has no Kafka
 /// connection of its own (Deploy C, PL-15a).
 #[derive(Debug, Parser)]
-pub struct Config {
+pub(crate) struct Config {
     /// The `api` crate's ingestion endpoint for train movement events.
     #[arg(long, env, default_value = "http://api:8080/private/train-events")]
     pub api_ingest_url: String,
@@ -38,7 +38,7 @@ pub struct Config {
     )]
     pub forward_signals_url: String,
 
-    /// Shared, non-secret OAuth2 client-credentials config (same value
+    /// Shared, non-secret `OAuth2` client-credentials config (same value
     /// across all 9 real callers).
     #[command(flatten)]
     pub internal_oauth: common::oauth_client::InternalOAuthArgs,

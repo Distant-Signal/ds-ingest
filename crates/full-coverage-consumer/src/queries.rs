@@ -4,7 +4,7 @@
 
 /// Outcome of one [`fetch_line_population`] call that reached `api`.
 #[derive(Debug, PartialEq, Eq)]
-pub enum LinePopulationFetch {
+pub(crate) enum LinePopulationFetch {
     /// `304 Not Modified`: the population `if_none_match` described is
     /// still current. Only possible when a validator was sent.
     NotModified,
@@ -25,7 +25,7 @@ pub enum LinePopulationFetch {
 /// predates conditional GET, `If-None-Match` is just an ignored header and
 /// the answer is the same `200` it always was, with no `ETag` to remember,
 /// so every later call is unconditional again.
-pub async fn fetch_line_population(
+pub(crate) async fn fetch_line_population(
     client: &reqwest::Client,
     url: &str,
     tokens: &common::oauth_client::OAuthTokenCache,
@@ -62,7 +62,7 @@ pub async fn fetch_line_population(
     Ok(LinePopulationFetch::Fetched { body, etag })
 }
 
-pub async fn fetch_stanox_crs(
+pub(crate) async fn fetch_stanox_crs(
     client: &reqwest::Client,
     url: &str,
     tokens: &common::oauth_client::OAuthTokenCache,
@@ -70,7 +70,7 @@ pub async fn fetch_stanox_crs(
     common::ingest::get_json(client, url, tokens).await
 }
 
-pub async fn post_full_coverage_stats(
+pub(crate) async fn post_full_coverage_stats(
     client: &reqwest::Client,
     url: &str,
     tokens: &common::oauth_client::OAuthTokenCache,
@@ -85,7 +85,7 @@ pub async fn post_full_coverage_stats(
 /// `POST /private/full-coverage-window-stats` -- one batch per stats write
 /// (every line's `recent` and `day_to_date` window). Only called with
 /// `FULL_COVERAGE_WINDOWED_STATS=true`.
-pub async fn post_full_coverage_window_stats(
+pub(crate) async fn post_full_coverage_window_stats(
     client: &reqwest::Client,
     url: &str,
     tokens: &common::oauth_client::OAuthTokenCache,
@@ -105,7 +105,11 @@ pub async fn post_full_coverage_window_stats(
 /// Encodes via a local `Wire` struct rather than deriving `Serialize`
 /// directly on `common::StationFullCoverageSample`, since that type has no
 /// other reason to depend on `serde` derives itself.
-pub async fn post_station_full_coverage_samples(
+#[expect(
+    clippy::items_after_statements,
+    reason = "a local type or import sits next to its only use"
+)]
+pub(crate) async fn post_station_full_coverage_samples(
     client: &reqwest::Client,
     url: &str,
     tokens: &common::oauth_client::OAuthTokenCache,
@@ -121,7 +125,7 @@ pub async fn post_station_full_coverage_samples(
         resolved_at: chrono::DateTime<chrono::Utc>,
         stats: &'a common::SampleStats,
     }
-    let wire: Vec<Wire> = samples
+    let wire: Vec<Wire<'_>> = samples
         .iter()
         .map(|s| Wire {
             crs: &s.crs,

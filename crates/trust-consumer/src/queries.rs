@@ -10,7 +10,7 @@ use common::oauth_client::OAuthTokenCache;
 use common::{TrackedTrainRef, TrainMovementEventMessage};
 use reqwest::Client;
 
-pub async fn fetch_active_tracked_trains(
+pub(crate) async fn fetch_active_tracked_trains(
     client: &Client,
     url: &str,
     tokens: &OAuthTokenCache,
@@ -18,7 +18,7 @@ pub async fn fetch_active_tracked_trains(
     common::ingest::get_json(client, url, tokens).await
 }
 
-pub async fn fetch_stanox_crs(
+pub(crate) async fn fetch_stanox_crs(
     client: &Client,
     url: &str,
     tokens: &OAuthTokenCache,
@@ -32,7 +32,7 @@ pub async fn fetch_stanox_crs(
 /// among them), so the caller leaves the batch un-ACKed. An older `api` that
 /// answers only `{"upserted": N}` parses as "nothing rejected". An empty
 /// batch is not sent.
-pub async fn post_train_events(
+pub(crate) async fn post_train_events(
     client: &Client,
     url: &str,
     tokens: &OAuthTokenCache,
@@ -44,7 +44,7 @@ pub async fn post_train_events(
     common::ingest::post_batch_for_response(client, url, tokens, events, "train events").await
 }
 
-pub async fn post_train_forward_signals(
+pub(crate) async fn post_train_forward_signals(
     client: &Client,
     url: &str,
     tokens: &OAuthTokenCache,

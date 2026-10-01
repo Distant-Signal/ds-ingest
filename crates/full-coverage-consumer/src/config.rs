@@ -5,7 +5,7 @@ use common::config::{LineCatalogue, parse_lines};
 /// `movement_feed`, re-exported here so every existing
 /// `use config::{Config, MovementFeedBackend};` import keeps resolving
 /// unchanged.
-pub use movement_feed::MovementFeedBackend;
+pub(crate) use movement_feed::MovementFeedBackend;
 
 /// CLI/env configuration for the `full-coverage-consumer` service -- a
 /// second, independent consumer of the same `movement-events` Redis stream
@@ -15,7 +15,7 @@ pub use movement_feed::MovementFeedBackend;
 /// docs/superpowers/specs/2026-09-04-option-b-live-consumer-design.md and
 /// docs/superpowers/plans/2026-09-04-option-b-live-consumer-plan.md Task 8.
 #[derive(Debug, Parser)]
-pub struct Config {
+pub(crate) struct Config {
     // api endpoints
     #[arg(
         long,
@@ -136,7 +136,7 @@ pub struct Config {
 /// **Off by default**: with `FULL_COVERAGE_WINDOWED_STATS=false` the
 /// consumer builds exactly the legacy whole-day rows and posts no windows.
 #[derive(Debug, Clone, clap::Args)]
-pub struct WindowedStatsArgs {
+pub(crate) struct WindowedStatsArgs {
     /// `true`: v2 day-to-date/closed-day rows, and `recent`/`day_to_date`
     /// window POSTs to `FULL_COVERAGE_WINDOW_STATS_URL` every stats write.
     #[arg(
@@ -192,7 +192,10 @@ impl Config {
     /// unlike the TOML field), mirroring `population::crs_to_tiploc_map`'s
     /// reasoning. Callers must fetch `stanox_crs_records` before relying on
     /// this for `"*"` resolution -- see `main.rs`'s startup sequencing.
-    pub fn shadow_line_ids(&self, stanox_crs_records: &[common::StanoxCrsRecord]) -> Vec<String> {
+    pub(crate) fn shadow_line_ids(
+        &self,
+        stanox_crs_records: &[common::StanoxCrsRecord],
+    ) -> Vec<String> {
         if self.shadow_lines.trim() == "*" {
             let known_crs: std::collections::HashSet<String> = stanox_crs_records
                 .iter()

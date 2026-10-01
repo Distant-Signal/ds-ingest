@@ -18,30 +18,34 @@ use std::time::Duration;
 /// movement-feed's shared dead-letter stream (`movement_feed::redis_stream`
 /// names it `<stream>-deadletter`; this crate does not depend on
 /// movement-feed).
-pub const DEADLETTER_STREAM: &str = "movement-events-deadletter";
+pub(crate) const DEADLETTER_STREAM: &str = "movement-events-deadletter";
 
 /// Hard upper bound on `--deadletter-max-age-secs`: 24 hours, the TRUST
 /// 1-day retention safeguard. clap refuses anything longer, and so does
 /// the chart.
-pub const MAX_DEADLETTER_AGE_SECS: u64 = 24 * 60 * 60;
+pub(crate) const MAX_DEADLETTER_AGE_SECS: u64 = 24 * 60 * 60;
 
 /// Lower bound on `--deadletter-max-age-secs`: an hour. Anything shorter
 /// leaves no time to inspect or re-inject a record and is almost
 /// certainly a typo (minutes entered as seconds).
-pub const MIN_DEADLETTER_AGE_SECS: u64 = 60 * 60;
+pub(crate) const MIN_DEADLETTER_AGE_SECS: u64 = 60 * 60;
 
 /// The `MINID` threshold for `now_ms` and `max_age`: every entry whose id
 /// is below it (added more than `max_age` ago, by the stream-id clock) is
 /// trimmed. Entry ids are `<ms>-<seq>`, so `<cutoff>-0` keeps everything
 /// added at or after the cutoff millisecond.
-pub fn min_id(now_ms: u64, max_age: Duration) -> String {
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "these durations are seconds to hours, far below u64::MAX milliseconds"
+)]
+pub(crate) fn min_id(now_ms: u64, max_age: Duration) -> String {
     format!("{}-0", now_ms.saturating_sub(max_age.as_millis() as u64))
 }
 
 /// Age in whole seconds of the entry with stream id `id` at `now_ms`
 /// (0 for an id from the future, as after a clock step). `None` for an id
 /// that is not `<ms>-<seq>`.
-pub fn age_secs(id: &str, now_ms: u64) -> Option<u64> {
+pub(crate) fn age_secs(id: &str, now_ms: u64) -> Option<u64> {
     let ms: u64 = id.split_once('-')?.0.parse().ok()?;
     Some(now_ms.saturating_sub(ms) / 1000)
 }
@@ -50,7 +54,7 @@ pub fn age_secs(id: &str, now_ms: u64) -> Option<u64> {
 /// than the limit survives (the stream holds at most 10,000 records, so an
 /// exact trim is cheap). Returns how many were removed; 0 for a stream
 /// that does not exist. `XTRIM` is not `denyoom`, so it runs at maxmemory.
-pub async fn trim_older_than<C: redis::aio::ConnectionLike + Send>(
+pub(crate) async fn trim_older_than<C: redis::aio::ConnectionLike + Send>(
     conn: &mut C,
     stream: &str,
     min_id: &str,
@@ -66,7 +70,7 @@ pub async fn trim_older_than<C: redis::aio::ConnectionLike + Send>(
 /// The id of the stream's oldest entry, `None` when it is empty or does
 /// not exist. `XRANGE - + COUNT 1` also returns that entry's fields; only
 /// the id is kept.
-pub async fn oldest_id<C: redis::aio::ConnectionLike + Send>(
+pub(crate) async fn oldest_id<C: redis::aio::ConnectionLike + Send>(
     conn: &mut C,
     stream: &str,
 ) -> anyhow::Result<Option<String>> {

@@ -52,7 +52,7 @@
 //! is NOT in this loop any more: it runs in its own task and swaps whole
 //! snapshots in, so a slow `api` can no longer stall consumption.
 //!
-//! # Why a batch is ACKed as soon as it is in memory -- and what that costs
+//! # Why a batch is `ACKed` as soon as it is in memory -- and what that costs
 //!
 //! `trust-consumer` only commits after a successful POST to `api`, because
 //! a failed post there loses a real tracked-train event. This crate commits
@@ -62,10 +62,10 @@
 //! re-dispatching a redelivered batch is harmless because `DerivedState`
 //! fields are last-write-wins per event, not additive.
 //!
-//! The cost is that an ACKed entry is never redelivered, so the group
+//! The cost is that an `ACKed` entry is never redelivered, so the group
 //! itself can NOT restore that state after a restart. (This doc used to
 //! claim that redelivery "would just re-derive the same state" -- true of a
-//! redelivered batch, but ACKed entries are not redelivered, and nothing
+//! redelivered batch, but `ACKed` entries are not redelivered, and nothing
 //! else restored them: every restart silently wiped the rail day so far,
 //! and every train seen before it was then counted as cancelled.) Startup
 //! step 3 is what restores it now, from the stream itself.
@@ -106,6 +106,10 @@ async fn main() -> std::process::ExitCode {
     common::logging::exit_code(run().await)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "long but linear; splitting it would scatter its shared state across helpers"
+)]
 async fn run() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
     common::logging::init("full-coverage-consumer");
@@ -160,7 +164,8 @@ async fn run() -> anyhow::Result<()> {
     let mut lookups = Lookups::default();
     let line_ids: SharedLineIds = Arc::new(ArcSwap::from_pointee(Vec::new()));
     // Stays empty while windowed stats are off: nothing is reduced.
-    let geometry: SharedGeometry = Arc::new(ArcSwap::from_pointee(Default::default()));
+    let geometry: SharedGeometry =
+        Arc::new(ArcSwap::from_pointee(std::collections::HashMap::default()));
     let stanox_crs_reload_interval = Duration::from_secs(config.stanox_crs_reload_secs);
     load_stanox_crs_until_ok(
         &http,
@@ -346,9 +351,9 @@ async fn run() -> anyhow::Result<()> {
 /// running).
 /// Every `full_coverage_consumer_errors_total` operation that is a failed
 /// call to api, registered at 0 and summed by the chart's
-/// DistantSignalConsumerApiCallsFailing alert (2026-10-01: ~516k failed
+/// `DistantSignalConsumerApiCallsFailing` alert (2026-10-01: ~516k failed
 /// population reloads raised nothing). `post_window_stats` is left out: it
-/// has its own alert (DistantSignalFullCoverageWindowPostErrors). The
+/// has its own alert (`DistantSignalFullCoverageWindowPostErrors`). The
 /// chart's template lists the same operations; a test keeps them in step.
 const API_CALL_OPERATIONS: &[&str] = &[
     "reload_line_population_fetch",
@@ -575,7 +580,10 @@ async fn reload_stanox_crs(
 
 /// Startup step 1: the crosswalk every other step depends on, retried from
 /// 1 s, doubling, capped at the normal failure backoff.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent input from the single caller; a struct would only wrap them"
+)]
 async fn load_stanox_crs_until_ok(
     client: &reqwest::Client,
     config: &Config,
@@ -664,7 +672,12 @@ fn failed_reload_retry_delay(interval: Duration) -> Duration {
 /// With `FULL_COVERAGE_WINDOWED_STATS=true` each line's row is the v2
 /// day-to-date (closed-day, once closed) row, and every line's `recent` and
 /// `day_to_date` windows are posted as one batch.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "each argument is an independent input from the single caller; a struct would only wrap them; metric gauges take f64, and these counts and timestamps stay far below 2^52; long but linear; splitting it would scatter its shared state across helpers"
+)]
 async fn write_stats(
     client: &reqwest::Client,
     config: &Config,
@@ -691,60 +704,55 @@ async fn write_stats(
     let mut window_rows = Vec::new();
     for line_id in shadow_line_ids {
         let partial = day.is_line_partial(line_id);
-        let row = match &windowed {
-            // Windowed stats (off by default): the v2 row is the
-            // day-to-date window, and both windows are posted.
-            Some((trains, ctx)) => {
-                let Some(pop) = population.line_pop(line_id, service_date) else {
-                    // Nothing published for this line yet: the same empty
-                    // pending row the legacy path writes, and no windows.
-                    line_rows.push(stats::build_line_row(
-                        line_id,
-                        service_date,
-                        &[],
-                        &day.correlation.derived,
-                        closed,
-                        partial,
-                        defaults,
-                    ));
-                    if partial {
-                        partial_count += 1;
-                    }
-                    pending_count += 1;
-                    continue;
-                };
-                let thresholds = ctx.thresholds.get(line_id.as_str()).unwrap_or(defaults);
-                let inputs = windows::LineInputs {
+        let row = if let Some((trains, ctx)) = &windowed {
+            let Some(pop) = population.line_pop(line_id, service_date) else {
+                // Nothing published for this line yet: the same empty
+                // pending row the legacy path writes, and no windows.
+                line_rows.push(stats::build_line_row(
                     line_id,
                     service_date,
-                    pop,
-                    trains,
-                    geometry: ctx.geometry.get(line_id).map(Arc::as_ref),
-                    thresholds,
-                    observed_from: day.observed_from,
-                    feed_stale: ctx.feed_stale,
-                    line_partial: partial,
-                };
-                let [recent, day_to_date] =
-                    windows::window_ranges(service_date, now, &ctx.params, closed)
-                        .map(|(kind, from, to)| inputs.window(kind, from, to, now));
-                let row = windows::line_row_v2(&day_to_date, closed);
-                window_rows.push(recent);
-                window_rows.push(day_to_date);
-                row
-            }
-            None => {
-                let population_uids = population.uids_for(line_id, service_date);
-                stats::build_line_row(
-                    line_id,
-                    service_date,
-                    &population_uids,
+                    &[],
                     &day.correlation.derived,
                     closed,
                     partial,
                     defaults,
-                )
-            }
+                ));
+                if partial {
+                    partial_count += 1;
+                }
+                pending_count += 1;
+                continue;
+            };
+            let thresholds = ctx.thresholds.get(line_id.as_str()).unwrap_or(defaults);
+            let inputs = windows::LineInputs {
+                line_id,
+                service_date,
+                pop,
+                trains,
+                geometry: ctx.geometry.get(line_id).map(Arc::as_ref),
+                thresholds,
+                observed_from: day.observed_from,
+                feed_stale: ctx.feed_stale,
+                line_partial: partial,
+            };
+            let [recent, day_to_date] =
+                windows::window_ranges(service_date, now, &ctx.params, closed)
+                    .map(|(kind, from, to)| inputs.window(kind, from, to, now));
+            let row = windows::line_row_v2(&day_to_date, closed);
+            window_rows.push(recent);
+            window_rows.push(day_to_date);
+            row
+        } else {
+            let population_uids = population.uids_for(line_id, service_date);
+            stats::build_line_row(
+                line_id,
+                service_date,
+                &population_uids,
+                &day.correlation.derived,
+                closed,
+                partial,
+                defaults,
+            )
         };
         if row.availability == "available" {
             available_count += 1;
@@ -869,6 +877,10 @@ fn windowed_write_context(
 static LAST_WINDOW_POST_WARNING: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "metric gauges take f64, and these counts and timestamps stay far below 2^52"
+)]
 async fn post_windows(
     client: &reqwest::Client,
     config: &Config,
@@ -928,10 +940,14 @@ async fn post_windows(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test code: scenario tests read top to bottom"
+)]
 mod tests {
     use std::collections::HashMap;
 
-    /// The chart's DistantSignalConsumerApiCallsFailing sums exactly
+    /// The chart's `DistantSignalConsumerApiCallsFailing` sums exactly
     /// [`API_CALL_OPERATIONS`](super::API_CALL_OPERATIONS) for this consumer.
     #[test]
     fn the_chart_alerts_on_every_api_call_operation() {
@@ -942,7 +958,7 @@ mod tests {
         .unwrap();
         let entry = format!(
             r#"(list "full_coverage_consumer" "full-coverage-consumer" "{}")"#,
-            super::API_CALL_OPERATIONS.join("|")
+            API_CALL_OPERATIONS.join("|")
         );
         assert!(
             template.contains(&entry),
@@ -1267,7 +1283,7 @@ mod tests {
     /// Integration-shaped test against `FakeMovementFeed`, mirroring
     /// `trust-consumer/src/main.rs`'s own `#[cfg(test)] mod tests`
     /// structure: exercises the full wiring together (parse -> correlate
-    /// -> station_correlate -> stats), not just each module in isolation.
+    /// -> `station_correlate` -> stats), not just each module in isolation.
     #[tokio::test]
     async fn an_activation_and_movement_batch_produces_the_expected_line_and_station_stats() {
         const ACTIVATION: &str = r#"{"header":{"msg_type":"0001"},"body":{
@@ -1395,7 +1411,7 @@ mod tests {
             ["C11052", "C22222", "C99999"]
                 .iter()
                 .map(|uid| schedule_query::LinePopulationEntry {
-                    uid: uid.to_string(),
+                    uid: (*uid).to_string(),
                     calling_points: vec![],
                     operator_atoc: None,
                     train_status: None,
@@ -1568,6 +1584,10 @@ mod tests {
         /// trains are not counted as cancelled.
         #[tokio::test]
         #[ignore = "needs REDIS_URL (local valkey)"]
+        #[allow(
+            clippy::similar_names,
+            reason = "only rustc 1.88's clippy flags these names, so #[expect] can't be used"
+        )]
         async fn a_trimmed_day_start_marks_the_day_partial() {
             let stream = unique_stream("trimmed-start");
             let (_, population) = todays_population();
@@ -1635,7 +1655,7 @@ mod tests {
     /// A feed that records, every time anything reads from it, whether the
     /// population had been loaded by then.
     struct RecordingFeed {
-        inner: movement_feed::FakeMovementFeed,
+        inner: FakeMovementFeed,
         population: SharedPopulation,
         date: chrono::NaiveDate,
         touches: Vec<bool>,
@@ -1679,7 +1699,7 @@ mod tests {
         }
         async fn pending_ids(&mut self) -> anyhow::Result<std::collections::HashSet<String>> {
             self.touch();
-            Ok(Default::default())
+            Ok(std::collections::HashSet::default())
         }
         async fn read_range(
             &mut self,
@@ -1688,7 +1708,7 @@ mod tests {
             _count: usize,
         ) -> anyhow::Result<movement_feed::redis_stream::RangePage> {
             self.touch();
-            Ok(Default::default())
+            Ok(movement_feed::redis_stream::RangePage::default())
         }
     }
 
@@ -1738,7 +1758,7 @@ mod tests {
         .spawn();
 
         let mut feed = RecordingFeed {
-            inner: movement_feed::FakeMovementFeed::new(vec![vec![
+            inner: FakeMovementFeed::new(vec![vec![
                 ACTIVATION_C11052.to_string(),
                 MOVEMENT_C11052.to_string(),
             ]]),
@@ -1778,7 +1798,7 @@ mod tests {
         );
     }
 
-    /// A population reload that takes a long time (a cold start, an ETag
+    /// A population reload that takes a long time (a cold start, an `ETag`
     /// miss, a slow `api`) no longer holds up consumption: the loop keeps
     /// consuming against the snapshot it has while the reload runs.
     #[tokio::test]
@@ -1825,7 +1845,7 @@ mod tests {
             "the reload is under way"
         );
 
-        let mut feed = movement_feed::FakeMovementFeed::new(vec![
+        let mut feed = FakeMovementFeed::new(vec![
             vec![ACTIVATION_C11052.to_string()],
             vec![MOVEMENT_C11052.to_string()],
         ]);

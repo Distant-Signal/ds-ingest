@@ -31,13 +31,13 @@ use trust_schema::schema::{Activation, Cancellation, ChangeOfOrigin, Movement, R
 use crate::correlate::{activation_service_date, train_id_day_of_month};
 
 /// UTC minutes since the Unix epoch -- the unit every due time is in.
-pub fn to_minutes(instant: DateTime<Utc>) -> u32 {
+pub(crate) fn to_minutes(instant: DateTime<Utc>) -> u32 {
     u32::try_from(instant.timestamp().div_euclid(60)).unwrap_or(0)
 }
 
 /// A live 0002.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Canx {
+pub(crate) struct Canx {
     pub canx_type: Option<String>,
     /// The planned departure at the location the train was cancelled
     /// from: it runs no further. `None` when the 0002 did not say.
@@ -46,7 +46,7 @@ pub struct Canx {
 
 /// One 0003, reduced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Report {
+pub(crate) struct Report {
     pub planned_min: u32,
     /// Minutes late (TRUST `timetable_variation`; 0 on time or early).
     pub delay: i16,
@@ -55,7 +55,7 @@ pub struct Report {
     pub tiploc: u32,
 }
 
-pub const NO_TIPLOC: u32 = u32::MAX;
+pub(crate) const NO_TIPLOC: u32 = u32::MAX;
 
 /// Reports kept per train. A long-distance train reports at a few dozen
 /// points; this only bounds a pathological feed.
@@ -66,7 +66,7 @@ const MAX_PARKED_TRAINS: usize = 50_000;
 
 /// Everything TRUST said about one UID's train(s) for the service date.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TrainDay {
+pub(crate) struct TrainDay {
     pub activated: bool,
     /// The latest 0002 not undone by a later 0005.
     pub cancel: Option<Canx>,
@@ -79,7 +79,7 @@ pub struct TrainDay {
 impl TrainDay {
     /// The report with the latest planned time: how late the train was
     /// last seen running.
-    pub fn last_report(&self) -> Option<&Report> {
+    pub(crate) fn last_report(&self) -> Option<&Report> {
         self.reports.iter().max_by_key(|r| r.planned_min)
     }
 }
@@ -108,7 +108,7 @@ impl Parked {
 }
 
 #[derive(Debug, Clone)]
-pub struct TrainState {
+pub(crate) struct TrainState {
     pub service_date: chrono::NaiveDate,
     pub current: HashMap<String, TrainDay>,
     pub next: HashMap<String, TrainDay>,
@@ -123,7 +123,7 @@ pub struct TrainState {
 }
 
 impl TrainState {
-    pub fn new(service_date: chrono::NaiveDate) -> Self {
+    pub(crate) fn new(service_date: chrono::NaiveDate) -> Self {
         Self {
             service_date,
             current: HashMap::new(),
@@ -136,7 +136,7 @@ impl TrainState {
     }
 
     /// The interned id of `tiploc`, if any report was ever at it.
-    pub fn tiploc_id(&self, tiploc: &str) -> Option<u32> {
+    pub(crate) fn tiploc_id(&self, tiploc: &str) -> Option<u32> {
         self.tiplocs.get(tiploc).copied()
     }
 
@@ -163,7 +163,7 @@ impl TrainState {
 
     /// `lookback`: an Activation from the startup replay's segment before
     /// the rail day started; only one for THIS service date is kept.
-    pub fn apply_activation(&mut self, activation: &Activation, lookback: bool) {
+    pub(crate) fn apply_activation(&mut self, activation: &Activation, lookback: bool) {
         let next_date = self.service_date + chrono::Duration::days(1);
         let candidates = if lookback {
             [
@@ -237,18 +237,26 @@ impl TrainState {
         }
     }
 
-    pub fn apply_cancellation(&mut self, cancellation: &Cancellation, received_at: DateTime<Utc>) {
+    pub(crate) fn apply_cancellation(
+        &mut self,
+        cancellation: &Cancellation,
+        received_at: DateTime<Utc>,
+    ) {
         self.apply_or_park(
             &cancellation.train_id.clone(),
             Parked::Cancellation(cancellation.clone(), received_at),
         );
     }
 
-    pub fn apply_reinstatement(&mut self, reinstatement: &Reinstatement) {
+    pub(crate) fn apply_reinstatement(&mut self, reinstatement: &Reinstatement) {
         self.apply_or_park(&reinstatement.train_id, Parked::Reinstatement);
     }
 
-    pub fn apply_change_of_origin(&mut self, change: &ChangeOfOrigin, received_at: DateTime<Utc>) {
+    pub(crate) fn apply_change_of_origin(
+        &mut self,
+        change: &ChangeOfOrigin,
+        received_at: DateTime<Utc>,
+    ) {
         self.apply_or_park(
             &change.train_id.clone(),
             Parked::ChangeOfOrigin(change.clone(), received_at),
@@ -258,7 +266,7 @@ impl TrainState {
     /// Records a 0003 against its train. Returns the report's actual
     /// time (for feed-health), when it parsed. `OFF ROUTE` (and any report
     /// that says nothing about lateness) updates nothing.
-    pub fn apply_movement(
+    pub(crate) fn apply_movement(
         &mut self,
         movement: &Movement,
         tiploc: Option<&str>,
@@ -283,9 +291,9 @@ impl TrainState {
         let (which, uid) = self.lookup(&movement.train_id)?;
         let delay = trust_schema::schema::movement_delay_minutes(movement)?;
         let planned = pair.planned?;
-        let tiploc = tiploc
-            .map(|t| self.intern(schedule_query::normalize_tiploc(t)))
-            .unwrap_or(NO_TIPLOC);
+        let tiploc = tiploc.map_or(NO_TIPLOC, |t| {
+            self.intern(schedule_query::normalize_tiploc(t))
+        });
         let day = self.day_mut(which, &uid);
         if day.reports.len() < MAX_REPORTS_PER_TRAIN {
             day.reports.push(Report {
@@ -306,7 +314,10 @@ impl TrainState {
     /// The state for the day after this one: `next` becomes `current`, and
     /// the `train_id`s and parked messages that belong to it are kept.
     /// Returns how many parked messages were given up, by `msg_type`.
-    pub fn roll(self, next_date: chrono::NaiveDate) -> (TrainState, HashMap<&'static str, u64>) {
+    pub(crate) fn roll(
+        self,
+        next_date: chrono::NaiveDate,
+    ) -> (TrainState, HashMap<&'static str, u64>) {
         use chrono::Datelike;
         let mut rolled = TrainState::new(next_date);
         let mut unattributed: HashMap<&'static str, u64> = HashMap::new();
@@ -335,7 +346,7 @@ impl TrainState {
     }
 
     /// Parked messages not yet attributed.
-    pub fn parked_count(&self) -> usize {
+    pub(crate) fn parked_count(&self) -> usize {
         self.parked.values().map(Vec::len).sum()
     }
 }

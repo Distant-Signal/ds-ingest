@@ -52,7 +52,7 @@
 //! actually ran, silently breaking `api::data::trust_event_backlog_match`'s
 //! `service_date = '<today>'` filter). TRUST delivers an Activation in real
 //! time for the specific day's running, so the day it's processed on is the
-//! correct service_date -- **except** that "the day" means the CALENDAR
+//! correct `service_date` -- **except** that "the day" means the CALENDAR
 //! date a departure board would show, not the OPERATIONAL rail day
 //! `today` otherwise is: for the 00:00-01:59:59 window those two disagree
 //! by exactly one day, and treating `today` as `service_date`
@@ -76,19 +76,19 @@ use crate::stanox_crs::StanoxCrsTable;
 /// per-train derived-state fold to maintain; every message is mapped
 /// independently, not folded against a running journey state.
 #[derive(Debug)]
-pub struct ProcessorState {
+pub(crate) struct ProcessorState {
     pub pending_service_dates: HashMap<String, NaiveDate>,
     /// `train_id -> train_uid`, populated identically to
     /// `pending_service_dates` (same Activation message, same lifetime --
     /// see this module's own doc comment). Closes the gap named in
     /// docs/superpowers/specs/2026-09-06-shared-train-identity-design.md §3:
     /// this consumer is now the PRIMARY writer for the shared trains/
-    /// train_movement_events tables, and a real train_uid on every event
+    /// `train_movement_events` tables, and a real `train_uid` on every event
     /// is what lets `api` key a Movement into the right `trains` row at
     /// all. Never removed on read (unlike trust-consumer's own
     /// one-shot-claim `pending_activations`) -- a train's whole
     /// Activation-to-Cancellation lifetime may span many Movements, every
-    /// one of which needs the same train_uid, not just the first.
+    /// one of which needs the same `train_uid`, not just the first.
     pub pending_train_uids: HashMap<String, String>,
 
     /// Finding #2's kill switch, mirroring
@@ -118,7 +118,7 @@ impl Default for ProcessorState {
 /// `process::MAX_PARKED_ACTIVATION_AGE_DAYS`, and for the same reason: an
 /// overnight working activated late on rail day D still emits Movements into
 /// rail day D+1, so one day is too tight and three buys nothing.
-pub const MAX_PARKED_ACTIVATION_AGE_DAYS: i64 = 2;
+pub(crate) const MAX_PARKED_ACTIVATION_AGE_DAYS: i64 = 2;
 
 /// Ages out parked Activation state. Pure, so the caller supplies `today`
 /// (the current Europe/London rail day) rather than this reading the clock,
@@ -143,7 +143,7 @@ pub const MAX_PARKED_ACTIVATION_AGE_DAYS: i64 = 2;
 ///    against, not merely wasted memory. `unwrap_or(today)` (the
 ///    no-parked-Activation fallback) is strictly better than a stale hit:
 ///    it is honestly approximate, where the stale hit is confidently wrong.
-pub fn prune_stale_activations(state: &mut ProcessorState, today: NaiveDate) {
+pub(crate) fn prune_stale_activations(state: &mut ProcessorState, today: NaiveDate) {
     let oldest_kept = today - chrono::Duration::days(MAX_PARKED_ACTIVATION_AGE_DAYS);
     state
         .pending_service_dates
@@ -163,7 +163,7 @@ pub fn prune_stale_activations(state: &mut ProcessorState, today: NaiveDate) {
 /// CIF schedule actually show -- see
 /// `trust-consumer::process::activation_is_for_service_date`'s own doc
 /// comment: "a service departing at (say) 00:12 has the NEXT calendar date
-/// as its service_date -- that's the date the departure board it was pinned
+/// as its `service_date` -- that's the date the departure board it was pinned
 /// from showed") -- **not** `common::rail_day::current_rail_day`'s
 /// 02:00-cutoff rail day.
 ///
@@ -201,6 +201,10 @@ pub(crate) fn service_date_for_instant(at: chrono::DateTime<chrono::Utc>) -> Nai
 /// already computed from that same `received_at`) needs exactly a
 /// one-calendar-day correction, not a full re-derivation, whenever it was
 /// processed in this window.
+#[expect(
+    clippy::expect_used,
+    reason = "a constant or range-checked time is always valid"
+)]
 fn is_within_post_midnight_window(at: chrono::DateTime<chrono::Utc>) -> bool {
     let local = at.with_timezone(&chrono_tz::Europe::London);
     let cutoff = chrono::NaiveTime::from_hms_opt(2, 0, 0).expect("2:00:00 is a valid time");
@@ -215,7 +219,11 @@ fn is_within_post_midnight_window(at: chrono::DateTime<chrono::Utc>) -> bool {
 /// background, why it decides correction ONCE per message rather than
 /// independently per field, and its guard against the correction itself
 /// being wrong.
-pub fn process_message(
+#[expect(
+    clippy::too_many_lines,
+    reason = "long but linear; splitting it would scatter its shared state across helpers"
+)]
+pub(crate) fn process_message(
     message: &TrustMessage,
     state: &mut ProcessorState,
     stanox_crs: &StanoxCrsTable,
@@ -405,12 +413,7 @@ pub fn process_message(
                 .pending_service_dates
                 .get(&movement.train_id)
                 .copied()
-                .unwrap_or_else(|| {
-                    actual
-                        .or(planned)
-                        .map(service_date_for_instant)
-                        .unwrap_or(today)
-                });
+                .unwrap_or_else(|| actual.or(planned).map_or(today, service_date_for_instant));
 
             let dedup = trust_schema::dedup::dedup_key(
                 &movement.train_id,
@@ -474,7 +477,7 @@ pub fn process_message(
                 .pending_service_dates
                 .get(&cancellation.train_id)
                 .copied()
-                .unwrap_or_else(|| actual.map(service_date_for_instant).unwrap_or(today));
+                .unwrap_or_else(|| actual.map_or(today, service_date_for_instant));
 
             // A Cancellation's key otherwise carries nothing but
             // `(train_id, msg_type)`, and `api`'s `trust_event_backlog`
@@ -555,12 +558,7 @@ pub fn process_message(
                 .pending_service_dates
                 .get(&reinstatement.train_id)
                 .copied()
-                .unwrap_or_else(|| {
-                    dep_pair
-                        .actual
-                        .map(service_date_for_instant)
-                        .unwrap_or(today)
-                });
+                .unwrap_or_else(|| dep_pair.actual.map_or(today, service_date_for_instant));
 
             // `reinstatement_timestamp` in the key's timestamp slot, so a
             // second reinstatement of the same train on the same day is a
@@ -619,6 +617,10 @@ pub fn process_message(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::similar_names,
+    reason = "test code: paired test values share names"
+)]
 mod tests {
     use super::*;
 
@@ -883,7 +885,7 @@ mod tests {
     /// overnight departure (see
     /// `trust-consumer::process::activation_is_for_service_date`'s own doc
     /// comment: "a service departing at (say) 00:12 has the NEXT calendar
-    /// date as its service_date"). Before this fix, every 00:00-01:59:59
+    /// date as its `service_date`"). Before this fix, every 00:00-01:59:59
     /// Activation was filed one calendar day early, splitting its
     /// `trust_event_backlog` rows from the `service_date` a schedule match
     /// keys the same overnight train's `trains` row on -- silently defeating
@@ -1620,7 +1622,7 @@ mod tests {
             .unwrap()
         };
         let rows: Vec<_> = sequence.iter().map(&mut run).collect();
-        let keys: std::collections::HashSet<_> = rows.iter().map(|row| &row.dedup_key).collect();
+        let keys: HashSet<_> = rows.iter().map(|row| &row.dedup_key).collect();
         assert_eq!(keys.len(), 4, "every event in the sequence is its own row");
         assert!(rows[1].actual_timestamp.is_some());
         assert!(rows[1].actual_timestamp < rows[3].actual_timestamp);

@@ -73,7 +73,7 @@ struct StanoxCrsRecord {
 /// message, not in a hot loop, so the small extra allocation per lookup
 /// this implies is not worth avoiding via `Box::leak`.
 #[derive(Debug, Clone, Default)]
-pub struct StanoxCrsTable {
+pub(crate) struct StanoxCrsTable {
     by_stanox: HashMap<String, String>,
 }
 
@@ -83,7 +83,7 @@ impl StanoxCrsTable {
     /// is missing or malformed, matching this codebase's "config load
     /// fails fast at startup" posture (see `common::LineDefinition::from_file`
     /// and `crates/aggregator/src/config.rs`'s `parse_lines`).
-    pub fn from_file(path: &Path) -> anyhow::Result<Self> {
+    pub(crate) fn from_file(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading STANOX->CRS table at {}", path.display()))?;
         Self::parse(&text)
@@ -159,7 +159,7 @@ impl StanoxCrsTable {
     /// `tiploc`/`station_name`/`source_sequence` are not needed for
     /// lookup and are dropped here; only `stanox`/`crs` matter to
     /// `stanox_to_crs`.
-    pub fn from_records(records: Vec<common::StanoxCrsRecord>) -> Self {
+    pub(crate) fn from_records(records: Vec<common::StanoxCrsRecord>) -> Self {
         let by_stanox = records.into_iter().map(|r| (r.stanox, r.crs)).collect();
         Self { by_stanox }
     }
@@ -173,7 +173,7 @@ impl StanoxCrsTable {
     /// `"2071"` instead of `"02071"`) still resolves; TRUST's real feed
     /// sends fixed 5-digit zero-padded strings, so this is defensive
     /// rather than load-bearing.
-    pub fn stanox_to_crs(&self, stanox: &str) -> Option<String> {
+    pub(crate) fn stanox_to_crs(&self, stanox: &str) -> Option<String> {
         let trimmed = stanox.trim();
         if let Some(crs) = self.by_stanox.get(trimmed) {
             return Some(crs.clone());

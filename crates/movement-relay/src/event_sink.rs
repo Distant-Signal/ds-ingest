@@ -14,7 +14,7 @@ const STREAM: &str = "movement-events";
 /// Every consumer group that reads `movement-events` -- the default for
 /// `--movement-consumer-groups` (the chart passes only the groups whose
 /// consumer actually reads the stream).
-pub const DEFAULT_CONSUMER_GROUPS: [&str; 3] = [
+pub(crate) const DEFAULT_CONSUMER_GROUPS: [&str; 3] = [
     "trust-consumer",
     "full-coverage-consumer",
     "trust-event-backlog",
@@ -23,11 +23,11 @@ pub const DEFAULT_CONSUMER_GROUPS: [&str; 3] = [
 /// Counter of `movement-events` streams this relay found missing while
 /// running and recreated, together with every consumer group (see
 /// [`RedisEventSink::publish`]). Registered at 0 on connect, so the chart's
-/// DistantSignalMovementGroupRecreated alert can use a plain `increase()`.
+/// `DistantSignalMovementGroupRecreated` alert can use a plain `increase()`.
 const STREAM_CREATED_METRIC: &str = "movement_relay_stream_created_total";
 
 #[async_trait]
-pub trait EventSink: Send {
+pub(crate) trait EventSink: Send {
     /// XADDs one surviving envelope. `msg_type` is the redundant
     /// introspection field (Decision 2's field-layout choice);
     /// `payload` is the envelope's own raw JSON bytes, unchanged.
@@ -131,7 +131,7 @@ pub(crate) async fn create_groups<C: redis::aio::ConnectionLike + Send>(
     Ok(created)
 }
 
-pub struct RedisEventSink {
+pub(crate) struct RedisEventSink {
     conn: RedisConn,
     stream: String,
     maxlen: u64,
@@ -147,7 +147,7 @@ impl RedisEventSink {
     ///
     /// `groups` are the consumer groups created at `0` whenever the stream
     /// is fresh (see [`create_groups`] and [`Self::prepare_stream`]).
-    pub async fn connect_until_ready(
+    pub(crate) async fn connect_until_ready(
         redis_url: &str,
         maxlen: u64,
         groups: Vec<String>,
@@ -187,7 +187,7 @@ impl RedisEventSink {
     /// must start at the tail, not replay the whole stream.
     ///
     /// Not counted as a recreation: a fresh install looks the same.
-    pub async fn prepare_stream(&mut self) -> anyhow::Result<()> {
+    pub(crate) async fn prepare_stream(&mut self) -> anyhow::Result<()> {
         let len: u64 = redis::cmd("XLEN")
             .arg(&self.stream)
             .query_async(&mut self.conn)
@@ -285,7 +285,7 @@ impl EventSink for RedisEventSink {
 
 #[cfg(test)]
 #[derive(Default)]
-pub struct FakeEventSink {
+pub(crate) struct FakeEventSink {
     pub published: Vec<(String, String)>,
     pub fail_next: bool,
 }

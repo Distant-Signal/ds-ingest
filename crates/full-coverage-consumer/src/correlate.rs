@@ -1,5 +1,5 @@
 //! Decision 2d's matching algorithm: per-`(line_id, uid)` running record,
-//! reusing trust_schema::journey's derivation logic exactly as
+//! reusing `trust_schema::journey`'s derivation logic exactly as
 //! trust-consumer does, keyed differently (per-(line_id, uid) here vs.
 //! per-train_id there) -- confirmed compatible with zero generalization
 //! by Task 1's own grounding pass.
@@ -13,16 +13,16 @@ use crate::population::Population;
 use crate::stanox_tiploc::StanoxTable;
 
 #[derive(Debug, Clone, Default)]
-pub struct CorrelationState {
-    /// train_id -> train_uid, parked by Activation (mirrors
-    /// trust-consumer's ProcessorState.pending_activations, but this
+pub(crate) struct CorrelationState {
+    /// `train_id` -> `train_uid`, parked by Activation (mirrors
+    /// trust-consumer's `ProcessorState.pending_activations`, but this
     /// consumer has no expiry-pruning need yet since it's rebuilt per
     /// rail day -- see Task 13's own cycle-reset note).
     pub pending_activations: HashMap<String, String>,
-    /// (line_id, uid) -> DerivedState, one entry per line a UID has been
+    /// (`line_id`, uid) -> `DerivedState`, one entry per line a UID has been
     /// matched against.
     pub derived: HashMap<(String, String), DerivedState>,
-    /// train_id -> train_uid, learned once an Activation OR a matched
+    /// `train_id` -> `train_uid`, learned once an Activation OR a matched
     /// Movement confirms it (mirrors ProcessorState.resolved).
     pub resolved: HashMap<String, String>,
 }
@@ -30,7 +30,7 @@ pub struct CorrelationState {
 /// The day of the month a TRUST `train_id` was activated for: its last
 /// two characters (the origin departure's day of the month, by TRUST's own
 /// id convention). `None` for an id not ending in two digits.
-pub fn train_id_day_of_month(train_id: &str) -> Option<u32> {
+pub(crate) fn train_id_day_of_month(train_id: &str) -> Option<u32> {
     let digits = train_id.get(train_id.len().checked_sub(2)?..)?;
     if !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -43,7 +43,7 @@ pub fn train_id_day_of_month(train_id: &str) -> Option<u32> {
 /// when present, else from the `train_id`'s day-of-month digits, matched
 /// against `candidates` -- never from `schedule_start_date`, which is the
 /// CIF validity window's start. `None` when neither says.
-pub fn activation_service_date(
+pub(crate) fn activation_service_date(
     activation: &Activation,
     candidates: &[chrono::NaiveDate],
 ) -> Option<chrono::NaiveDate> {
@@ -59,7 +59,7 @@ pub fn activation_service_date(
     candidates.iter().copied().find(|date| date.day() == day)
 }
 
-pub fn apply_activation(state: &mut CorrelationState, activation: &Activation) {
+pub(crate) fn apply_activation(state: &mut CorrelationState, activation: &Activation) {
     state
         .pending_activations
         .insert(activation.train_id.clone(), activation.train_uid.clone());
@@ -71,7 +71,7 @@ pub fn apply_activation(state: &mut CorrelationState, activation: &Activation) {
 /// `station_correlate::apply_movement_station` without `correlate.rs`
 /// itself depending on `station_correlate.rs` (keeps the two modules'
 /// test suites independent).
-pub fn apply_movement(
+pub(crate) fn apply_movement(
     state: &mut CorrelationState,
     movement: &Movement,
     stanox: &StanoxTable,
@@ -144,10 +144,10 @@ pub fn apply_movement(
 /// station-level state (Task 12) for one Movement -- `train_uid` even when
 /// `matched_lines` is empty (a Movement can be un-matched at the line
 /// level -- no candidate line's population contains this UID -- while
-/// still carrying a real, already-resolved train_uid the station-level
+/// still carrying a real, already-resolved `train_uid` the station-level
 /// pass has independent use for, per Decision 2h's own asymmetric rule).
 #[derive(Debug, Clone, Default)]
-pub struct MovementMatch {
+pub(crate) struct MovementMatch {
     pub train_uid: String,
     pub matched_lines: Vec<(String, String)>,
     pub loc_crs: Option<String>,
@@ -163,7 +163,7 @@ pub struct MovementMatch {
 /// moved -- most cancellations (windowed stats design, section 3.4) -- was
 /// ignored, and only read "cancelled" through the no-event rule, which a
 /// partial day switches off.
-pub fn apply_cancellation(
+pub(crate) fn apply_cancellation(
     state: &mut CorrelationState,
     cancellation: &Cancellation,
     population: &Population,
@@ -184,7 +184,7 @@ pub fn apply_cancellation(
             .or_insert_with(DerivedState::awaiting_activation);
     }
     let mut cancelled = vec![];
-    for (key, derived) in state.derived.iter_mut() {
+    for (key, derived) in &mut state.derived {
         if key.1 == train_uid {
             *derived = trust_schema::journey::apply_cancellation(derived);
             cancelled.push(key.clone());
@@ -195,6 +195,10 @@ pub fn apply_cancellation(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::similar_names,
+    reason = "test code: paired test values share names"
+)]
 mod tests {
     use super::*;
 
@@ -317,6 +321,10 @@ mod tests {
     /// `timetable_variation`. It used to stay `None`, so every full-coverage
     /// row read `delayed = 0`.
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "a single 12-minute sample averages to exactly 12.0"
+    )]
     fn a_late_movement_records_trusts_timetable_variation_as_the_delay() {
         let mut state = CorrelationState::default();
         let date: chrono::NaiveDate = "2026-09-04".parse().unwrap();

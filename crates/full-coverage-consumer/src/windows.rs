@@ -22,7 +22,7 @@ use crate::trains::{NO_TIPLOC, Report, TrainDay, TrainState, to_minutes};
 
 /// The consumer's window parameters (`config::WindowedStatsArgs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WindowParams {
+pub(crate) struct WindowParams {
     pub recent_minutes: u32,
     pub grace_minutes: u32,
     pub activations_min: u32,
@@ -35,7 +35,7 @@ pub struct WindowParams {
 const ACTIVATION_LEAD_MINUTES: u32 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrainClass {
+pub(crate) enum TrainClass {
     OnTime,
     Late,
     /// Reached the line, then a cancellation or change of origin cut it
@@ -54,7 +54,7 @@ pub enum TrainClass {
 
 /// What classifying one train needs beyond the train itself.
 #[derive(Debug, Clone)]
-pub struct ClassifyCtx {
+pub(crate) struct ClassifyCtx {
     /// Minutes late (at the first report on the line) from which a train
     /// is delayed: `Defaults::full_coverage_delay_threshold_minutes`.
     pub delay_threshold: i64,
@@ -87,7 +87,7 @@ fn first_report_on_line<'a>(
 
 /// Section 4.3.2's table, in order. Returns the class and the delay it was
 /// judged on (0 when none).
-pub fn classify_line_train(
+pub(crate) fn classify_line_train(
     train: &LineTrain,
     day: Option<&TrainDay>,
     ctx: &ClassifyCtx,
@@ -195,7 +195,7 @@ fn count(counts: &mut FullCoverageWindowCounts, class: TrainClass, delay: i32) -
 }
 
 /// Everything about one line that every window of one write shares.
-pub struct LineInputs<'a> {
+pub(crate) struct LineInputs<'a> {
     pub line_id: &'a str,
     pub service_date: chrono::NaiveDate,
     pub pop: &'a LinePop,
@@ -234,10 +234,18 @@ impl LineInputs<'_> {
 
     /// Counts every train with `due` in `[from, to]` (inclusive, UTC
     /// minutes).
-    pub fn counts(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> FullCoverageWindowCounts {
+    pub(crate) fn counts(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> FullCoverageWindowCounts {
         self.counts_in(to_minutes(from), to_minutes(to))
     }
 
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "counts stay far below 2^52, so the f64 ratio is exact"
+    )]
     fn counts_in(&self, from: u32, to: u32) -> FullCoverageWindowCounts {
         let ctx = self.ctx();
         let trains = &self.pop.trains;
@@ -267,7 +275,7 @@ impl LineInputs<'_> {
     /// (from the rail-day start itself). A window that
     /// starts less than an hour after `observed_from` (or on a line whose
     /// day is partial) is `partial` and never influences severity.
-    pub fn window(
+    pub(crate) fn window(
         &self,
         kind: FullCoverageWindowKind,
         from: DateTime<Utc>,
@@ -302,7 +310,7 @@ impl LineInputs<'_> {
 
 /// The `recent` and `day_to_date` due ranges at `now`. When the day has
 /// closed, `day_to_date` covers the whole rail day (the closed-day row).
-pub fn window_ranges(
+pub(crate) fn window_ranges(
     service_date: chrono::NaiveDate,
     now: DateTime<Utc>,
     params: &WindowParams,
@@ -331,7 +339,7 @@ pub fn window_ranges(
 /// The v2 `full_coverage_line_stats` row from a `day_to_date` window: the
 /// open day's running counts (`pending`), or -- once closed -- the day's
 /// audit record (`available` unless partial).
-pub fn line_row_v2(
+pub(crate) fn line_row_v2(
     day_to_date: &FullCoverageWindowStatsRow,
     closed: bool,
 ) -> FullCoverageLineStatsRow {
@@ -354,7 +362,7 @@ pub fn line_row_v2(
 /// Section 4.3.4's feed-health gate: the newest consumed event is recent
 /// enough, and enough Activations arrived in the last hour. Without it a
 /// TRUST or relay outage would read as every due train presumed cancelled.
-pub fn feed_stale(
+pub(crate) fn feed_stale(
     last_event_at: Option<DateTime<Utc>>,
     activations_last_hour: usize,
     now: DateTime<Utc>,
@@ -367,6 +375,10 @@ pub fn feed_stale(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::float_cmp,
+    reason = "test code: exact expected values are the point"
+)]
 mod tests {
     use super::*;
     use crate::trains::Canx;

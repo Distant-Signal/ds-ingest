@@ -11,7 +11,7 @@ use schedule_query::LinePopulationEntry;
 /// Whether a line's population for a date could apply the full relevance
 /// filter (windowed stats design section 4.1).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Relevance {
+pub(crate) enum Relevance {
     /// The population carried `operator_atoc`/`train_status`: buses and
     /// ships are out, and a train must be run by one of the line's
     /// operators and call at two of its stations.
@@ -24,7 +24,7 @@ pub enum Relevance {
 }
 
 impl Relevance {
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Relevance::Full => "full",
             Relevance::StopsOnly => "stops_only",
@@ -35,7 +35,7 @@ impl Relevance {
 /// One relevant train of a line, reduced to what the windowed stats need:
 /// all times are UTC minutes since the Unix epoch. No calling points.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LineTrain {
+pub(crate) struct LineTrain {
     pub uid: Box<str>,
     /// First booked call at a station of the line (departure, else
     /// arrival): when the train is "due" on it.
@@ -48,7 +48,7 @@ pub struct LineTrain {
 
 /// One line's population for one service date.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct LinePop {
+pub(crate) struct LinePop {
     /// Every UID except buses and ships -- movement matching and the
     /// legacy (flag-off) row, unchanged semantics.
     pub uids: HashSet<String>,
@@ -70,7 +70,7 @@ pub struct LinePop {
 /// (resolved through the same `stanox_crs` crosswalk as
 /// [`build_tiploc_index`]) and its operators.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LineGeometry {
+pub(crate) struct LineGeometry {
     /// Bare TIPLOC -> CRS, for the line's stations.
     pub crs_by_tiploc: HashMap<String, String>,
     pub operators: HashSet<String>,
@@ -79,7 +79,7 @@ pub struct LineGeometry {
 }
 
 impl LineGeometry {
-    pub fn new(crs_by_tiploc: HashMap<String, String>, operators: HashSet<String>) -> Self {
+    pub(crate) fn new(crs_by_tiploc: HashMap<String, String>, operators: HashSet<String>) -> Self {
         use std::hash::{Hash, Hasher};
         let mut pairs: Vec<(&String, &String)> = crs_by_tiploc.iter().collect();
         pairs.sort();
@@ -98,8 +98,8 @@ impl LineGeometry {
     }
 }
 
-/// line_id -> its geometry, rebuilt on every stanox/crs reload.
-pub fn build_line_geometry(
+/// `line_id` -> its geometry, rebuilt on every stanox/crs reload.
+pub(crate) fn build_line_geometry(
     lines: &[common::LineDefinition],
     stanox_crs_records: &[common::StanoxCrsRecord],
 ) -> HashMap<String, Arc<LineGeometry>> {
@@ -308,7 +308,7 @@ impl<'de> serde::de::DeserializeSeed<'de> for PopulationSeed<'_> {
 impl<'de> serde::de::Visitor<'de> for PopulationSeed<'_> {
     type Value = Option<LinePop>;
 
-    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("null or an array of line-population entries")
     }
 
@@ -356,7 +356,7 @@ impl<'de> serde::de::Visitor<'de> for PopulationSeed<'_> {
 /// day (882 of the 891 population UIDs with no TRUST message at all on
 /// 2026-09-26). A population published without `train_status` (an older
 /// `schedule-reference`) keeps every entry, and reads `StopsOnly`.
-pub fn parse_line_population(
+pub(crate) fn parse_line_population(
     body: &str,
     geometry: Option<&LineGeometry>,
     date: chrono::NaiveDate,
@@ -369,8 +369,8 @@ pub fn parse_line_population(
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct Population {
-    /// line_id -> service_date -> uid set.
+pub(crate) struct Population {
+    /// `line_id` -> `service_date` -> uid set.
     ///
     /// Deliberately just the UID, not the `Vec<CallingPoint>` each wire
     /// entry (`schedule_query::LinePopulationEntry`) also carries -- see
@@ -442,7 +442,7 @@ impl Population {
     /// Test-only since 2026-09-26: the reload calls
     /// [`Population::insert_uids`].
     #[cfg(test)]
-    pub fn insert(
+    pub(crate) fn insert(
         &mut self,
         line_id: &str,
         service_date: chrono::NaiveDate,
@@ -455,7 +455,7 @@ impl Population {
     /// arrived with. Test-only: see [`Population::insert_uids`] (`None` when `api` sent none, which clears any previous
     /// one for this key -- the new data is no longer described by it).
     #[cfg(test)]
-    pub fn insert_with_etag(
+    pub(crate) fn insert_with_etag(
         &mut self,
         line_id: &str,
         service_date: chrono::NaiveDate,
@@ -468,7 +468,7 @@ impl Population {
 
     /// Stores `(line_id, service_date)`'s uid set alone (no trains).
     #[cfg(test)]
-    pub fn insert_uids(
+    pub(crate) fn insert_uids(
         &mut self,
         line_id: &str,
         service_date: chrono::NaiveDate,
@@ -490,7 +490,7 @@ impl Population {
     /// arrived with (`None` clears any previous one -- the new data is no
     /// longer described by it). What the reload calls, with the population
     /// parsed straight off the wire by [`parse_line_population`].
-    pub fn insert_line_pop(
+    pub(crate) fn insert_line_pop(
         &mut self,
         line_id: &str,
         service_date: chrono::NaiveDate,
@@ -515,7 +515,7 @@ impl Population {
     /// The `ETag` of the population currently held for
     /// `(line_id, service_date)`, to send as `If-None-Match` -- `None` when
     /// nothing is held or `api` sent no `ETag` with it.
-    pub fn etag_for(&self, line_id: &str, service_date: chrono::NaiveDate) -> Option<&str> {
+    pub(crate) fn etag_for(&self, line_id: &str, service_date: chrono::NaiveDate) -> Option<&str> {
         self.etags
             .get(&(line_id.to_string(), service_date))
             .map(String::as_str)
@@ -525,7 +525,7 @@ impl Population {
     /// reduced against `geometry_hash` -- after a line's stations or
     /// operators change, its population must be downloaded and reduced
     /// again, not revalidated.
-    pub fn etag_if_current(
+    pub(crate) fn etag_if_current(
         &self,
         line_id: &str,
         service_date: chrono::NaiveDate,
@@ -539,7 +539,7 @@ impl Population {
     }
 
     /// `(line_id, service_date)`'s population, if held.
-    pub fn line_pop(
+    pub(crate) fn line_pop(
         &self,
         line_id: &str,
         service_date: chrono::NaiveDate,
@@ -564,7 +564,7 @@ impl Population {
     /// each snapshot from scratch with only today's and tomorrow's dates, so
     /// an older date is dropped by construction.
     #[cfg(test)]
-    pub fn retain_from(&mut self, service_date: chrono::NaiveDate) {
+    pub(crate) fn retain_from(&mut self, service_date: chrono::NaiveDate) {
         self.by_line.retain(|_line_id, by_date| {
             by_date.retain(|date, _| *date >= service_date);
             !by_date.is_empty()
@@ -576,7 +576,7 @@ impl Population {
     /// `ETag` -- over from `previous` unchanged, sharing the set rather than
     /// copying it. Used for a `304` and for a fetch that failed (keep the
     /// previous snapshot). A no-op when `previous` holds nothing for it.
-    pub fn carry_over(
+    pub(crate) fn carry_over(
         &mut self,
         previous: &Population,
         line_id: &str,
@@ -597,7 +597,7 @@ impl Population {
 
     /// Whether a population (possibly empty) is held for
     /// `(line_id, service_date)`.
-    pub fn has(&self, line_id: &str, service_date: chrono::NaiveDate) -> bool {
+    pub(crate) fn has(&self, line_id: &str, service_date: chrono::NaiveDate) -> bool {
         self.by_line
             .get(line_id)
             .is_some_and(|by_date| by_date.contains_key(&service_date))
@@ -608,7 +608,12 @@ impl Population {
     /// `uids_for(..).contains(..)` collected the line's whole uid set into
     /// a `Vec` for every candidate line of every Movement, which is what a
     /// startup replay of a full rail day (~1M entries) would otherwise pay.
-    pub fn contains(&self, line_id: &str, service_date: chrono::NaiveDate, uid: &str) -> bool {
+    pub(crate) fn contains(
+        &self,
+        line_id: &str,
+        service_date: chrono::NaiveDate,
+        uid: &str,
+    ) -> bool {
         self.by_line
             .get(line_id)
             .and_then(|by_date| by_date.get(&service_date))
@@ -618,7 +623,7 @@ impl Population {
     /// Every line whose `service_date` population contains `uid`. A scan of
     /// the ~250 lines' hash sets, paid once per Cancellation, not per
     /// Movement.
-    pub fn lines_containing(&self, service_date: chrono::NaiveDate, uid: &str) -> Vec<&str> {
+    pub(crate) fn lines_containing(&self, service_date: chrono::NaiveDate, uid: &str) -> Vec<&str> {
         self.by_line
             .iter()
             .filter(|(_, by_date)| {
@@ -632,7 +637,7 @@ impl Population {
 
     /// Total uids held across every line and date -- for the
     /// `population_uids` gauge and memory sizing.
-    pub fn total_uids(&self) -> usize {
+    pub(crate) fn total_uids(&self) -> usize {
         self.by_line
             .values()
             .flat_map(|by_date| by_date.values())
@@ -643,7 +648,7 @@ impl Population {
     /// Every UID this line's population contains for `service_date`,
     /// empty if nothing has been published yet (Decision 2e's Pending
     /// case, upstream of the rail-day gate).
-    pub fn uids_for(&self, line_id: &str, service_date: chrono::NaiveDate) -> Vec<&str> {
+    pub(crate) fn uids_for(&self, line_id: &str, service_date: chrono::NaiveDate) -> Vec<&str> {
         self.by_line
             .get(line_id)
             .and_then(|by_date| by_date.get(&service_date))
@@ -685,7 +690,7 @@ fn crs_to_tiploc_map(records: &[common::StanoxCrsRecord]) -> HashMap<String, Vec
 /// `trust-backlog-consumer::crs_index::build_crs_index`. Each station's
 /// real TIPLOC(s) are now resolved from `crs_to_tiploc_map` via its CRS
 /// (always present, unlike the TOML `tiploc` field) instead.
-pub fn build_tiploc_index(
+pub(crate) fn build_tiploc_index(
     lines: &[common::LineDefinition],
     stanox_crs_records: &[common::StanoxCrsRecord],
 ) -> HashMap<String, Vec<String>> {
@@ -708,6 +713,12 @@ pub fn build_tiploc_index(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::needless_pass_by_value,
+    reason = "test code: casts of small known test values; helpers take owned fixtures"
+)]
 mod tests {
     use super::*;
 
@@ -720,7 +731,7 @@ mod tests {
             is_half_minute_arrival: false,
             is_half_minute_departure: false,
             day_offset: 0,
-            activity: Default::default(),
+            activity: schedule_query::SmallStr::default(),
             public_arrival: None,
             public_departure: None,
             platform: None,
@@ -755,9 +766,9 @@ mod tests {
         LineGeometry::new(
             stations
                 .iter()
-                .map(|(t, c)| (t.to_string(), c.to_string()))
+                .map(|(t, c)| ((*t).to_string(), (*c).to_string()))
                 .collect(),
-            operators.iter().map(|o| o.to_string()).collect(),
+            operators.iter().map(ToString::to_string).collect(),
         )
     }
 
@@ -799,7 +810,7 @@ mod tests {
     }
 
     /// Due is the first call at a line station -- its departure, or its
-    /// arrival when it has none -- in UTC (BST here); last_due the last;
+    /// arrival when it has none -- in UTC (BST here); `last_due` the last;
     /// origin the schedule's first calling point.
     #[test]
     fn due_is_the_first_line_call_and_times_are_utc() {
@@ -969,8 +980,8 @@ mod tests {
             .collect();
         let pop = parse(entries, &g, "2026-09-27");
         assert_eq!(pop.trains.len(), 3357);
-        assert!(std::mem::size_of::<LineTrain>() <= 32);
-        let resident = pop.trains.capacity() * std::mem::size_of::<LineTrain>()
+        assert!(size_of::<LineTrain>() <= 32);
+        let resident = pop.trains.capacity() * size_of::<LineTrain>()
             + pop.trains.iter().map(|t| t.uid.len()).sum::<usize>();
         assert!(resident < 3357 * 40, "{resident} bytes");
     }
@@ -1144,7 +1155,7 @@ mod tests {
             stations: crs_codes
                 .iter()
                 .map(|c| common::Station {
-                    crs: c.to_string(),
+                    crs: (*c).to_string(),
                     tiploc: None,
                     role: "minor".to_string(),
                     segment: None,
@@ -1153,7 +1164,7 @@ mod tests {
             sample_stations: vec![],
             match_keywords: vec![],
             excluded_keywords: vec![],
-            severity_overrides: std::collections::HashMap::new(),
+            severity_overrides: HashMap::new(),
             destination_crs_filter: vec![],
             headcode_prefixes: vec![],
             full_coverage_enabled: false,

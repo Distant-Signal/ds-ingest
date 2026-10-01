@@ -13,7 +13,7 @@
 //! only after the full `population_reload_secs` (300s). When `api` was not
 //! up yet at startup (connection refused, seen at 01:24Z on 2026-09-27),
 //! up to 5 minutes of events were matched against an empty population and
-//! ACKed -- lost for this consumer. The first load is now awaited before
+//! `ACKed` -- lost for this consumer. The first load is now awaited before
 //! anything is consumed (see [`wait_for_first_load`]), and a failed cycle
 //! is retried on a short, doubling backoff instead of the full interval --
 //! the same idea as the stanox/crs reload's `failed_reload_retry_delay`.
@@ -40,26 +40,26 @@ use crate::queries;
 
 /// A cycle stops fetching once this many fetches in a row have failed with
 /// none succeeding before them (see the module docs).
-pub const ABORT_AFTER_FAILURES: usize = 3;
+pub(crate) const ABORT_AFTER_FAILURES: usize = 3;
 
 /// The wait after each consecutive failed cycle: 1s, doubling, capped at
 /// 60s, jittered (see [`common::backoff`]).
-pub const RETRY_BACKOFF: common::backoff::Backoff =
+pub(crate) const RETRY_BACKOFF: common::backoff::Backoff =
     common::backoff::Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
 
 /// The current population snapshot, swapped whole by the reloader.
-pub type SharedPopulation = Arc<ArcSwap<Population>>;
+pub(crate) type SharedPopulation = Arc<ArcSwap<Population>>;
 /// The shadow line ids the reloader fetches, refreshed by the consume
 /// loop's stanox/crs reload.
-pub type SharedLineIds = Arc<ArcSwap<Vec<String>>>;
-/// line_id -> [`LineGeometry`], refreshed by the stanox/crs reload. Empty
+pub(crate) type SharedLineIds = Arc<ArcSwap<Vec<String>>>;
+/// `line_id` -> [`LineGeometry`], refreshed by the stanox/crs reload. Empty
 /// while `FULL_COVERAGE_WINDOWED_STATS` is off, so no trains are reduced
 /// (the population is then exactly what it was before windowed stats).
-pub type SharedGeometry = Arc<ArcSwap<HashMap<String, Arc<LineGeometry>>>>;
+pub(crate) type SharedGeometry = Arc<ArcSwap<HashMap<String, Arc<LineGeometry>>>>;
 
 /// What one reload cycle achieved.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CycleOutcome {
+pub(crate) struct CycleOutcome {
     /// Every `(line_id, date)` whose fetch failed (transport/HTTP error or
     /// an undeserializable body). Its previous snapshot, if any, was kept.
     pub failed: Vec<(String, chrono::NaiveDate)>,
@@ -70,7 +70,7 @@ pub struct CycleOutcome {
 
 impl CycleOutcome {
     /// Lines whose fetch for `date` failed.
-    pub fn failed_on(&self, date: chrono::NaiveDate) -> Vec<String> {
+    pub(crate) fn failed_on(&self, date: chrono::NaiveDate) -> Vec<String> {
         self.failed
             .iter()
             .filter(|(_, d)| *d == date)
@@ -91,7 +91,7 @@ impl CycleOutcome {
 /// today's and tomorrow's are ever read). The reloader itself calls
 /// [`reload_cycle_from`], which also rotates the starting line.
 #[cfg(test)]
-pub async fn reload_cycle(
+pub(crate) async fn reload_cycle(
     client: &reqwest::Client,
     url: &str,
     tokens: &common::oauth_client::OAuthTokenCache,
@@ -117,8 +117,11 @@ pub async fn reload_cycle(
 /// round. Stops fetching once [`ABORT_AFTER_FAILURES`] fetches in a row
 /// have failed with none succeeding before them; every key not fetched
 /// keeps its previous snapshot and is reported in [`CycleOutcome::failed`].
-#[allow(clippy::too_many_arguments)]
-pub async fn reload_cycle_from(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent input from the single caller; a struct would only wrap them"
+)]
+pub(crate) async fn reload_cycle_from(
     client: &reqwest::Client,
     url: &str,
     tokens: &common::oauth_client::OAuthTokenCache,
@@ -241,7 +244,7 @@ pub async fn reload_cycle_from(
 
 /// How many of `line_ids` have no population held for `date` (never
 /// published, or not yet fetched successfully).
-pub fn lines_without_population(
+pub(crate) fn lines_without_population(
     population: &Population,
     line_ids: &[String],
     date: chrono::NaiveDate,
@@ -266,7 +269,7 @@ const POPULATION_DEADLINE_LONDON: chrono::NaiveTime = match chrono::NaiveTime::f
 /// `missing_today` once `now` is past 06:00 London on `service_date`, else
 /// 0 -- what the `..._population_missing_past_deadline_lines` gauge
 /// exports, so the alert needs no time-of-day logic of its own.
-pub fn missing_past_deadline(
+pub(crate) fn missing_past_deadline(
     missing_today: usize,
     service_date: chrono::NaiveDate,
     now: chrono::DateTime<chrono::Utc>,
@@ -281,6 +284,10 @@ pub fn missing_past_deadline(
 /// current day's count once past the 06:00 London deadline
 /// (`full_coverage_consumer_population_missing_past_deadline_lines`, read by
 /// the chart's `DistantSignalLinePopulationMissing` alert).
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "metric gauges take f64, and these counts and timestamps stay far below 2^52"
+)]
 fn report_missing_populations(
     population: &Population,
     line_ids: &[String],
@@ -309,7 +316,7 @@ fn report_missing_populations(
 /// Signalled once, by the first reload cycle that makes the population
 /// usable -- see [`Reloader::run`] for exactly when.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FirstLoad {
+pub(crate) struct FirstLoad {
     pub service_date: chrono::NaiveDate,
     /// Lines whose population for `service_date` could still not be
     /// fetched when consumption was allowed to begin (only possible after
@@ -317,7 +324,7 @@ pub struct FirstLoad {
     pub missing_lines: Vec<String>,
 }
 
-pub struct Reloader {
+pub(crate) struct Reloader {
     pub client: reqwest::Client,
     pub url: String,
     pub tokens: Arc<common::oauth_client::OAuthTokenCache>,
@@ -339,7 +346,7 @@ pub struct Reloader {
 impl Reloader {
     /// Spawns the reload loop. The returned receiver turns `Some` once, when
     /// the first load is usable; wait on it with [`wait_for_first_load`].
-    pub fn spawn(self) -> tokio::sync::watch::Receiver<Option<FirstLoad>> {
+    pub(crate) fn spawn(self) -> tokio::sync::watch::Receiver<Option<FirstLoad>> {
         let (tx, rx) = tokio::sync::watch::channel(None);
         tokio::spawn(self.run(tx));
         rx
@@ -350,6 +357,11 @@ impl Reloader {
     /// `initial_wait` has passed, after a cycle in which at least one did
     /// (some lines persistently failing must not stall every other line
     /// forever; those are reported in [`FirstLoad::missing_lines`]).
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        reason = "metric gauges take f64, and these counts and timestamps stay far below 2^52"
+    )]
     async fn run(self, tx: tokio::sync::watch::Sender<Option<FirstLoad>>) {
         let started = tokio::time::Instant::now();
         let mut failed_cycles: u32 = 0;
@@ -435,7 +447,11 @@ impl Reloader {
 /// `progress` meanwhile (the process is alive and retrying; a restart would
 /// not make `api` come up any sooner). `Err` only if the reloader task has
 /// died, which should be impossible.
-pub async fn wait_for_first_load(
+#[expect(
+    clippy::expect_used,
+    reason = "the watch value was just checked to be Some"
+)]
+pub(crate) async fn wait_for_first_load(
     rx: &mut tokio::sync::watch::Receiver<Option<FirstLoad>>,
     progress: &health_http::Progress,
 ) -> anyhow::Result<FirstLoad> {
@@ -461,6 +477,7 @@ pub async fn wait_for_first_load(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::collections::HashSet;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -470,7 +487,7 @@ pub(crate) mod tests {
     fn a_missing_population_is_reported_only_past_the_06_00_london_deadline() {
         let date: chrono::NaiveDate = "2026-09-27".parse().unwrap();
         let mut population = Population::default();
-        population.insert_uids("present", date, Default::default(), None);
+        population.insert_uids("present", date, HashSet::default(), None);
         let line_ids = vec!["present".to_string(), "absent".to_string()];
         assert_eq!(lines_without_population(&population, &line_ids, date), 1);
         assert_eq!(
@@ -626,9 +643,9 @@ pub(crate) mod tests {
             let g = LineGeometry::new(
                 tiplocs
                     .iter()
-                    .map(|t| (t.to_string(), t.to_string()))
+                    .map(|t| ((*t).to_string(), (*t).to_string()))
                     .collect(),
-                Default::default(),
+                HashSet::default(),
             );
             let mut map = HashMap::new();
             map.insert("waterloo-reading".to_string(), Arc::new(g));
@@ -743,7 +760,7 @@ pub(crate) mod tests {
             "waterloo-reading",
             today,
             &uids,
-            &std::collections::HashMap::new(),
+            &HashMap::new(),
             true,
             false,
             &common::Defaults::default(),
@@ -808,7 +825,7 @@ pub(crate) mod tests {
             url: url(server),
             tokens: Arc::new(tokens),
             line_ids: Arc::new(ArcSwap::from_pointee(
-                lines.iter().map(|l| l.to_string()).collect(),
+                lines.iter().map(ToString::to_string).collect(),
             )),
             geometry: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             population: Arc::clone(&population),

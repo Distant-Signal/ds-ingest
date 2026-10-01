@@ -133,7 +133,7 @@ use crate::feed::MovementFeed;
 /// reference-reload timer). Kept as a plain argument rather than internal
 /// state so `run_once` stays an easy-to-assert function of
 /// (feed, reference, state) -> events.
-pub struct Reference {
+pub(crate) struct Reference {
     pub pending: Vec<crate::matching::PendingPin>,
     /// `train_uid -> EVERY subscription that shares it`, for every active
     /// ref whose identity is already known (a schedule match, or an
@@ -159,7 +159,7 @@ pub struct Reference {
     /// See [`SharingSubscription`] and `activation_is_for_service_date`.
     pub by_train_uid: HashMap<String, Vec<SharingSubscription>>,
     /// `tracked_train_id -> trains_id`, for every active ref that has one
-    /// (regardless of resolution_status -- an already-`resolved`
+    /// (regardless of `resolution_status` -- an already-`resolved`
     /// subscription still needs its later movements forwarded). Feeds
     /// `build_forward_signals`, below.
     pub trains_id_by_tracked_train_id: HashMap<i64, i64>,
@@ -192,7 +192,7 @@ pub struct Reference {
 /// completely different day's running of the same service, permanently
 /// (`ProcessorState::resolved` has no unwind path).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SharingSubscription {
+pub(crate) struct SharingSubscription {
     pub tracked_train_id: i64,
     /// `common::TrackedTrainRef::service_date` verbatim -- the calendar date
     /// of the pinned/tracked departure, as the subscription was created
@@ -235,9 +235,9 @@ pub struct SharingSubscription {
 /// sets it once, right after constructing `ProcessorState::default()`,
 /// from `config.trust_timestamp_correction_enabled`.
 #[derive(Debug)]
-pub struct ProcessorState {
+pub(crate) struct ProcessorState {
     /// `train_id -> EVERY subscription attributed to it`. Consulted FIRST
-    /// by every message type: a train_id in here is already attributed, so
+    /// by every message type: a `train_id` in here is already attributed, so
     /// it must never go back through `matching::resolve_origin_departure`
     /// (that function matches *origin departures* against pins; re-running
     /// it on a mid-journey event would at best fail and at worst
@@ -246,13 +246,13 @@ pub struct ProcessorState {
     /// `Vec<i64>` for the same reason as `Reference::by_train_uid` above
     /// (review finding I6) -- and it has to change in lockstep with it,
     /// since the Activation fast path writes straight from one into the
-    /// other. Every message for a train_id now fans out to one event per
+    /// other. Every message for a `train_id` now fans out to one event per
     /// subscription in this list; see `process_message`'s own return type.
     ///
     /// Entries are unioned, never replaced: a subscription already here
     /// stays, and a newly-seen one is appended. The two writers that add to
     /// it (an Activation's `by_train_uid` match, and a Movement's CRS+time
-    /// claim) can both legitimately fire for the same train_id at different
+    /// claim) can both legitimately fire for the same `train_id` at different
     /// times.
     pub resolved: HashMap<String, Vec<i64>>,
 
@@ -282,7 +282,7 @@ pub struct ProcessorState {
     /// that carries `resolved_train_id` -- since the direct match happens
     /// on the Activation itself (which never posts an event), this set
     /// defers that one-time "freshly resolved" signal to the FIRST
-    /// Movement this process sees for the train_id, exactly once.
+    /// Movement this process sees for the `train_id`, exactly once.
     pub activation_matched_awaiting_movement: HashSet<String>,
 
     /// Finding #2's kill switch: whether
@@ -305,7 +305,7 @@ pub struct ProcessorState {
     ///
     /// Why an undo log rather than simply deferring the writes until after
     /// the POST: a batch can legitimately contain an Activation and a later
-    /// Movement for the SAME train_id, and that Movement must see the
+    /// Movement for the SAME `train_id`, and that Movement must see the
     /// Activation's attribution (otherwise it falls through to the CRS+time
     /// heuristic and can claim a different pin entirely). The mutations
     /// therefore have to be visible within the batch, and only their
@@ -327,7 +327,7 @@ enum StateChange {
         previous: Option<Vec<i64>>,
     },
     /// `pending_activations[train_id]` was parked (possibly over a previous
-    /// entry for the same recycled train_id).
+    /// entry for the same recycled `train_id`).
     ActivationParked {
         train_id: String,
         previous: Option<PendingActivation>,
@@ -372,7 +372,7 @@ impl ProcessorState {
     /// deliberately private -- it is this module's own transaction
     /// bookkeeping, mutated only through the journaled helpers below, and
     /// nothing outside may construct or inspect it.
-    pub fn new(trust_timestamp_correction_enabled: bool) -> Self {
+    pub(crate) fn new(trust_timestamp_correction_enabled: bool) -> Self {
         Self {
             trust_timestamp_correction_enabled,
             ..Self::default()
@@ -382,7 +382,7 @@ impl ProcessorState {
     /// The batch's events reached `api`. Its mutations are now durable
     /// facts, so the undo log is dropped. Called by `main.rs`'s `run_cycle`
     /// and by nothing else.
-    pub fn confirm_batch(&mut self) {
+    pub(crate) fn confirm_batch(&mut self) {
         self.journal.clear();
     }
 
@@ -394,7 +394,7 @@ impl ProcessorState {
     /// same events -- including the one-time
     /// `resolved_train_uid`/`resolved_train_id` resolution signal, which was
     /// exactly what used to be lost (finding #4).
-    pub fn roll_back_batch(&mut self) {
+    pub(crate) fn roll_back_batch(&mut self) {
         while let Some(change) = self.journal.pop() {
             match change {
                 StateChange::ResolvedAttributed { train_id, previous } => match previous {
@@ -486,7 +486,7 @@ impl ProcessorState {
     }
 
     /// Defers an Activation-fast-path resolution's one-time "freshly
-    /// resolved" signal to the first Movement seen for this train_id,
+    /// resolved" signal to the first Movement seen for this `train_id`,
     /// journaled.
     fn mark_awaiting_movement(&mut self, train_id: &str) {
         if self
@@ -527,7 +527,7 @@ impl ProcessorState {
 /// the event actually needs, plus enough to know when the entry is safe to
 /// forget.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PendingActivation {
+pub(crate) struct PendingActivation {
     pub train_uid: String,
     /// `Activation::schedule_end_date` parsed as a date, or `None` when it
     /// was absent or didn't parse. `None` means "expiry unknown", and
@@ -597,7 +597,7 @@ fn activation_origin_date(raw: Option<&str>, activation_rail_day: NaiveDate) -> 
 /// that may have been read before it was written, so it is never dropped --
 /// but a subscription the reload knows about and this process hasn't seen
 /// yet is added alongside it rather than being discarded.
-pub fn apply_reference_reload(
+pub(crate) fn apply_reference_reload(
     refs: Vec<common::TrackedTrainRef>,
     reference: &mut Reference,
     state: &mut ProcessorState,
@@ -707,7 +707,7 @@ pub fn apply_reference_reload(
 /// day D is still emitting Movements well into rail day D+1, and a pin for
 /// it may not be claimed until then. Three or more buys nothing -- the
 /// binding is only ever useful to a Movement of the same running.
-pub const MAX_PARKED_ACTIVATION_AGE_DAYS: i64 = 2;
+pub(crate) const MAX_PARKED_ACTIVATION_AGE_DAYS: i64 = 2;
 
 /// Drops parked Activations that can no longer be of use to any Movement.
 /// Pure, so the caller supplies `today` (the current Europe/London rail
@@ -740,7 +740,7 @@ pub const MAX_PARKED_ACTIVATION_AGE_DAYS: i64 = 2;
 /// `schedule_end_date` is kept as a cheap secondary signal (a schedule that
 /// has genuinely ended can go immediately), still failing open when absent
 /// or unparseable.
-pub fn prune_expired_activations(
+pub(crate) fn prune_expired_activations(
     activations: &mut HashMap<String, PendingActivation>,
     today: NaiveDate,
 ) {
@@ -767,7 +767,11 @@ pub fn prune_expired_activations(
 /// startup, or a previously-fetched live one) untouched, never swapping in
 /// an empty table that would silently stop translating every STANOX. See
 /// the spec's Error handling section.
-pub fn apply_stanox_crs_reload(
+#[expect(
+    clippy::expect_used,
+    reason = "a poisoned lock means another thread already panicked"
+)]
+pub(crate) fn apply_stanox_crs_reload(
     fetched: anyhow::Result<Vec<common::StanoxCrsRecord>>,
     cell: &std::sync::RwLock<crate::stanox_crs::StanoxCrsTable>,
 ) {
@@ -799,7 +803,7 @@ pub fn apply_stanox_crs_reload(
 /// means none of that function's own 25+ existing tests need updating for
 /// this feature. Filters out any event whose `tracked_train_id` has no
 /// known `trains_id` yet -- exactly the same accepted gap named throughout
-/// this plan (a subscription whose identity, and therefore trains_id, is
+/// this plan (a subscription whose identity, and therefore `trains_id`, is
 /// still unknown has nothing to forward a signal about).
 ///
 /// Deduplicated by `trains_id`, first occurrence winning. This became
@@ -812,7 +816,7 @@ pub fn apply_stanox_crs_reload(
 /// produce duplicate notifications -- this keeps them out of the queue
 /// table in the first place, where they would otherwise scale with a
 /// popular train's subscriber count.
-pub fn build_forward_signals(
+pub(crate) fn build_forward_signals(
     events: &[common::TrainMovementEventMessage],
     trains_id_by_tracked_train_id: &HashMap<i64, i64>,
 ) -> Vec<common::TrainForwardSignalMessage> {
@@ -861,7 +865,7 @@ pub fn build_forward_signals(
 /// timestamp parsed this cycle (via
 /// `common::trust_timestamp::parse_trust_epoch_millis`) and into
 /// `matching::resolve_origin_departure`'s own guard.
-pub async fn run_once<F: MovementFeed + movement_feed::DeadLetterSink>(
+pub(crate) async fn run_once<F: MovementFeed + movement_feed::DeadLetterSink>(
     feed: &mut F,
     reference: &Reference,
     state: &mut ProcessorState,
@@ -1093,6 +1097,11 @@ fn activation_is_for_service_date(
 /// per-subscription work -- `flip_legacy_resolution`'s
 /// `resolution_status` update -- is exactly the thing that needs to happen
 /// once per subscriber and previously happened for only one of them.
+#[expect(
+    clippy::similar_names,
+    clippy::too_many_lines,
+    reason = "the similar names are distinct domain terms; long but linear; splitting it would scatter its shared state across helpers"
+)]
 fn process_message(
     message: &TrustMessage,
     reference: &Reference,
@@ -1247,177 +1256,174 @@ fn process_message(
 
             // Already-resolved train_ids short-circuit matching entirely;
             // only a genuinely unseen train_id is offered to the pins.
-            let (tracked_train_ids, freshly_resolved) =
-                match state.resolved.get(&movement.train_id).cloned() {
-                    Some(tracked_train_ids) => {
-                        // Already resolved -- either by this same branch on
-                        // an earlier Movement, by the reference reload's
-                        // rehydration, or (this task) by an Activation's
-                        // direct train_uid match. That last case never got
-                        // to post its own event (an Activation never does),
-                        // so the FIRST Movement seen for this train_id after
-                        // it is the one that must carry the one-time
-                        // "freshly resolved" signal for `api`'s db flip.
-                        let freshly_resolved = state.spend_awaiting_movement(&movement.train_id);
-                        (tracked_train_ids, freshly_resolved)
-                    }
-                    None => {
-                        // Only a DEPARTURE may claim a pin. `resolve_origin_departure`
-                        // knows nothing about event types -- it compares a
-                        // location and two times, and TRUST's `event_type` is
-                        // one of ARRIVAL / DEPARTURE / PASS (see
-                        // `schema::Movement`). At a busy terminus an ARRIVAL
-                        // or PASS near a pin's scheduled departure would
-                        // otherwise satisfy both tests and claim it, and
-                        // a claim is one-way: `state.resolved` has no unwind
-                        // path, so the train that should have matched is
-                        // locked out for the life of the process. Filtered
-                        // here rather than inside `matching`, for the same
-                        // reason as the `claimed` filter just below: that
-                        // module stays a pure function of its arguments.
-                        if movement.event_type != "DEPARTURE" {
-                            return Vec::new();
-                        }
+            let (tracked_train_ids, freshly_resolved) = if let Some(tracked_train_ids) =
+                state.resolved.get(&movement.train_id).cloned()
+            {
+                // Already resolved -- either by this same branch on
+                // an earlier Movement, by the reference reload's
+                // rehydration, or (this task) by an Activation's
+                // direct train_uid match. That last case never got
+                // to post its own event (an Activation never does),
+                // so the FIRST Movement seen for this train_id after
+                // it is the one that must carry the one-time
+                // "freshly resolved" signal for `api`'s db flip.
+                let freshly_resolved = state.spend_awaiting_movement(&movement.train_id);
+                (tracked_train_ids, freshly_resolved)
+            } else {
+                // Only a DEPARTURE may claim a pin. `resolve_origin_departure`
+                // knows nothing about event types -- it compares a
+                // location and two times, and TRUST's `event_type` is
+                // one of ARRIVAL / DEPARTURE / PASS (see
+                // `schema::Movement`). At a busy terminus an ARRIVAL
+                // or PASS near a pin's scheduled departure would
+                // otherwise satisfy both tests and claim it, and
+                // a claim is one-way: `state.resolved` has no unwind
+                // path, so the train that should have matched is
+                // locked out for the life of the process. Filtered
+                // here rather than inside `matching`, for the same
+                // reason as the `claimed` filter just below: that
+                // module stays a pure function of its arguments.
+                if movement.event_type != "DEPARTURE" {
+                    return Vec::new();
+                }
 
-                        let Some(actual_ts) = actual else {
-                            return Vec::new();
-                        };
-                        // A pin can only ever be claimed by a Movement whose
-                        // location translated to a real CRS -- an untranslated
-                        // STANOX can never equal a pin's `pin_origin_crs`, so
-                        // there's nothing to attempt a match against. This
-                        // mirrors the existing early-returns just above for a
-                        // missing `event_type`/`actual_timestamp`.
-                        let Some(loc_crs_for_match) = loc_crs.as_deref() else {
-                            return Vec::new();
-                        };
-
-                        // A pin already claimed by some other train_id must not
-                        // be offered again. `resolve_origin_departure` has no
-                        // notion of "taken", so two different trains
-                        // departing the same origin close enough together
-                        // would otherwise both resolve to the same
-                        // tracked_train_id and flip-flop what the user sees.
-                        // Filtering here rather than inside `matching` keeps
-                        // that module a pure function of its arguments.
-                        let claimed: HashSet<i64> =
-                            state.resolved.values().flatten().copied().collect();
-
-                        // CONTRADICTION FILTER -- the fix for a confirmed
-                        // production mis-attribution (2026-09-25). A pin
-                        // that already knows its own CIF identity
-                        // (`PendingPin::train_uid`, set for every
-                        // `schedule_matched`/NR-primary subscription) is
-                        // still offered to this ±20-minute CRS+time
-                        // heuristic, deliberately, as a fallback for
-                        // whichever pins the Activation direct match
-                        // (`by_train_uid`) didn't catch -- see
-                        // `apply_reference_reload`'s own comment and
-                        // Decision 3 of
-                        // docs/superpowers/specs/2026-09-05-schedule-first-train-tracking-design.md.
-                        // But when this process has ALSO parked an
-                        // Activation for the `train_id` now trying to claim
-                        // a pin, it already knows -- for certain, from
-                        // TRUST's own `0001` message -- which `train_uid`
-                        // that `train_id` is. A pin naming a DIFFERENT
-                        // `train_uid` is then provably not this train, and
-                        // must not be claimed however well the location and
-                        // the ±20-minute window happen to line up.
-                        //
-                        // The real case this closes: London Euston, 2026-09-25.
-                        // A user tracked `Y80926` (the 18:56 to Birmingham
-                        // New Street, `pin_scheduled_departure` 17:56:00Z).
-                        // TRUST reported `train_id` `721F34MX25` -- whose
-                        // own Activation names `train_uid` `W34058`, the
-                        // 18:43 Euston to Liverpool Lime Street -- departing
-                        // EUSTON at 17:42:00Z. That is 14 minutes from the
-                        // pin's scheduled departure, comfortably inside
-                        // `common::MATCH_TOLERANCE`, so the heuristic
-                        // claimed the pin, and every subsequent movement of
-                        // the Liverpool train (Wembley Central, Harrow &
-                        // Wealdstone, Watford Junction) was written onto the
-                        // Birmingham train's shared row. The user's journey
-                        // read "En route" -- via `trust_schema::journey::
-                        // apply_movement`'s `en_route`, faithfully rendered
-                        // by `frontend/components/TrackedTrainStatusBadge.tsx`
-                        // -- a quarter of an hour before their train had
-                        // left, with another train's calling points filled
-                        // in behind it.
-                        //
-                        // Filtered here, alongside the `claimed` filter
-                        // below, rather than inside `matching`, for the
-                        // reason that filter already gives: that module
-                        // stays a pure CRS+time function of its arguments.
-                        //
-                        // Known residual: `pending_activations` is in-memory
-                        // and one-shot, so this guard can only fire when
-                        // THIS process saw the Activation for this
-                        // `train_id` and no Movement has claimed it yet. A
-                        // restart between Activation and origin departure
-                        // leaves the old behavior exactly as it was -- this
-                        // narrows the mis-attribution window, it does not
-                        // close it, and nothing here weakens any path that
-                        // resolved correctly before.
-                        let movement_train_uid = state
-                            .pending_activations
-                            .get(&movement.train_id)
-                            .map(|activation| activation.train_uid.as_str());
-
-                        let unclaimed: Vec<crate::matching::PendingPin> = reference
-                            .pending
-                            .iter()
-                            .filter(|pin| !claimed.contains(&pin.tracked_train_id))
-                            .filter(|pin| match (pin.train_uid.as_deref(), movement_train_uid) {
-                                // Both identities known and different: a
-                                // provable mismatch, never a claim.
-                                (Some(pin_uid), Some(movement_uid)) => {
-                                    pin_uid.eq_ignore_ascii_case(movement_uid)
-                                }
-                                // Either side unknown -- the heuristic is
-                                // all there is, exactly as before.
-                                _ => true,
-                            })
-                            .cloned()
-                            .collect();
-
-                        // Still a SINGLE claim, deliberately: this is the
-                        // CRS+time heuristic, and letting one departure claim
-                        // every pin that happens to fall in its tolerance
-                        // window would re-open exactly the mis-attribution
-                        // the `claimed` filter above exists to prevent.
-                        // Subscribers sharing one physical train are
-                        // attributed through `by_train_uid` (which knows
-                        // their identity for certain), not through this
-                        // guess. See this fix's report for the residual
-                        // limitation this leaves.
-                        //
-                        // `planned` -- the Movement's own BOOKED (WTT)
-                        // departure time -- is what the match is decided on
-                        // now, against each pin's `pin_scheduled_departure`
-                        // with a tight tolerance and nearest-wins; `actual`
-                        // remains the plausibility guard's anchor and the
-                        // fallback for a Movement that carries no booked time
-                        // at all. See `matching::resolve_origin_departure`'s
-                        // own doc comment for finding #1's full reasoning:
-                        // before this, `planned` was parsed here and used
-                        // only for the delay calculation below, while the
-                        // claim itself was a first-found match inside a
-                        // ±20-minute window around `actual` -- which at a
-                        // busy terminus routinely claimed a pin for the
-                        // wrong train, permanently.
-                        let Some(tracked_train_id) = crate::matching::resolve_origin_departure(
-                            loc_crs_for_match,
-                            planned,
-                            actual_ts,
-                            &unclaimed,
-                            received_at,
-                        ) else {
-                            return Vec::new();
-                        };
-                        state.attribute(&movement.train_id, &[tracked_train_id]);
-                        (vec![tracked_train_id], true)
-                    }
+                let Some(actual_ts) = actual else {
+                    return Vec::new();
                 };
+                // A pin can only ever be claimed by a Movement whose
+                // location translated to a real CRS -- an untranslated
+                // STANOX can never equal a pin's `pin_origin_crs`, so
+                // there's nothing to attempt a match against. This
+                // mirrors the existing early-returns just above for a
+                // missing `event_type`/`actual_timestamp`.
+                let Some(loc_crs_for_match) = loc_crs.as_deref() else {
+                    return Vec::new();
+                };
+
+                // A pin already claimed by some other train_id must not
+                // be offered again. `resolve_origin_departure` has no
+                // notion of "taken", so two different trains
+                // departing the same origin close enough together
+                // would otherwise both resolve to the same
+                // tracked_train_id and flip-flop what the user sees.
+                // Filtering here rather than inside `matching` keeps
+                // that module a pure function of its arguments.
+                let claimed: HashSet<i64> = state.resolved.values().flatten().copied().collect();
+
+                // CONTRADICTION FILTER -- the fix for a confirmed
+                // production mis-attribution (2026-09-25). A pin
+                // that already knows its own CIF identity
+                // (`PendingPin::train_uid`, set for every
+                // `schedule_matched`/NR-primary subscription) is
+                // still offered to this ±20-minute CRS+time
+                // heuristic, deliberately, as a fallback for
+                // whichever pins the Activation direct match
+                // (`by_train_uid`) didn't catch -- see
+                // `apply_reference_reload`'s own comment and
+                // Decision 3 of
+                // docs/superpowers/specs/2026-09-05-schedule-first-train-tracking-design.md.
+                // But when this process has ALSO parked an
+                // Activation for the `train_id` now trying to claim
+                // a pin, it already knows -- for certain, from
+                // TRUST's own `0001` message -- which `train_uid`
+                // that `train_id` is. A pin naming a DIFFERENT
+                // `train_uid` is then provably not this train, and
+                // must not be claimed however well the location and
+                // the ±20-minute window happen to line up.
+                //
+                // The real case this closes: London Euston, 2026-09-25.
+                // A user tracked `Y80926` (the 18:56 to Birmingham
+                // New Street, `pin_scheduled_departure` 17:56:00Z).
+                // TRUST reported `train_id` `721F34MX25` -- whose
+                // own Activation names `train_uid` `W34058`, the
+                // 18:43 Euston to Liverpool Lime Street -- departing
+                // EUSTON at 17:42:00Z. That is 14 minutes from the
+                // pin's scheduled departure, comfortably inside
+                // `common::MATCH_TOLERANCE`, so the heuristic
+                // claimed the pin, and every subsequent movement of
+                // the Liverpool train (Wembley Central, Harrow &
+                // Wealdstone, Watford Junction) was written onto the
+                // Birmingham train's shared row. The user's journey
+                // read "En route" -- via `trust_schema::journey::
+                // apply_movement`'s `en_route`, faithfully rendered
+                // by `frontend/components/TrackedTrainStatusBadge.tsx`
+                // -- a quarter of an hour before their train had
+                // left, with another train's calling points filled
+                // in behind it.
+                //
+                // Filtered here, alongside the `claimed` filter
+                // below, rather than inside `matching`, for the
+                // reason that filter already gives: that module
+                // stays a pure CRS+time function of its arguments.
+                //
+                // Known residual: `pending_activations` is in-memory
+                // and one-shot, so this guard can only fire when
+                // THIS process saw the Activation for this
+                // `train_id` and no Movement has claimed it yet. A
+                // restart between Activation and origin departure
+                // leaves the old behavior exactly as it was -- this
+                // narrows the mis-attribution window, it does not
+                // close it, and nothing here weakens any path that
+                // resolved correctly before.
+                let movement_train_uid = state
+                    .pending_activations
+                    .get(&movement.train_id)
+                    .map(|activation| activation.train_uid.as_str());
+
+                let unclaimed: Vec<crate::matching::PendingPin> = reference
+                    .pending
+                    .iter()
+                    .filter(|pin| !claimed.contains(&pin.tracked_train_id))
+                    .filter(|pin| match (pin.train_uid.as_deref(), movement_train_uid) {
+                        // Both identities known and different: a
+                        // provable mismatch, never a claim.
+                        (Some(pin_uid), Some(movement_uid)) => {
+                            pin_uid.eq_ignore_ascii_case(movement_uid)
+                        }
+                        // Either side unknown -- the heuristic is
+                        // all there is, exactly as before.
+                        _ => true,
+                    })
+                    .cloned()
+                    .collect();
+
+                // Still a SINGLE claim, deliberately: this is the
+                // CRS+time heuristic, and letting one departure claim
+                // every pin that happens to fall in its tolerance
+                // window would re-open exactly the mis-attribution
+                // the `claimed` filter above exists to prevent.
+                // Subscribers sharing one physical train are
+                // attributed through `by_train_uid` (which knows
+                // their identity for certain), not through this
+                // guess. See this fix's report for the residual
+                // limitation this leaves.
+                //
+                // `planned` -- the Movement's own BOOKED (WTT)
+                // departure time -- is what the match is decided on
+                // now, against each pin's `pin_scheduled_departure`
+                // with a tight tolerance and nearest-wins; `actual`
+                // remains the plausibility guard's anchor and the
+                // fallback for a Movement that carries no booked time
+                // at all. See `matching::resolve_origin_departure`'s
+                // own doc comment for finding #1's full reasoning:
+                // before this, `planned` was parsed here and used
+                // only for the delay calculation below, while the
+                // claim itself was a first-found match inside a
+                // ±20-minute window around `actual` -- which at a
+                // busy terminus routinely claimed a pin for the
+                // wrong train, permanently.
+                let Some(tracked_train_id) = crate::matching::resolve_origin_departure(
+                    loc_crs_for_match,
+                    planned,
+                    actual_ts,
+                    &unclaimed,
+                    received_at,
+                ) else {
+                    return Vec::new();
+                };
+                state.attribute(&movement.train_id, &[tracked_train_id]);
+                (vec![tracked_train_id], true)
+            };
 
             // Destination lookup: any of this message's `tracked_train_ids`
             // sharing the same physical train also share the same
@@ -1833,7 +1839,7 @@ mod tests {
     use std::sync::LazyLock;
 
     /// PL-8: every dropped envelope reaches the errors counter with its
-    /// msg_type, instead of vanishing behind a log line.
+    /// `msg_type`, instead of vanishing behind a log line.
     #[test]
     fn a_dropped_envelope_is_counted_with_its_msg_type() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
@@ -4158,7 +4164,7 @@ mod tests {
              resolution_status can be flipped"
         );
         let mut ids: Vec<i64> = events.iter().map(|e| e.tracked_train_id).collect();
-        ids.sort();
+        ids.sort_unstable();
         assert_eq!(ids, vec![1, 2]);
         for event in &events {
             assert_eq!(
@@ -4284,7 +4290,7 @@ mod tests {
 
         assert_eq!(events.len(), 2);
         let mut ids: Vec<i64> = events.iter().map(|e| e.tracked_train_id).collect();
-        ids.sort();
+        ids.sort_unstable();
         assert_eq!(ids, vec![7, 8]);
         for event in &events {
             assert_eq!(event.status, "cancelled");
@@ -4394,7 +4400,7 @@ mod tests {
             .get("221832406")
             .cloned()
             .expect("the resolved train_id must be rehydrated");
-        attributed.sort();
+        attributed.sort_unstable();
         assert_eq!(attributed, vec![1, 2]);
 
         // And a second reload tick must not duplicate them.
@@ -4445,7 +4451,7 @@ mod tests {
     // comment on the filter for the full production case) ---
 
     /// An Activation binding `train_id` `221832406` to `train_uid`
-    /// `"W34058"` -- the schedule that train_id REALLY is. Deliberately a
+    /// `"W34058"` -- the schedule that `train_id` REALLY is. Deliberately a
     /// different `train_uid` from `SHARED_ACTIVATION`'s `"C88888"`, so a
     /// test using this one can't accidentally satisfy `by_train_uid` too.
     const OTHER_SCHEDULES_ACTIVATION: &str = r#"[{"header":{"msg_type":"0001"},"body":{
@@ -4487,7 +4493,7 @@ mod tests {
     /// station inside the CRS+time heuristic's tolerance window. Before the
     /// contradiction filter this produced a `freshly_resolved` event, bound
     /// `state.resolved` for the life of the process, and made the user's
-    /// not-yet-departed train read "en_route" with a different train's
+    /// not-yet-departed train read "`en_route`" with a different train's
     /// movements behind it.
     #[tokio::test]
     async fn a_parked_activation_for_a_different_schedule_cannot_claim_a_pin_by_crs_and_time() {
@@ -4701,7 +4707,7 @@ mod activation_date_tests {
     }
 
     /// The residual of finding H3: last night's post-midnight running
-    /// (service_date 08-29, 00:15 BST, so rail day 08-28) is still active
+    /// (`service_date` 08-29, 00:15 BST, so rail day 08-28) is still active
     /// -- it never reached `completed` -- when TONIGHT's Activation (rail
     /// day 08-29) arrives. Same calendar date, wrong running.
     #[test]

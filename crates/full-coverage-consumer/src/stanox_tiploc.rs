@@ -11,13 +11,13 @@
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Default)]
-pub struct StanoxTable {
+pub(crate) struct StanoxTable {
     stanox_to_tiploc: HashMap<String, String>,
     stanox_to_crs: HashMap<String, String>,
 }
 
 impl StanoxTable {
-    pub fn from_records(records: &[common::StanoxCrsRecord]) -> Self {
+    pub(crate) fn from_records(records: &[common::StanoxCrsRecord]) -> Self {
         let mut stanox_to_tiploc = HashMap::new();
         let mut stanox_to_crs = HashMap::new();
         for r in records {
@@ -30,11 +30,11 @@ impl StanoxTable {
         }
     }
 
-    pub fn tiploc(&self, stanox: &str) -> Option<&str> {
+    pub(crate) fn tiploc(&self, stanox: &str) -> Option<&str> {
         self.stanox_to_tiploc.get(stanox).map(String::as_str)
     }
 
-    pub fn crs(&self, stanox: &str) -> Option<&str> {
+    pub(crate) fn crs(&self, stanox: &str) -> Option<&str> {
         self.stanox_to_crs.get(stanox).map(String::as_str)
     }
 }

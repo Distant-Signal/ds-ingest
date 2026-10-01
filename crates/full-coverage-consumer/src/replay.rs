@@ -2,14 +2,14 @@
 //! `movement-events` before consuming as the group again.
 //!
 //! **Why** (2026-09-27 full-coverage lag review): this consumer XACKs each
-//! batch as soon as it is dispatched into in-memory state, so an ACKed
+//! batch as soon as it is dispatched into in-memory state, so an `ACKed`
 //! entry is never redelivered, and nothing used to restore that state on
 //! start. Every restart (about 200 on rail day 2026-09-26: OOM kills,
 //! rollouts, node reboots) therefore wiped the day's correlation so far,
 //! and `stats::build_line_row` counted every train seen before the restart
 //! as cancelled.
 //!
-//! **How**: a group-less `XRANGE` (nothing delivered, claimed or ACKed)
+//! **How**: a group-less `XRANGE` (nothing delivered, claimed or `ACKed`)
 //! from the start of the current rail day (02:00 Europe/London, as a
 //! stream id `<ms>-0`) up to and including the group's `last-delivered-id`
 //! -- exactly the entries this group has already been handed. Entries still
@@ -45,17 +45,17 @@ use crate::population_reload::SharedPopulation;
 
 /// Entries per `XRANGE` round trip. Bounded so the replay never holds more
 /// than one page of payloads at a time (~1 MB at 1000 entries).
-pub const REPLAY_PAGE_SIZE: usize = 1000;
+pub(crate) const REPLAY_PAGE_SIZE: usize = 1000;
 
 /// How far before the rail-day start the replay begins -- see this
 /// module's doc. Measured: an Activation precedes the train's first call on
 /// a line by at most 247 min at p99 and 513 min at the maximum.
-pub const LOOKBACK: chrono::Duration = chrono::Duration::hours(6);
+pub(crate) const LOOKBACK: chrono::Duration = chrono::Duration::hours(6);
 
 /// What a startup replay needs from a stream. Implemented by the real Redis
 /// reader and by `ActiveFeed` (which delegates to it).
 #[async_trait]
-pub trait ReplaySource: Send {
+pub(crate) trait ReplaySource: Send {
     async fn positions(&mut self) -> anyhow::Result<StreamPositions>;
     async fn pending_ids(&mut self) -> anyhow::Result<HashSet<String>>;
     async fn read_range(
@@ -104,7 +104,7 @@ impl ReplaySource for movement_feed::ActiveFeed {
 
 /// What to replay, decided purely from a [`StreamPositions`] snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplayPlan {
+pub(crate) struct ReplayPlan {
     /// `<lookback start ms>-0`, inclusive -- where the replay begins.
     pub start_id: String,
     /// `<rail day start ms>-0`: entries before it are the lookback segment.
@@ -117,7 +117,7 @@ pub struct ReplayPlan {
     pub day_start_trimmed: bool,
 }
 
-pub fn plan_replay(
+pub(crate) fn plan_replay(
     positions: &StreamPositions,
     day_start_ms: i64,
     lookback_start_ms: i64,
@@ -174,7 +174,7 @@ fn day_start_trimmed(positions: &StreamPositions, start_id: &str) -> bool {
 }
 
 /// The instant a stream entry id (`<ms>-<seq>`) was generated at.
-pub fn stream_id_time(id: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+pub(crate) fn stream_id_time(id: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     let millis: i64 = id.split('-').next()?.parse().ok()?;
     chrono::DateTime::from_timestamp_millis(millis)
 }
@@ -206,7 +206,7 @@ macro_rules! retry {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ReplayReport {
+pub(crate) struct ReplayReport {
     /// Stream entries dispatched into the day state.
     pub entries: u64,
     /// Of `entries`, how many came from the lookback segment (Activations
@@ -221,7 +221,7 @@ pub struct ReplayReport {
 /// `day.partial_reason` when the replay cannot be complete. Redis errors
 /// are retried with backoff (the replay resumes where it stopped): nothing
 /// can be consumed while Redis is unreachable anyway.
-pub async fn run_startup_replay<S: ReplaySource + ?Sized>(
+pub(crate) async fn run_startup_replay<S: ReplaySource + ?Sized>(
     source: &mut S,
     day: &mut DayState,
     lookups: &Lookups,

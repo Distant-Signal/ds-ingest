@@ -17,7 +17,7 @@ use crate::process::{ProcessorState, service_date_for_instant};
 
 /// The reason carried by `message`, or `None` when it is not a `0002` or
 /// `0006` or carries no (non-blank) reason code.
-pub fn reason_message(
+pub(crate) fn reason_message(
     message: &TrustMessage,
     state: &ProcessorState,
     today: NaiveDate,
@@ -54,7 +54,7 @@ pub fn reason_message(
         .pending_service_dates
         .get(train_id)
         .copied()
-        .unwrap_or_else(|| event_at.map(service_date_for_instant).unwrap_or(today));
+        .unwrap_or_else(|| event_at.map_or(today, service_date_for_instant));
     Some(common::TrainReasonMessage {
         train_id: train_id.clone(),
         train_uid: state.pending_train_uids.get(train_id).cloned(),

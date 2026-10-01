@@ -14,7 +14,7 @@
 //! Using the shared helpers here instead of duplicating a fourth
 //! hand-rolled copy of the same GET/POST-bearer-token shape.
 
-pub async fn fetch_stanox_crs(
+pub(crate) async fn fetch_stanox_crs(
     client: &reqwest::Client,
     url: &str,
     tokens: &common::oauth_client::OAuthTokenCache,
@@ -25,7 +25,7 @@ pub async fn fetch_stanox_crs(
 /// POSTs one batch and returns `api`'s reply, including any rows it
 /// rejected for a data error (see `common::TrustBacklogIngestResponse`).
 /// An empty batch is not sent and counts as a clean success.
-pub async fn post_trust_event_backlog(
+pub(crate) async fn post_trust_event_backlog(
     client: &reqwest::Client,
     url: &str,
     tokens: &common::oauth_client::OAuthTokenCache,
@@ -49,7 +49,7 @@ pub async fn post_trust_event_backlog(
 /// setting is needed: the two routes share a host, a prefix and a
 /// service-account group. `None` when that URL does not end in
 /// `/trust-event-backlog`, in which case reasons are not sent.
-pub fn train_reasons_url(api_ingest_url: &str) -> Option<String> {
+pub(crate) fn train_reasons_url(api_ingest_url: &str) -> Option<String> {
     api_ingest_url
         .trim_end_matches('/')
         .strip_suffix("/trust-event-backlog")
@@ -57,7 +57,7 @@ pub fn train_reasons_url(api_ingest_url: &str) -> Option<String> {
 }
 
 /// POSTs one batch of reason codes. An empty batch is not sent.
-pub async fn post_train_reasons(
+pub(crate) async fn post_train_reasons(
     client: &reqwest::Client,
     url: &str,
     tokens: &common::oauth_client::OAuthTokenCache,

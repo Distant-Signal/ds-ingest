@@ -1,7 +1,7 @@
-//! Decision 2h: a second, parallel running record keyed (crs, toc_id),
+//! Decision 2h: a second, parallel running record keyed (crs, `toc_id`),
 //! fed off the same event stream correlate.rs already processes. The
 //! asymmetric-population rule (a population UID only contributes once
-//! its toc_id is learned from a real Activation) is this module's one
+//! its `toc_id` is learned from a real Activation) is this module's one
 //! genuinely new correctness property -- see this module's own doc on
 //! `StationCorrelationState::activations_by_uid`.
 //!
@@ -19,19 +19,19 @@ use std::collections::HashMap;
 use trust_schema::journey::DerivedState;
 
 #[derive(Debug, Clone, Default)]
-pub struct StationCorrelationState {
-    /// train_uid -> toc_id, learned only from a real Activation
+pub(crate) struct StationCorrelationState {
+    /// `train_uid` -> `toc_id`, learned only from a real Activation
     /// (`trust_schema::schema::Activation::toc_id`). A UID absent here has
     /// NOT been confirmed by TRUST this rail day -- Decision 2h's own
     /// "excluded entirely, not guessed" rule for the station-level output,
     /// asymmetric with the line-level output's treatment of the same case
     /// (Decision 2d still counts it as a line-level cancellation).
     pub activations_by_uid: HashMap<String, String>,
-    /// (crs, toc_id) -> uid -> DerivedState
+    /// (crs, `toc_id`) -> uid -> `DerivedState`
     pub derived: HashMap<(String, String), HashMap<String, DerivedState>>,
 }
 
-pub fn apply_activation(state: &mut StationCorrelationState, train_uid: &str, toc_id: &str) {
+pub(crate) fn apply_activation(state: &mut StationCorrelationState, train_uid: &str, toc_id: &str) {
     state
         .activations_by_uid
         .insert(train_uid.to_string(), toc_id.to_string());
@@ -39,12 +39,12 @@ pub fn apply_activation(state: &mut StationCorrelationState, train_uid: &str, to
 
 /// Called by `main.rs`'s loop (Task 13) once per matched `(line_id, uid)`
 /// `correlate::apply_movement` reports, with the movement's translated CRS
-/// (Decision 2c's STANOX->CRS half) -- a UID with no learned toc_id yet is
+/// (Decision 2c's STANOX->CRS half) -- a UID with no learned `toc_id` yet is
 /// silently skipped here (returns `false`), per Decision 2h's own rule;
 /// the caller increments `full_coverage_consumer_station_buckets_dropped_total`
 /// when this returns `false`, so the drop is observable, not silent in the
 /// operational sense even though it's silent in the stats themselves.
-pub fn apply_movement_station(
+pub(crate) fn apply_movement_station(
     state: &mut StationCorrelationState,
     train_uid: &str,
     crs: &str,
@@ -65,7 +65,11 @@ pub fn apply_movement_station(
 /// but producing one row per `(crs, toc_id)` bucket with at least one
 /// `derived` entry -- Decision 2h's own "only pairs that actually
 /// resolved this cycle are included" rule, no `Pending`-sentinel row.
-pub fn build_station_rows(
+#[expect(
+    clippy::similar_names,
+    reason = "the similar names are distinct domain terms"
+)]
+pub(crate) fn build_station_rows(
     state: &StationCorrelationState,
     resolved_at: chrono::DateTime<chrono::Utc>,
     defaults: &common::Defaults,

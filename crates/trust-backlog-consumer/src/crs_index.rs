@@ -43,7 +43,7 @@ use std::collections::HashSet;
 
 use common::LineDefinition;
 
-pub fn build_crs_index(lines: &[LineDefinition]) -> HashSet<String> {
+pub(crate) fn build_crs_index(lines: &[LineDefinition]) -> HashSet<String> {
     let mut index = HashSet::new();
     for line in lines {
         for station in &line.stations {

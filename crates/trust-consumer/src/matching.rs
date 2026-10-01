@@ -1,13 +1,13 @@
 //! Best-effort resolution of a user's pin (origin CRS + scheduled
-//! departure time, date -- no train_uid) against the live TRUST feed, by
+//! departure time, date -- no `train_uid`) against the live TRUST feed, by
 //! matching the first Movement event at the origin station near the
 //! scheduled time. trust-consumer does no CIF schedule lookup itself, so an
-//! Activation alone cannot be tied to a pin that lacks a train_uid. A
+//! Activation alone cannot be tied to a pin that lacks a `train_uid`. A
 //! heuristic, not a guaranteed join.
 //!
 //! This is the fallback path. api's schedule-first matching
 //! (`crates/api/src/data/schedule_matching.rs`, using
-//! `schedule_query::match_pin`) gives most pins a train_uid before any
+//! `schedule_query::match_pin`) gives most pins a `train_uid` before any
 //! TRUST event arrives, and those resolve on
 //! `process::Reference::by_train_uid`'s Activation fast path; everything
 //! here exists for the pins that still don't have one.
@@ -15,7 +15,7 @@
 use chrono::{DateTime, Duration, Utc};
 
 #[derive(Debug, Clone)]
-pub struct PendingPin {
+pub(crate) struct PendingPin {
     pub tracked_train_id: i64,
     pub pin_origin_crs: String,
     pub pin_scheduled_departure: DateTime<Utc>,
@@ -53,14 +53,14 @@ pub struct PendingPin {
 /// the busy-terminus neighbours that the 20-minute window swept in: at
 /// London Waterloo a 20-minute window around one departure routinely
 /// contains a dozen other services.
-pub const SCHEDULED_DEPARTURE_TOLERANCE: Duration = Duration::minutes(5);
+pub(crate) const SCHEDULED_DEPARTURE_TOLERANCE: Duration = Duration::minutes(5);
 
 /// `loc_crs` is the origin-departure Movement event's location, already
 /// translated from STANOX by the caller (see Task 11's translation table).
 /// Returns the pending pin this departure most plausibly belongs to, or
 /// `None` -- and `None` is always the right answer when in doubt, because a
 /// claim is IRREVERSIBLE: `process::ProcessorState::resolved` has no unwind
-/// path, so a pin bound to the wrong train_id locks the correct train out
+/// path, so a pin bound to the wrong `train_id` locks the correct train out
 /// for the life of the process, while an unclaimed pin is simply retried on
 /// the next departure/reference-reload cycle (or, once the live TRUST
 /// window has closed, by `api`'s own backlog-match sweep).
@@ -125,7 +125,7 @@ pub const SCHEDULED_DEPARTURE_TOLERANCE: Duration = Duration::minutes(5);
 /// pin is left exactly as it was, for the next reference-reload cycle (or
 /// `api`'s backlog-match sweep) to retry once a plausible message
 /// eventually arrives.
-pub fn resolve_origin_departure(
+pub(crate) fn resolve_origin_departure(
     loc_crs: &str,
     planned_timestamp: Option<DateTime<Utc>>,
     actual_timestamp: DateTime<Utc>,
@@ -221,7 +221,7 @@ mod tests {
     /// `actual`, for every test below that isn't specifically exercising
     /// the plausibility guard itself.
     fn received_shortly_after(actual: DateTime<Utc>) -> DateTime<Utc> {
-        actual + chrono::Duration::minutes(1)
+        actual + Duration::minutes(1)
     }
 
     fn ts(raw: &str) -> DateTime<Utc> {
@@ -524,7 +524,7 @@ mod tests {
         let actual = ts("2026-08-28T18:32:00Z");
         // A couple of minutes of ordinary clock skew, well within
         // `common::trust_timestamp::MAX_TIMESTAMP_SKEW_AHEAD_OF_RECEIPT`.
-        let received_at = actual - chrono::Duration::minutes(2);
+        let received_at = actual - Duration::minutes(2);
         assert_eq!(
             resolve_origin_departure("WAT", Some(actual), actual, &pending, received_at),
             Some(1),

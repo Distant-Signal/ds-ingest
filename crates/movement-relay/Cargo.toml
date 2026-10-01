@@ -1,7 +1,9 @@
 [package]
 name = "movement-relay"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
@@ -20,3 +22,6 @@ trust-schema = { path = "../trust-schema" }
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "test-util", "net", "io-util"] }
+
+[lints]
+workspace = true

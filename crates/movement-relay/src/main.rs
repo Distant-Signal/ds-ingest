@@ -114,7 +114,7 @@ enum Cycle {
 
 /// One consume -> classify -> XADD -> commit cycle. Only commits the Kafka
 /// offset once EVERY surviving envelope from this record has been
-/// durably XADDed -- mirrors trust-consumer's own never-commit-on-a-
+/// durably `XADDed` -- mirrors trust-consumer's own never-commit-on-a-
 /// failed-downstream-write discipline, substituting "every XADD in this
 /// record succeeded" for "the HTTP POST succeeded".
 ///
@@ -272,7 +272,7 @@ trait LagConnection: Sized + Send + 'static {
     async fn connect(redis_url: &str) -> anyhow::Result<Self>;
     async fn group_lag(&mut self, group: &str) -> anyhow::Result<Option<i64>>;
     /// The group's `pending` count (`XINFO GROUPS`): entries delivered but
-    /// not yet ACKed. `None` when the group doesn't exist.
+    /// not yet `ACKed`. `None` when the group doesn't exist.
     async fn group_pending(&mut self, group: &str) -> anyhow::Result<Option<i64>>;
     /// `XLEN movement-events` -- 0 for a stream that doesn't exist yet.
     async fn stream_len(&mut self) -> anyhow::Result<u64>;
@@ -399,19 +399,19 @@ const STREAM_MAXLEN_METRIC: &str = "movement_relay_stream_maxlen";
 /// tick, unlike the consumers' own `movement_feed_deadletter_length`,
 /// which is only set when a consumer dead-letters something: that one is
 /// absent after every restart and stays at its last value after an
-/// operator drains the stream, so DistantSignalDeadLetterNearFull reads
+/// operator drains the stream, so `DistantSignalDeadLetterNearFull` reads
 /// this one instead.
 const DEADLETTER_LENGTH_METRIC: &str = "movement_relay_deadletter_length";
 /// Counter of dead-letter records removed for being older than
 /// `--deadletter-max-age-secs` (D5; see `deadletter`).
 const DEADLETTER_TRIMMED_METRIC: &str = "movement_relay_deadletter_trimmed_total";
 /// Age in seconds of the oldest dead-letter record (0 when there is
-/// none), for DistantSignalDeadLetterExpiring: it fires hours before the
+/// none), for `DistantSignalDeadLetterExpiring`: it fires hours before the
 /// trim removes the record, while it can still be re-injected.
 const DEADLETTER_OLDEST_AGE_METRIC: &str = "movement_relay_deadletter_oldest_age_seconds";
 /// `INFO persistence` as 1/0 gauges (see [`PersistenceStatus`]), for the
-/// chart's DistantSignalRedisPersistenceFailing alert. The chart ships no
-/// redis_exporter, so without these nothing in it can see a failing AOF.
+/// chart's `DistantSignalRedisPersistenceFailing` alert. The chart ships no
+/// `redis_exporter`, so without these nothing in it can see a failing AOF.
 const AOF_ENABLED_METRIC: &str = "redis_aof_enabled";
 const AOF_LAST_WRITE_OK_METRIC: &str = "redis_aof_last_write_ok";
 const AOF_LAST_BGREWRITE_OK_METRIC: &str = "redis_aof_last_bgrewrite_ok";
@@ -444,6 +444,10 @@ struct LagSample {
 /// Writes one tick's `LagSample` plus the configured cap to the gauges.
 /// The cap is written every tick, connected or not, so it is present from
 /// the first tick onward even while Redis is unreachable.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "metric gauges take f64, and these counts and timestamps stay far below 2^52"
+)]
 fn publish_lag_sample(sample: &LagSample, maxlen: u64) {
     metrics::gauge!(common::metrics::metric_name(STREAM_MAXLEN_METRIC)).set(maxlen as f64);
     if let Some(len) = sample.stream_length {
@@ -513,6 +517,10 @@ fn publish_lag_sample(sample: &LagSample, maxlen: u64) {
 ///
 /// Each tick also trims dead letters older than `deadletter_max_age` and
 /// reports the oldest remaining one's age (see `deadletter`).
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "these durations are seconds to hours, far below u64::MAX milliseconds"
+)]
 async fn stream_lag_loop<C: LagConnection>(
     redis_url: String,
     interval: Duration,
@@ -534,6 +542,10 @@ async fn stream_lag_loop<C: LagConnection>(
 
 /// One tick's worth of `stream_lag_loop` work, split out so it's callable
 /// (and its retry behaviour testable) without an actual `sleep`.
+#[expect(
+    clippy::expect_used,
+    reason = "the invariant is established just above; the expect message names it"
+)]
 async fn run_lag_tick<C: LagConnection>(
     redis_url: &str,
     conn: &mut Option<C>,
@@ -670,6 +682,10 @@ async fn group_info_field(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::items_after_statements,
+    reason = "test code: fixtures sit next to their use"
+)]
 mod tests {
     use super::*;
     use crate::event_sink::FakeEventSink;
@@ -839,7 +855,7 @@ mod tests {
     /// overwrote `last_received`, so cycle 2 published record B and then
     /// committed B's offset -- implicitly committing past record A, which
     /// never reached `movement-events` and could never be re-read. This
-    /// test asserts on the published train_ids and the committed offsets,
+    /// test asserts on the published `train_ids` and the committed offsets,
     /// both of which pinned that skip precisely: it used to see
     /// `["B"]` / `[1]` instead of `["A", "B"]` / `[0, 1]`.
     #[tokio::test]
@@ -910,7 +926,7 @@ mod tests {
 
         assert_eq!(
             published_train_ids(&sink.published),
-            ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+            ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "every record touched during the outage must still be published, in order"
         );
         assert_eq!(
@@ -1035,6 +1051,10 @@ mod tests {
         /// `None` makes `trim_deadletter` fail.
         trim_result: Option<u64>,
         /// `Err` (as `None`) makes `deadletter_oldest_id` fail.
+        #[expect(
+            clippy::option_option,
+            reason = "the outer None makes the call fail; the inner one is an empty stream"
+        )]
         oldest_id: Option<Option<String>>,
     }
 
@@ -1056,7 +1076,7 @@ mod tests {
     impl LagConnection for FakeLagConnection {
         async fn connect(_redis_url: &str) -> anyhow::Result<Self> {
             CONNECT_ATTEMPTS.with(|c| c.set(c.get() + 1));
-            let remaining = CONNECT_FAILURES_REMAINING.with(|c| c.get());
+            let remaining = CONNECT_FAILURES_REMAINING.with(std::cell::Cell::get);
             if remaining > 0 {
                 CONNECT_FAILURES_REMAINING.with(|c| c.set(remaining - 1));
                 return Err(anyhow::anyhow!("simulated Redis not up yet"));
@@ -1205,7 +1225,7 @@ mod tests {
             "a later tick must succeed instead of the gauge staying disabled forever"
         );
         assert_eq!(
-            CONNECT_ATTEMPTS.with(|c| c.get()),
+            CONNECT_ATTEMPTS.with(std::cell::Cell::get),
             3,
             "every tick without a connection must attempt one"
         );
@@ -1214,7 +1234,7 @@ mod tests {
         // reconnecting every time.
         run_lag_tick("redis://fake", &mut conn, TEST_MAX_AGE, TEST_NOW_MS).await;
         assert_eq!(
-            CONNECT_ATTEMPTS.with(|c| c.get()),
+            CONNECT_ATTEMPTS.with(std::cell::Cell::get),
             3,
             "an already-open connection must not be re-established every tick"
         );
@@ -1357,7 +1377,7 @@ mod tests {
         assert_eq!(sample, LagSample::default());
     }
 
-    /// The chart's PrometheusRule (charts/distant-signal/templates/
+    /// The chart's `PrometheusRule` (charts/distant-signal/templates/
     /// prometheusrule.yaml) references these exact names; renaming one
     /// silently breaks an alert.
     #[test]

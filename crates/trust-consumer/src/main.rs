@@ -25,8 +25,8 @@ use movement_feed::ActiveFeed;
 use movement_feed::redis_stream::RedisStreamMovementFeed;
 
 /// Registers `trust_consumer_errors_total{operation="parse_envelope",msg_type}`
-/// at 0 for every msg_type a dropped envelope can carry, so the
-/// DistantSignalTrustEnvelopeParseDrops alert's `increase()` sees the first
+/// at 0 for every `msg_type` a dropped envelope can carry, so the
+/// `DistantSignalTrustEnvelopeParseDrops` alert's `increase()` sees the first
 /// drop too (R-097).
 fn register_parse_envelope_counters() {
     for msg_type in trust_schema::schema::ENVELOPE_FAILURE_MSG_TYPES {
@@ -41,7 +41,7 @@ fn register_parse_envelope_counters() {
 
 /// Every `trust_consumer_errors_total` operation that is a failed call to
 /// api (not a data rejection, which is `post_rejected`), registered at 0
-/// and summed by the chart's DistantSignalConsumerApiCallsFailing alert
+/// and summed by the chart's `DistantSignalConsumerApiCallsFailing` alert
 /// (2026-10-01: ~23.6k failed tracked-trains reloads raised nothing). The
 /// chart's template lists the same operations; a test below keeps the two
 /// in step.
@@ -62,6 +62,11 @@ async fn main() -> std::process::ExitCode {
     common::logging::exit_code(run().await)
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::too_many_lines,
+    reason = "these durations are seconds to hours, far below u64::MAX milliseconds; long but linear; splitting it would scatter its shared state across helpers"
+)]
 async fn run() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
 
@@ -282,7 +287,7 @@ async fn run() -> anyhow::Result<()> {
 /// for with every attempt logged and beating `progress`, so `/livez` stays
 /// 200 through a Redis outage well past `PROGRESS_STALL_SECS` (300s by
 /// default) instead of the pod being killed or exiting into
-/// CrashLoopBackOff. After startup each Redis command is bounded (see
+/// `CrashLoopBackOff`. After startup each Redis command is bounded (see
 /// `common::redis_conn`) and a failure is a `Cycle::Failed`: backed off by
 /// `ERROR_BACKOFF`, progress beaten, retried.
 async fn connect_redis_feed(
@@ -317,7 +322,7 @@ const ERROR_BACKOFF: Duration = Duration::from_secs(2);
 const STARTUP_RETRY_MIN: Duration = Duration::from_secs(1);
 const STARTUP_RETRY_MAX: Duration = Duration::from_secs(30);
 
-/// Rebuilds the matchable pins AND rehydrates already-resolved train_ids
+/// Rebuilds the matchable pins AND rehydrates already-resolved `train_ids`
 /// from a freshly fetched reference, so a restart doesn't permanently lose
 /// trains whose origin departure has already been and gone.
 fn apply_loaded_reference(
@@ -346,6 +351,10 @@ fn apply_loaded_reference(
 /// successful result. `on_retry` runs on every failure (the caller beats
 /// the health-progress heartbeat, so a slow `api` is not mistaken for a
 /// wedged loop). The caller must not touch the feed before this returns.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "these durations are seconds to hours, far below u64::MAX milliseconds"
+)]
 async fn load_reference_until_ok<F, B>(
     mut fetch: F,
     min: Duration,
@@ -420,6 +429,10 @@ enum Cycle {
 /// "already resolved", and drop the one-time
 /// `resolved_train_uid`/`resolved_train_id` signal that is the only thing
 /// that ever flips a subscription to `'resolved'` in the database.
+#[expect(
+    clippy::expect_used,
+    reason = "the invariant is established just above; the expect message names it"
+)]
 async fn run_cycle<F, P>(
     feed: &mut F,
     reference: &process::Reference,
@@ -764,7 +777,7 @@ mod tests {
     }
 
     /// If the unparseable payload cannot be dead-lettered, the cycle fails
-    /// and nothing is ACKed, so it is not lost.
+    /// and nothing is `ACKed`, so it is not lost.
     #[tokio::test]
     async fn a_failed_dead_letter_of_an_unparseable_payload_commits_nothing() {
         let mut feed = FakeMovementFeed::new(vec![vec!["not json at all".to_string()]]);
@@ -1161,7 +1174,7 @@ mod redis_outage_tests {
 
     use super::*;
 
-    /// R-097: every parse_envelope series exists at 0 from startup.
+    /// R-097: every `parse_envelope` series exists at 0 from startup.
     #[test]
     fn parse_envelope_counters_are_registered_at_zero() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
@@ -1179,7 +1192,7 @@ mod redis_outage_tests {
         }
     }
 
-    /// The chart's DistantSignalConsumerApiCallsFailing sums exactly
+    /// The chart's `DistantSignalConsumerApiCallsFailing` sums exactly
     /// [`API_CALL_OPERATIONS`] for this consumer.
     #[test]
     fn the_chart_alerts_on_every_api_call_operation() {

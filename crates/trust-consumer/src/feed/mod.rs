@@ -5,5 +5,5 @@
 //! Decision 3 for why the trait/fake moved to a shared crate.
 
 #[cfg(test)]
-pub use movement_feed::FakeMovementFeed;
-pub use movement_feed::MovementFeed;
+pub(crate) use movement_feed::FakeMovementFeed;
+pub(crate) use movement_feed::MovementFeed;

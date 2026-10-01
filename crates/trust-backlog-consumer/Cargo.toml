@@ -1,7 +1,9 @@
 [package]
 name = "trust-backlog-consumer"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
@@ -22,3 +24,6 @@ trust-schema = { path = "../trust-schema" }
 
 [dev-dependencies]
 movement-feed = { path = "../movement-feed", features = ["test-util"] }
+
+[lints]
+workspace = true

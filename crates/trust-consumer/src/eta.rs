@@ -19,8 +19,14 @@ use chrono::{DateTime, Utc};
 // to hand it, so `process.rs` documents it as deliberately uncalled rather
 // than calling it for a guaranteed `None`. Allowed rather than deleted: the
 // rule it encodes is tested, and re-deriving it later is pure waste.
-#[allow(dead_code)]
-pub fn propagate_eta(
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "tested but deliberately uncalled until its caller exists; see above"
+    )
+)]
+pub(crate) fn propagate_eta(
     last_reported_planned: DateTime<Utc>,
     last_reported_actual: DateTime<Utc>,
     remaining_scheduled: Option<DateTime<Utc>>,

@@ -15,7 +15,7 @@ use crate::station_correlate;
 /// The STANOX/TIPLOC lookups every Movement is resolved through, rebuilt
 /// on each stanox/crs reload.
 #[derive(Debug, Default)]
-pub struct Lookups {
+pub(crate) struct Lookups {
     pub stanox: StanoxTable,
     /// TIPLOC -> every shadow line whose catalogue resolves to it.
     pub tiploc_index: HashMap<String, Vec<String>>,
@@ -23,14 +23,14 @@ pub struct Lookups {
 
 /// Why a whole rail day is `partial` -- see [`DayState::partial_reason`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PartialReason {
+pub(crate) enum PartialReason {
     /// The process started mid-day and the day's first events had already
     /// been trimmed from `movement-events` (or the replay could not tell).
     DayStartTrimmed,
 }
 
 impl PartialReason {
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             PartialReason::DayStartTrimmed => "day_start_trimmed",
         }
@@ -39,7 +39,7 @@ impl PartialReason {
 
 /// Everything this process knows about `service_date`'s rail day.
 #[derive(Debug)]
-pub struct DayState {
+pub(crate) struct DayState {
     pub service_date: chrono::NaiveDate,
     pub correlation: correlate::CorrelationState,
     pub stations: station_correlate::StationCorrelationState,
@@ -80,7 +80,7 @@ pub struct DayState {
 }
 
 impl DayState {
-    pub fn new(service_date: chrono::NaiveDate) -> Self {
+    pub(crate) fn new(service_date: chrono::NaiveDate) -> Self {
         Self {
             service_date,
             correlation: correlate::CorrelationState::default(),
@@ -96,7 +96,7 @@ impl DayState {
     }
 
     /// Turns on the windowed-stats per-train state.
-    pub fn enable_windowed(mut self) -> Self {
+    pub(crate) fn enable_windowed(mut self) -> Self {
         self.trains = Some(crate::trains::TrainState::new(self.service_date));
         self
     }
@@ -106,7 +106,7 @@ impl DayState {
     /// [`DayState::next_activations`]), and -- with windowed stats -- the
     /// next day's per-train state, feed-health history and how far back
     /// this process has seen everything.
-    pub fn roll(self, next: chrono::NaiveDate) -> DayState {
+    pub(crate) fn roll(self, next: chrono::NaiveDate) -> DayState {
         let mut day = DayState::new(next);
         let consecutive = next == self.service_date + chrono::Duration::days(1);
         if consecutive {
@@ -128,7 +128,7 @@ impl DayState {
         day.observed_from = if consecutive {
             day.observed_from.max(self.observed_from)
         } else {
-            chrono::Utc::now()
+            Utc::now()
         };
         day.last_event_at = self.last_event_at;
         day.activation_times = self.activation_times;
@@ -151,7 +151,7 @@ impl DayState {
     }
 
     /// Activations received in the 60 minutes up to `now`.
-    pub fn activations_in_last_hour(&self, now: DateTime<Utc>) -> usize {
+    pub(crate) fn activations_in_last_hour(&self, now: DateTime<Utc>) -> usize {
         let horizon = now - chrono::Duration::minutes(60);
         self.activation_times
             .iter()
@@ -190,7 +190,7 @@ impl DayState {
         }
     }
 
-    pub fn is_line_partial(&self, line_id: &str) -> bool {
+    pub(crate) fn is_line_partial(&self, line_id: &str) -> bool {
         self.partial_reason.is_some() || self.partial_lines.contains(line_id)
     }
 
@@ -201,7 +201,7 @@ impl DayState {
     /// `received_at`: when the payload arrived -- `Utc::now()` live, the
     /// stream entry id's time in the startup replay. It anchors TRUST's
     /// skewed timestamps and the feed-health history.
-    pub fn dispatch_payload(
+    pub(crate) fn dispatch_payload(
         &mut self,
         raw: &str,
         lookups: &Lookups,
@@ -261,7 +261,7 @@ impl DayState {
     /// the per-train state also takes this day's 0002/0005/0006 (a train
     /// can be cancelled before its day starts). No Movement from before the
     /// day start belongs to this day's rows.
-    pub fn dispatch_lookback_payload(
+    pub(crate) fn dispatch_lookback_payload(
         &mut self,
         raw: &str,
         lookups: &Lookups,
@@ -293,7 +293,7 @@ impl DayState {
 /// `trust_schema::journey` directly, so that fix's own `status_rank` change
 /// (a fresh Movement can un-stick a `"cancelled"` per-line status without
 /// needing a Reinstatement message specifically) already applies here too.
-pub fn dispatch_message(
+pub(crate) fn dispatch_message(
     message: TrustMessage,
     correlation_state: &mut correlate::CorrelationState,
     station_state: &mut station_correlate::StationCorrelationState,

@@ -5,7 +5,7 @@ use clap::Parser;
 /// docs/superpowers/specs/2026-09-04-movement-relay-design.md and
 /// docs/superpowers/plans/2026-09-04-movement-relay-plan.md.
 #[derive(Debug, Parser)]
-pub struct Config {
+pub(crate) struct Config {
     /// GAP: unconfirmed hostname until Deploy B's real credential is in
     /// hand -- same posture as trust-consumer/src/config.rs's own
     /// identical field.
@@ -14,7 +14,7 @@ pub struct Config {
 
     /// The one real, RDM-issued group -- `SC-c4d90f8e-...` in production,
     /// per the design doc's "Why this exists" section. Deliberately no
-    /// default: unlike trust-consumer's own kafka_consumer_group (which
+    /// default: unlike trust-consumer's own `kafka_consumer_group` (which
     /// DOES have a sensible per-deployment default,
     /// "distant-signal-trust-consumer"), this crate's group id is a fixed,
     /// externally-issued, unforgeable identity -- guessing wrong here is
@@ -56,7 +56,7 @@ pub struct Config {
     /// polls `XINFO GROUPS` for both downstream groups. UNRESEARCHED
     /// starting figure, same posture as every other first-guess cadence
     /// constant in this codebase (see trust-consumer/src/config.rs's own
-    /// stanox_crs_reload_secs comment).
+    /// `stanox_crs_reload_secs` comment).
     #[arg(long, env, default_value_t = 30)]
     pub stream_lag_poll_secs: u64,
 
@@ -124,23 +124,24 @@ pub struct Config {
 /// original 500,000 "~19h" figure (sized for ~630k/day) silently became
 /// 11.7h. With `MAXLEN` the memory stays bounded and the time window is
 /// what varies, which the lag gauge and `check_gap` already report.
-pub const STREAM_MEMORY_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const STREAM_MEMORY_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Planning figure for Redis memory per `movement-events` entry: 1 KiB.
 /// Measured at 920 B in production (a ~750 B raw TRUST envelope in
 /// `payload`, the 4-byte `msg_type`, and listpack/radix-tree overhead),
 /// rounded up so that bigger payloads (activations) still fit the budget.
-pub const STREAM_ENTRY_BYTES_ESTIMATE: u64 = 1024;
+pub(crate) const STREAM_ENTRY_BYTES_ESTIMATE: u64 = 1024;
 
 /// 524,288 entries. See `STREAM_MEMORY_BUDGET_BYTES`.
-pub const DEFAULT_STREAM_MAXLEN: u64 = STREAM_MEMORY_BUDGET_BYTES / STREAM_ENTRY_BYTES_ESTIMATE;
+pub(crate) const DEFAULT_STREAM_MAXLEN: u64 =
+    STREAM_MEMORY_BUDGET_BYTES / STREAM_ENTRY_BYTES_ESTIMATE;
 
 /// Floor for `--movement-stream-maxlen`. `MAXLEN ~` only trims whole
 /// stream nodes (`stream-node-max-entries`, 100 by default), so a
 /// smaller cap is not honoured precisely. Any cap this small would also be
 /// minutes of traffic, which is almost certainly a typo rather than a
 /// deliberate setting.
-pub const MIN_STREAM_MAXLEN: u64 = 1_000;
+pub(crate) const MIN_STREAM_MAXLEN: u64 = 1_000;
 
 #[cfg(test)]
 mod tests {
@@ -284,7 +285,7 @@ mod chart_env_wiring_tests {
     }
 
     /// Liveness on `/healthz` (readiness: a confirmed Kafka partition
-    /// assignment) got the relay SIGKILLed whenever it was unready for
+    /// assignment) got the relay `SIGKILLed` whenever it was unready for
     /// ~2 minutes, e.g. while the Redis pod was being recreated by the same
     /// rollout. Liveness must be the dependency-free `/livez`.
     #[test]

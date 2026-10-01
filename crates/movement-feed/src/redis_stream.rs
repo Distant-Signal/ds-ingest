@@ -45,7 +45,7 @@ const DEAD_LETTER_MAX_LEN: usize = 10_000;
 /// the group. Either way the group's pending entries and, after an empty
 /// restart, every entry it had not yet read are gone, and `check_gap`
 /// cannot see it (the new stream has no trimmed range). Registered at 0 so
-/// the chart's DistantSignalMovementGroupRecreated alert can use a plain
+/// the chart's `DistantSignalMovementGroupRecreated` alert can use a plain
 /// `increase()`.
 const GROUP_RECREATED_METRIC: &str = "movement_feed_group_recreated_total";
 
@@ -276,6 +276,10 @@ impl RedisStreamMovementFeed {
     /// One bounded connect attempt plus the consumer-group setup; any
     /// failure is returned (see [`Self::connect_until_ready`] for the
     /// retrying form).
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Instant::now() is far past any autoclaim idle time"
+    )]
     async fn connect_to_stream(
         client: &redis::Client,
         stream: &str,
@@ -326,7 +330,9 @@ impl RedisStreamMovementFeed {
             pel_replay_cursor: Some("0".to_string()),
             pending: Vec::new(),
             isolating: false,
-            last_autoclaim_sweep: std::time::Instant::now() - autoclaim_min_idle,
+            last_autoclaim_sweep: std::time::Instant::now()
+                .checked_sub(autoclaim_min_idle)
+                .unwrap(),
             autoclaim_min_idle,
             last_delivered_id,
         })
@@ -412,7 +418,7 @@ impl RedisStreamMovementFeed {
     ///
     /// - A single-entry batch: that entry is the poison. It is written to
     ///   the dead-letter stream (reason `rejected_by_api`, payload intact)
-    ///   and XACKed. If the dead-letter write fails, nothing is ACKed.
+    ///   and `XACKed`. If the dead-letter write fails, nothing is `ACKed`.
     /// - A multi-entry batch: the bad entry cannot be identified, so none is
     ///   dead-lettered. The feed switches to isolation (see `isolating`),
     ///   re-reading its pending entries one at a time so the next rejection
@@ -501,6 +507,10 @@ impl DeadLetterSink for RedisStreamMovementFeed {
     /// it once the cause is fixed -- `docs/movement-events-deadletter.md`);
     /// the log and metric are for alerting. Refuses (`Err`, nothing
     /// written) when the stream is already at its cap.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "metric gauges take f64, and these counts and timestamps stay far below 2^52"
+    )]
     async fn dead_letter(&mut self, records: &[DeadLetter]) -> anyhow::Result<()> {
         if records.is_empty() {
             return Ok(());
@@ -686,7 +696,7 @@ async fn stream_last_generated_id(
 /// falls back to `$`, the stream's tail, as at startup.
 ///
 /// Not recoverable either way: the lost group's pending-entries list.
-/// Entries delivered but not yet ACKed are not redelivered (after an empty
+/// Entries delivered but not yet `ACKed` are not redelivered (after an empty
 /// restart they are gone anyway). Nor is one narrow case: a recreated
 /// stream on a server whose clock is behind, whose `last-generated-id`
 /// has already passed `last_delivered` -- its entries up to
@@ -726,32 +736,34 @@ fn recreate_start_id(last_delivered: Option<&str>, stream_last_generated: Option
 ///
 /// Each malformed entry comes back as `(id, fields)`, `fields` being its
 /// field/value pairs rendered as text, so it can be dead-lettered.
-#[allow(clippy::type_complexity)]
+#[expect(
+    clippy::type_complexity,
+    reason = "two (id, fields) lists, spelled out at their one use"
+)]
 fn split_deliverable_and_malformed(
     ids: Vec<redis::streams::StreamId>,
 ) -> (Vec<(String, String)>, Vec<(String, String)>) {
     let mut entries = Vec::new();
     let mut malformed = Vec::new();
     for entry in ids {
-        match entry
+        if let Some(payload) = entry
             .map
             .get("payload")
             .and_then(|v| redis::from_redis_value::<String>(v).ok())
         {
-            Some(payload) => entries.push((entry.id, payload)),
-            None => {
-                let mut fields: Vec<String> = entry
-                    .map
-                    .iter()
-                    .map(|(k, v)| {
-                        let v = redis::from_redis_value::<String>(v)
-                            .unwrap_or_else(|_| format!("{v:?}"));
-                        format!("{k}={v}")
-                    })
-                    .collect();
-                fields.sort();
-                malformed.push((entry.id, fields.join("\n")));
-            }
+            entries.push((entry.id, payload));
+        } else {
+            let mut fields: Vec<String> = entry
+                .map
+                .iter()
+                .map(|(k, v)| {
+                    let v =
+                        redis::from_redis_value::<String>(v).unwrap_or_else(|_| format!("{v:?}"));
+                    format!("{k}={v}")
+                })
+                .collect();
+            fields.sort();
+            malformed.push((entry.id, fields.join("\n")));
         }
     }
     (entries, malformed)
@@ -986,6 +998,10 @@ impl RedisStreamMovementFeed {
     /// step (an `id = "0"` read) is re-entered to actually retrieve them,
     /// the exact same path startup replay already uses -- no separate
     /// delivery mechanism needed.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "these durations are seconds to hours, far below u64::MAX milliseconds"
+    )]
     async fn reclaim_stale(&mut self) -> anyhow::Result<()> {
         let mut cursor = "0-0".to_string();
         let mut claimed_any = false;
@@ -1033,7 +1049,7 @@ impl RedisStreamMovementFeed {
     /// a gap whenever `last-delivered-id < first-entry`, which is also true
     /// when the first retained entry is simply the group's next unread one
     /// (a false alarm), and it ignored entries that had been delivered but
-    /// not yet ACKed and were then trimmed out from under the PEL.
+    /// not yet `ACKed` and were then trimmed out from under the PEL.
     pub async fn check_gap(&mut self) -> anyhow::Result<Option<GapInfo>> {
         let positions = self.stream_positions().await?;
         Ok(detect_gap(&positions))
@@ -1112,7 +1128,7 @@ impl RedisStreamMovementFeed {
     }
 
     /// Group-less `XRANGE start end COUNT count` over this feed's stream --
-    /// NOT a consumer-group read: nothing is delivered, claimed or ACKed,
+    /// NOT a consumer-group read: nothing is delivered, claimed or `ACKed`,
     /// and the group's position is untouched. `start`/`end` take any
     /// `XRANGE` bound, including an exclusive `(<id>` (Redis >= 6.2).
     ///
@@ -1189,7 +1205,7 @@ pub struct StreamPositions {
     /// The group's logical read counter; nil in Redis when it cannot be
     /// known (e.g. a group created at an arbitrary id).
     pub group_entries_read: Option<u64>,
-    /// Entries delivered to the group but not yet ACKed.
+    /// Entries delivered to the group but not yet `ACKed`.
     pub pending_count: u64,
     /// The smallest id in the group's PEL, if any.
     pub pending_min_id: Option<String>,
@@ -1232,7 +1248,7 @@ impl StreamPositions {
 ///   that drift alone must not raise an alarm while the group is inside
 ///   the retained window.
 /// - **Pending entries trimmed.** The group's PEL holds an id older than
-///   the first retained entry: delivered, never ACKed, and now gone, so a
+///   the first retained entry: delivered, never `ACKed`, and now gone, so a
 ///   redelivery can only hand back an empty entry.
 pub fn detect_gap(positions: &StreamPositions) -> Option<GapInfo> {
     let last_delivered = positions.group_last_delivered_id.as_deref()?;
@@ -1241,9 +1257,7 @@ pub fn detect_gap(positions: &StreamPositions) -> Option<GapInfo> {
     let first_entry = positions.stream_first_entry_id.as_deref()?;
 
     let behind_first_entry = stream_id_less_than(last_delivered, first_entry);
-    let unread_lost: Option<Option<u64>> = if !behind_first_entry {
-        None
-    } else {
+    let unread_lost: Option<Option<u64>> = if behind_first_entry {
         match (positions.stream_entries_added, positions.group_entries_read) {
             (Some(added), Some(read)) => {
                 let lost = added
@@ -1256,6 +1270,8 @@ pub fn detect_gap(positions: &StreamPositions) -> Option<GapInfo> {
                 _ => Some(None),
             },
         }
+    } else {
+        None
     };
 
     let pending_trimmed = positions
@@ -1541,7 +1557,7 @@ mod recreate_start_id_tests {
     }
 
     /// charts/distant-signal/templates/prometheusrule.yaml's
-    /// DistantSignalMovementGroupRecreated reads this exact name.
+    /// `DistantSignalMovementGroupRecreated` reads this exact name.
     #[test]
     fn the_group_recreated_counter_name_matches_the_chart_alert() {
         assert_eq!(
@@ -1615,6 +1631,10 @@ mod long_pending_entries_tests {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::items_after_statements,
+    reason = "test code: fixtures sit next to their use"
+)]
 mod redis_tests {
     use super::*;
 
@@ -1790,7 +1810,7 @@ mod redis_tests {
 
     /// PL-2: a downstream data rejection of a multi-entry batch isolates
     /// the entries one at a time; only the one that is rejected on its own
-    /// is dead-lettered (payload intact) and ACKed, and its healthy
+    /// is dead-lettered (payload intact) and `ACKed`, and its healthy
     /// batch-mate is committed normally.
     #[tokio::test]
     #[ignore = "needs REDIS_URL"]
@@ -1941,7 +1961,7 @@ mod redis_tests {
     }
 
     /// Regression test for the pending-forever bug: a stream entry with no
-    /// `payload` field must be XACKed by `next_batch` itself, not left
+    /// `payload` field must be `XACKed` by `next_batch` itself, not left
     /// dangling in the pending-entries list for a future PEL replay to trip
     /// over again.
     #[tokio::test]
@@ -2423,7 +2443,7 @@ mod redis_tests {
     }
 
     /// The old check's false alarm, against a real server: the group has
-    /// read and ACKed everything, then those entries are trimmed. The first
+    /// read and `ACKed` everything, then those entries are trimmed. The first
     /// retained entry is the group's next unread one -- nothing was lost.
     #[tokio::test]
     #[ignore = "needs REDIS_URL"]
@@ -2460,7 +2480,7 @@ mod redis_tests {
         cleanup(&stream).await;
     }
 
-    /// Delivered, never ACKed, then trimmed: the PEL now points at entries
+    /// Delivered, never `ACKed`, then trimmed: the PEL now points at entries
     /// that no longer exist. The old check could not see this at all.
     #[tokio::test]
     #[ignore = "needs REDIS_URL"]

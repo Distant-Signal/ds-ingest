@@ -59,7 +59,7 @@ pub trait MovementFeed: Send {
     /// narrows a rejected multi-entry batch down one entry at a time -- see
     /// `redis_stream::RedisStreamMovementFeed::reject_batch`. The default
     /// does nothing, leaving the batch uncommitted. `Err` means nothing was dead-lettered
-    /// or ACKed.
+    /// or `ACKed`.
     async fn reject_batch(&mut self, _detail: &str) -> anyhow::Result<()> {
         Ok(())
     }

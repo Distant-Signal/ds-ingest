@@ -22,7 +22,7 @@ use rdkafka::consumer::{BaseConsumer, ConsumerContext, Rebalance};
 /// true on a non-empty partition assignment (`post_rebalance`'s `Assign`
 /// variant), false on any revoke/error path, independent of whether a
 /// message has arrived on the assigned partitions yet.
-pub struct RelayContext {
+pub(crate) struct RelayContext {
     pub ready: health_http::ConnectionState,
 }
 
@@ -46,7 +46,7 @@ impl ConsumerContext for RelayContext {
                 health_http::set_connected(&self.ready, "movement_relay_ready", false);
                 tracing::error!(error = ?err, "movement-relay: Kafka rebalance error; readiness now false");
             }
-            _ => {}
+            Rebalance::Assign(_) => {}
         }
     }
 }

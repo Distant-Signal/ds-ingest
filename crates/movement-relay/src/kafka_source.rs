@@ -1,5 +1,5 @@
 //! Raw Kafka source for movement-relay. Structurally close to
-//! `trust-consumer/src/feed/kafka.rs` (same ClientConfig shape, same
+//! `trust-consumer/src/feed/kafka.rs` (same `ClientConfig` shape, same
 //! store-then-commit offset discipline) but deliberately NOT shared via
 //! `crates/movement-feed` -- see
 //! docs/superpowers/plans/2026-09-04-movement-relay-plan.md Task 6 for why:
@@ -28,7 +28,7 @@ use crate::config::Config;
 use crate::health::RelayContext;
 
 #[async_trait]
-pub trait RawKafkaSource: Send {
+pub(crate) trait RawKafkaSource: Send {
     async fn next_batch(&mut self) -> anyhow::Result<Vec<String>>;
 
     /// Hands a batch whose downstream write failed back to the source, so
@@ -67,7 +67,7 @@ pub trait RawKafkaSource: Send {
 /// a broker. The production implementation (`StreamConsumer<RelayContext>`
 /// below) is a thin pass-through.
 #[async_trait]
-pub trait ConsumerOps: Send + Sync {
+pub(crate) trait ConsumerOps: Send + Sync {
     /// The next record, with its payload copied out (the borrowed
     /// `BorrowedMessage` cannot outlive the call). Rebalance callbacks are
     /// served inside this poll, so the assignment can change across it.
@@ -83,10 +83,10 @@ pub trait ConsumerOps: Send + Sync {
 }
 
 /// `(topic, partition)`.
-pub type TopicPartition = (String, i32);
+pub(crate) type TopicPartition = (String, i32);
 
 /// One Kafka record, owned.
-pub struct ReceivedRecord {
+pub(crate) struct ReceivedRecord {
     pub topic: String,
     pub partition: i32,
     pub offset: i64,
@@ -138,7 +138,7 @@ impl ConsumerOps for StreamConsumer<RelayContext> {
     }
 }
 
-pub struct KafkaRawSource<C = StreamConsumer<RelayContext>> {
+pub(crate) struct KafkaRawSource<C = StreamConsumer<RelayContext>> {
     consumer: C,
     /// `(topic, partition, offset)` of the message the most recent
     /// successful `next_batch` returned, held until `commit` either stores
@@ -222,7 +222,7 @@ const MAX_PENDING_RETRY: usize = 256;
 /// Worst-case time `run_cycle` can spend doing inline downstream work
 /// between one `consumer.recv()` and the next, so librdkafka's own
 /// `max.poll.interval.ms` liveness timeout is set to comfortably outlast it
-/// instead of quietly relying on the library's raw 300_000ms (5 minute)
+/// instead of quietly relying on the library's raw `300_000ms` (5 minute)
 /// default being enough.
 ///
 /// **The shape of the risk**: `next_batch` fetches exactly ONE Kafka record
@@ -237,13 +237,13 @@ const MAX_PENDING_RETRY: usize = 256;
 /// genuinely degraded-but-not-fully-down Redis -- a full outage instead
 /// fails each XADD fast and is handled by `retain_for_retry`, not this path
 /// -- that is ~436 seconds (~7.3 minutes) of inline work with no intervening
-/// poll, which already exceeds librdkafka's stock 300_000ms
+/// poll, which already exceeds librdkafka's stock `300_000ms`
 /// `max.poll.interval.ms`. Once that timeout is exceeded mid-batch, the
 /// broker considers this consumer dead and triggers a group rebalance,
 /// which both interrupts the in-flight batch and briefly stops movement
 /// data from flowing to every downstream consumer group.
 ///
-/// 900_000ms (15 minutes) is set explicitly here -- roughly double the
+/// `900_000ms` (15 minutes) is set explicitly here -- roughly double the
 /// pessimistic worst-case estimate above -- so there is headroom for an even
 /// slower downstream without depending on the library default happening to
 /// be enough, and so the reasoning is visible next to the value rather than
@@ -275,7 +275,7 @@ impl KafkaRawSource {
     /// way `trust-consumer`'s `KafkaMovementFeed` uses its
     /// `connection_state` flag -- the one structural divergence from that
     /// crate's copy beyond the return-shape difference.
-    pub fn connect(
+    pub(crate) fn connect(
         config: &Config,
         ready: health_http::ConnectionState,
         progress: health_http::Progress,
@@ -475,6 +475,10 @@ impl<C: ConsumerOps> RawKafkaSource for KafkaRawSource<C> {
         Ok(vec![batch])
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "the invariant is established just above; the expect message names it"
+    )]
     fn retain_for_retry(&mut self, batch: Vec<String>) {
         let offset = self
             .last_received
@@ -564,10 +568,14 @@ fn test_config() -> Config {
 
 /// Regression test for the Signal Box Audit's "no poll-interval override"
 /// finding: no `max.poll.interval.ms` override meant this consumer relied
-/// entirely on librdkafka's stock 300_000ms default, which
+/// entirely on librdkafka's stock `300_000ms` default, which
 /// `MAX_POLL_INTERVAL_MS`'s own doc comment shows a single slow-downstream
 /// batch can plausibly exceed.
 #[test]
+#[expect(
+    clippy::items_after_statements,
+    reason = "a local type or import sits next to its only use"
+)]
 fn max_poll_interval_is_configured_with_headroom_over_the_librdkafka_default() {
     let config = test_config();
     let client_config = KafkaRawSource::client_config(&config);
@@ -600,10 +608,10 @@ fn max_poll_interval_is_configured_with_headroom_over_the_librdkafka_default() {
 /// back will see the next cycle fetch record N+1 and then commit N+1's
 /// offset, silently skipping N.
 #[cfg(test)]
-pub struct FakeRawSource {
+pub(crate) struct FakeRawSource {
     /// Records not yet fetched, in offset order -- one element per Kafka
     /// record. An empty element models a poll that returned nothing.
-    batches: std::collections::VecDeque<Vec<String>>,
+    batches: VecDeque<Vec<String>>,
     /// The offset the next fetched record will carry.
     next_offset: i64,
     /// Offset of the most recently fetched record, cleared by a successful
@@ -623,7 +631,7 @@ pub struct FakeRawSource {
 
 #[cfg(test)]
 impl FakeRawSource {
-    pub fn new(batches: Vec<Vec<String>>) -> Self {
+    pub(crate) fn new(batches: Vec<Vec<String>>) -> Self {
         Self {
             batches: batches.into(),
             next_offset: 0,
@@ -676,6 +684,10 @@ impl RawKafkaSource for FakeRawSource {
 /// callbacks), new partitions arriving unpaused, and `store_offset`
 /// refusing a partition that is no longer assigned (`__STATE`).
 #[cfg(test)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "test code: casts of small known test values"
+)]
 mod consumer_tests {
     use std::collections::{BTreeMap, HashSet};
     use std::sync::Mutex;

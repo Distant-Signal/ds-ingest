@@ -6,7 +6,7 @@
 //! docs/superpowers/plans/2026-09-05-trust-event-backlog-plan.md.
 //!
 //! Loop shape mirrors `full-coverage-consumer/src/main.rs`'s own
-//! multi-cadence-in-one-loop shape (stanox_crs reload / consume-and-filter
+//! multi-cadence-in-one-loop shape (`stanox_crs` reload / consume-and-filter
 //! / batch POST, each on its own timer or per-iteration, all checked once
 //! per loop) -- this crate needs no population/stats-write cadence of its
 //! own, so it is simpler than that crate's loop, not a copy of it.
@@ -30,7 +30,7 @@ use movement_feed::{DeadLetter, DeadLetterSink};
 
 /// Every `trust_backlog_consumer_errors_total` operation that is a failed
 /// call to api (not a data rejection, which is `post_rejected`), registered
-/// at 0 and summed by the chart's DistantSignalConsumerApiCallsFailing alert
+/// at 0 and summed by the chart's `DistantSignalConsumerApiCallsFailing` alert
 /// (2026-10-01: ~2,200 failed backlog POSTs raised nothing). The chart's
 /// template lists the same operations; a test below keeps the two in step.
 const API_CALL_OPERATIONS: &[&str] = &["post_batch", "post_train_reasons", "reload_stanox_crs"];
@@ -40,6 +40,11 @@ async fn main() -> std::process::ExitCode {
     common::logging::exit_code(run().await)
 }
 
+#[expect(
+    clippy::expect_used,
+    clippy::too_many_lines,
+    reason = "a poisoned lock means another thread already panicked; long but linear; splitting it would scatter its shared state across helpers"
+)]
 async fn run() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
     common::logging::init("trust-backlog-consumer");
@@ -330,10 +335,10 @@ const ERROR_BACKOFF: Duration = Duration::from_secs(2);
 /// What [`deliver_batch`] did with one batch.
 #[derive(Debug, PartialEq, Eq)]
 enum Delivery {
-    /// Posted (any rows `api` rejected were dead-lettered) and XACKed.
+    /// Posted (any rows `api` rejected were dead-lettered) and `XACKed`.
     Committed,
     /// The POST failed transiently (unreachable, timeout, 5xx, ...): nothing
-    /// XACKed and nothing dead-lettered, so the batch is redelivered later --
+    /// `XACKed` and nothing dead-lettered, so the batch is redelivered later --
     /// however long the outage lasts.
     PostFailed,
     /// `api` refused the whole batch's data (400/413/422): handed to
@@ -341,7 +346,7 @@ enum Delivery {
     /// entry and dead-letters only that.
     Rejected,
     /// `api` rejected rows but they could not be dead-lettered: nothing
-    /// XACKed, so the rejected rows are not lost. The retry re-posts the
+    /// `XACKed`, so the rejected rows are not lost. The retry re-posts the
     /// batch; the good rows then conflict harmlessly on `dedup_key`.
     DeadLetterFailed,
     /// Posted, but the XACK itself failed; the batch will be redelivered
@@ -355,7 +360,7 @@ enum Delivery {
 /// **Rejected rows no longer hold a batch hostage.** When `api` answers 2xx
 /// with a non-empty `rejected` list, those rows failed a constraint or were
 /// invalid input and will fail identically on every retry, while every other
-/// row has already landed. So the batch is ACKed like any success, and the
+/// row has already landed. So the batch is `ACKed` like any success, and the
 /// rejected rows go to the dead-letter stream (see
 /// `movement_feed::DeadLetterSink`) with the SQLSTATE and message, where an
 /// operator can inspect them and re-inject them once the cause is fixed.
@@ -365,7 +370,7 @@ enum Delivery {
 /// to `MovementFeed::reject_batch` instead.
 ///
 /// `unparseable` (payloads in this batch that did not parse at all) are
-/// dead-lettered first; if that fails, nothing is posted or ACKed.
+/// dead-lettered first; if that fails, nothing is posted or `ACKed`.
 async fn deliver_batch<F, P>(
     feed: &mut F,
     events: &[common::TrustBacklogEventMessage],
@@ -503,7 +508,7 @@ fn current_rail_day(at: chrono::DateTime<chrono::Utc>) -> chrono::NaiveDate {
 mod rail_day_tests {
     use super::*;
 
-    /// The chart's DistantSignalConsumerApiCallsFailing sums exactly
+    /// The chart's `DistantSignalConsumerApiCallsFailing` sums exactly
     /// [`API_CALL_OPERATIONS`] for this consumer.
     #[test]
     fn the_chart_alerts_on_every_api_call_operation() {
@@ -638,7 +643,7 @@ mod deliver_batch_tests {
     }
 
     /// The production incident's fix, consumer half: a batch where `api`
-    /// rejected a row is ACKed like any success, and the rejected row goes
+    /// rejected a row is `ACKed` like any success, and the rejected row goes
     /// to the dead-letter sink with enough to recover it.
     #[tokio::test]
     async fn rejected_rows_are_dead_lettered_and_the_batch_is_acked() {
@@ -705,7 +710,7 @@ mod deliver_batch_tests {
         assert!(feed.dead_lettered.is_empty());
     }
 
-    /// If the rejected rows cannot be stored, ACKing would lose them: the
+    /// If the rejected rows cannot be stored, `ACKing` would lose them: the
     /// batch stays pending and is retried instead.
     #[tokio::test]
     async fn a_failed_dead_letter_write_leaves_the_batch_un_acked() {
@@ -726,7 +731,7 @@ mod deliver_batch_tests {
     }
 
     /// PL-2: however many times the POST fails transiently, nothing is
-    /// dead-lettered, rejected or ACKed -- the batch just stays pending.
+    /// dead-lettered, rejected or `ACKed` -- the batch just stays pending.
     #[tokio::test]
     async fn a_transient_failure_never_dead_letters_however_often_it_repeats() {
         let mut feed = feed_with_one_batch().await;

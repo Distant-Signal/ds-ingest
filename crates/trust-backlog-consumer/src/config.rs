@@ -23,7 +23,7 @@ fn parse_stanox_crs(path: &str) -> anyhow::Result<StanoxCrsTable> {
 /// consumer to keep compatible with, so it only ever speaks to the
 /// `movement-events` Redis Stream directly via `movement_feed::redis_stream::RedisStreamMovementFeed`.
 #[derive(Debug, Parser)]
-pub struct Config {
+pub(crate) struct Config {
     #[arg(long, env, default_value = "redis://redis:6379")]
     pub redis_url: String,
 

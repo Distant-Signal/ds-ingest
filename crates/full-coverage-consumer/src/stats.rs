@@ -1,4 +1,4 @@
-//! Decision 2f/2g's SampleStats synthesis and Decision 2e's
+//! Decision 2f/2g's `SampleStats` synthesis and Decision 2e's
 //! Resolved-vs-Pending rail-day gating, per line.
 
 use std::collections::HashMap;
@@ -50,7 +50,7 @@ pub(crate) fn synthesize_departure(uid: &str, derived: &DerivedState) -> Station
 /// "available", even once the day has closed. Before this, every restart
 /// (about 200 on rail day 2026-09-26) turned every train already seen that
 /// day into a "cancellation".
-pub fn build_line_row(
+pub(crate) fn build_line_row(
     line_id: &str,
     service_date: chrono::NaiveDate,
     population_uids: &[&str],
@@ -62,11 +62,11 @@ pub fn build_line_row(
     let departures: Vec<StationDeparture> = population_uids
         .iter()
         .filter_map(
-            |uid| match derived.get(&(line_id.to_string(), uid.to_string())) {
+            |uid| match derived.get(&(line_id.to_string(), (*uid).to_string())) {
                 Some(state) => Some(synthesize_departure(uid, state)),
                 None if partial => None,
                 None => Some(StationDeparture {
-                    service_id: uid.to_string(),
+                    service_id: (*uid).to_string(),
                     operator: String::new(),
                     destination_crs: String::new(),
                     scheduled: String::new(),
@@ -116,7 +116,7 @@ pub fn build_line_row(
 /// Derived from [`rail_day_closed`] rather than a second, independent
 /// Europe/London 02:00 calculation: the day before `now`'s calendar date is
 /// the current rail day exactly when that earlier day has NOT yet closed.
-pub fn current_rail_service_date(now: chrono::DateTime<chrono::Utc>) -> chrono::NaiveDate {
+pub(crate) fn current_rail_service_date(now: chrono::DateTime<chrono::Utc>) -> chrono::NaiveDate {
     let today = now.date_naive();
     let yesterday = today - chrono::Duration::days(1);
     if rail_day_closed(yesterday, now) {
@@ -130,7 +130,11 @@ pub fn current_rail_service_date(now: chrono::DateTime<chrono::Utc>) -> chrono::
 /// `service_date` -- equivalently, the boundary that closed the day
 /// before, computed with the same `next_rail_day_boundary` anchoring as
 /// [`rail_day_closed`] so the two can never disagree about DST.
-pub fn rail_day_start(service_date: chrono::NaiveDate) -> chrono::DateTime<chrono::Utc> {
+#[expect(
+    clippy::expect_used,
+    reason = "a constant or range-checked time is always valid"
+)]
+pub(crate) fn rail_day_start(service_date: chrono::NaiveDate) -> chrono::DateTime<chrono::Utc> {
     let previous_midday = (service_date - chrono::Duration::days(1))
         .and_hms_opt(12, 0, 0)
         .expect("midday is a valid time")
@@ -156,7 +160,11 @@ pub fn rail_day_start(service_date: chrono::NaiveDate) -> chrono::DateTime<chron
 /// inside `service_date`'s rail day (`service_date`'s 02:00 local through
 /// the next calendar day's 02:00 local) regardless of DST, so the
 /// boundary this returns is genuinely the day's end.
-pub fn rail_day_closed(
+#[expect(
+    clippy::expect_used,
+    reason = "a constant or range-checked time is always valid"
+)]
+pub(crate) fn rail_day_closed(
     service_date: chrono::NaiveDate,
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
