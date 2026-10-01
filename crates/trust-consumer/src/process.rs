@@ -1210,6 +1210,19 @@ fn process_message(
             );
             let planned = timestamp_pair.planned;
             let actual = timestamp_pair.actual;
+            // The public-timetable time, under the SAME correction decision
+            // as `planned` (it is anchored on the same `actual`, so the
+            // decision is identical). Empty for a pass: `None`.
+            let gbtt = common::trust_timestamp::parse_trust_epoch_millis_pair(
+                movement
+                    .gbtt_timestamp
+                    .as_deref()
+                    .filter(|raw| !raw.is_empty()),
+                movement.actual_timestamp.as_deref(),
+                received_at,
+                state.trust_timestamp_correction_enabled,
+            )
+            .planned;
             // Finding #2's operator signal: how often the correction
             // actually fires vs. falls back to raw, so a change in the
             // upstream feed's own behavior (e.g. a vendor fix landing) shows
@@ -1488,6 +1501,7 @@ fn process_message(
                     loc_stanox: movement.loc_stanox.clone(),
                     loc_crs: loc_crs.clone(),
                     planned_timestamp: planned,
+                    gbtt_timestamp: gbtt,
                     actual_timestamp: actual,
                     variation_status: movement.variation_status.clone(),
                     raw_body: serde_json::json!({}),
@@ -1591,6 +1605,7 @@ fn process_message(
                     loc_stanox: None,
                     loc_crs: None,
                     planned_timestamp: None,
+                    gbtt_timestamp: None,
                     actual_timestamp: canx_pair.actual,
                     variation_status: None,
                     raw_body: serde_json::json!({}),
@@ -1678,6 +1693,7 @@ fn process_message(
                     loc_stanox: None,
                     loc_crs: None,
                     planned_timestamp: None,
+                    gbtt_timestamp: None,
                     actual_timestamp: reinstated_pair.actual,
                     variation_status: None,
                     raw_body: serde_json::json!({}),
@@ -1760,6 +1776,7 @@ fn passthrough_event(
             loc_stanox: None,
             loc_crs: None,
             planned_timestamp: None,
+            gbtt_timestamp: None,
             actual_timestamp: None,
             variation_status: None,
             raw_body: serde_json::json!({}),
@@ -2109,6 +2126,56 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tracked_train_id, 1);
         assert_eq!(events[0].status, "en_route");
+    }
+
+    /// The public-timetable `gbtt_timestamp` is carried through under the
+    /// same timestamp correction as `planned_timestamp` (here a public
+    /// departure one minute before the working one); an empty one (a pass)
+    /// is `None`.
+    #[tokio::test]
+    async fn the_gbtt_timestamp_is_carried_under_the_same_correction() {
+        let with_gbtt = r#"[{"header":{"msg_type":"0003"},"body":{
+            "train_id":"221832406","event_type":"DEPARTURE",
+            "gbtt_timestamp":"1787945460000",
+            "planned_timestamp":"1787945520000","actual_timestamp":"1787945520000",
+            "loc_stanox":"87212","variation_status":"ON TIME"
+        }}]"#;
+        let mut feed = FakeMovementFeed::new(vec![vec![with_gbtt.to_string()]]);
+        let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
+        let mut state = ProcessorState::default();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].planned_timestamp,
+            Some("2026-08-28T18:32:00Z".parse().unwrap())
+        );
+        assert_eq!(
+            events[0].gbtt_timestamp,
+            Some("2026-08-28T18:31:00Z".parse().unwrap())
+        );
+
+        let mut feed = FakeMovementFeed::new(vec![vec![
+            ORIGIN_DEPARTURE.replace(r#""train_id""#, r#""gbtt_timestamp":"","train_id""#),
+        ]]);
+        let mut state = ProcessorState::default();
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(events[0].gbtt_timestamp, None);
     }
 
     #[tokio::test]
@@ -3946,6 +4013,7 @@ mod tests {
                 loc_stanox: None,
                 loc_crs: None,
                 planned_timestamp: None,
+                gbtt_timestamp: None,
                 actual_timestamp: None,
                 variation_status: None,
                 raw_body: serde_json::json!({}),
@@ -3968,6 +4036,7 @@ mod tests {
                 loc_stanox: None,
                 loc_crs: None,
                 planned_timestamp: None,
+                gbtt_timestamp: None,
                 actual_timestamp: None,
                 variation_status: None,
                 raw_body: serde_json::json!({}),
@@ -4350,6 +4419,7 @@ mod tests {
                 loc_stanox: None,
                 loc_crs: None,
                 planned_timestamp: None,
+                gbtt_timestamp: None,
                 actual_timestamp: None,
                 variation_status: None,
                 raw_body: serde_json::json!({}),
