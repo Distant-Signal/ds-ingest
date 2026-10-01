@@ -1014,10 +1014,11 @@ fn msg_type_label(message: &TrustMessage) -> &'static str {
 ///
 /// Two accepted dates, not one:
 ///
-/// - `service_date == activation_rail_day` is the ordinary case, accepted
-///   unconditionally: a CIF `train_uid` runs at most once per rail day, so
-///   agreement on the day alone already identifies the one running it can
-///   mean.
+/// - `service_date == activation_rail_day` is the ordinary case. It used to
+///   be accepted unconditionally, but `service_date` is a calendar date and
+///   a 00:15 departure dated D runs in rail day D-1, so the date alone can
+///   name LAST night's running. When `pin_scheduled_departure` is known it
+///   must now fall in the Activation's rail day here too (see the body).
 /// - `service_date == activation_rail_day + 1 day` is the legitimate
 ///   post-midnight case, and it is not an edge case worth losing. A rail day
 ///   runs 02:00 to 02:00 Europe/London, so a service departing at (say)
@@ -1057,18 +1058,31 @@ fn activation_is_for_service_date(
     pin_scheduled_departure: Option<chrono::DateTime<chrono::Utc>>,
     activation_rail_day: NaiveDate,
 ) -> bool {
-    if service_date == activation_rail_day {
-        return true;
-    }
-    if service_date != activation_rail_day + chrono::Duration::days(1) {
+    let same_date = service_date == activation_rail_day;
+    let next_date = service_date == activation_rail_day + chrono::Duration::days(1);
+    if !same_date && !next_date {
         return false;
     }
-    // D+1 only: confirm it's a genuine post-midnight departure (same rail
-    // day as the Activation) rather than an arbitrary tomorrow-daytime
-    // running of the same uid.
     match pin_scheduled_departure {
+        // A known departure decides on its own, in BOTH branches: it must
+        // fall in the Activation's rail day. For D+1 that separates a real
+        // post-midnight departure from tomorrow's daytime running (H3). For
+        // the same date it separates tonight's running from LAST night's
+        // post-midnight one: service_date D at 00:15 is rail day D-1, so a
+        // subscription for it that never reached `completed` (no
+        // destination_crs, say) would otherwise be claimed by rail day D's
+        // Activation of the same uid (the H3 residual, 2026-10-01).
         Some(departure) => common::rail_day::current_rail_day(departure) == activation_rail_day,
-        None => false,
+        // No departure, no timing to check. The same date is still
+        // accepted: an unpinned subscription has no pin for the CRS+time
+        // claim either, so rejecting it here would leave it with no route
+        // to resolution at all, and the date match alone is right for
+        // every daytime departure. The one shape it can get wrong (an
+        // unpinned post-midnight subscription left active from the night
+        // before) needs a subscription that is both unpinned and stale,
+        // which `list_active_tracked_trains`' date window keeps small. D+1
+        // stays rejected, as before.
+        None => same_date,
     }
 }
 
@@ -1620,17 +1634,20 @@ fn process_message(
             let derived = trust_schema::journey::apply_reinstatement(&previous);
             state.set_last_derived(&reinstatement.train_id, derived.clone());
 
-            // No timestamp of any kind in this minimal, confirmed-by-name-
-            // only shape (see `schema::Reinstatement`'s own doc comment), so
-            // the key is just `(train_id, "0005", rail_day)` -- same
-            // no-extra-distinguishing-field shape as `0001`/`0006`/`0007`
-            // already have, per `dedup_key`'s own doc comment.
+            // `reinstatement_timestamp` fills the key's timestamp slot, as
+            // `canx_timestamp` does for a Cancellation: without it, cancel ->
+            // reinstate -> cancel -> reinstate on one day keyed both
+            // reinstatements identically, and `trust_event_backlog`'s global
+            // `ON CONFLICT (dedup_key) DO NOTHING` kept only the first, so a
+            // backlog replay ended "cancelled" (H4 residual, 2026-10-01). A
+            // redelivery carries the same value and still keys the same.
+            // `trust-backlog-consumer` builds the identical key.
             let dedup = trust_schema::dedup::dedup_key(
                 &reinstatement.train_id,
                 "0005",
                 None,
                 None,
-                None,
+                reinstatement.reinstatement_timestamp.as_deref(),
                 // PL-3: the message's own date, so a redelivery across
                 // 02:00 or trust-backlog-consumer's copy keys the same.
                 trust_schema::dedup::event_date(
@@ -1638,6 +1655,25 @@ fn process_message(
                     common::rail_day::current_rail_day(received_at),
                 ),
             );
+
+            // When the reinstatement happened, guarded and corrected exactly
+            // like a Cancellation's `canx_timestamp`, and carried the same
+            // way (in `actual_timestamp`), so a stale redelivered
+            // Cancellation older than this can no longer re-cancel the
+            // train through `upsert_train_movement`'s event-time guard.
+            let reinstated_pair = common::trust_timestamp::parse_trust_epoch_millis_pair(
+                None,
+                reinstatement.reinstatement_timestamp.as_deref(),
+                received_at,
+                state.trust_timestamp_correction_enabled,
+            );
+            if let Some(was_corrected) = reinstated_pair.was_corrected {
+                metrics::counter!(
+                    common::metrics::metric_name("trust_consumer_timestamp_correction_total"),
+                    "outcome" => if was_corrected { "corrected" } else { "raw" }
+                )
+                .increment(1);
+            }
 
             tracked_train_ids
                 .into_iter()
@@ -1652,7 +1688,7 @@ fn process_message(
                     loc_stanox: None,
                     loc_crs: None,
                     planned_timestamp: None,
-                    actual_timestamp: None,
+                    actual_timestamp: reinstated_pair.actual,
                     variation_status: None,
                     raw_body: serde_json::json!({}),
                     status: derived.status.clone(),
@@ -1945,6 +1981,7 @@ mod tests {
             train_id: "221832406".to_string(),
             // 2026-09-27 01:59:30, raw TRUST epoch millis.
             dep_timestamp: Some("1790474370000".to_string()),
+            reinstatement_timestamp: None,
         });
         let reference = reference_with_one_pending(1, "WAT", "2026-09-27T01:00:00Z");
         let mut state = ProcessorState::default();
@@ -1975,6 +2012,57 @@ mod tests {
                 "2026-09-27".parse().unwrap()
             )
         );
+    }
+
+    /// H4 residual (2026-10-01): two reinstatements of one train on one day
+    /// key apart by `reinstatement_timestamp` (the planned `dep_timestamp`
+    /// repeats), with the same key `trust-backlog-consumer` builds, and the
+    /// reinstatement time travels as the event's `actual_timestamp`.
+    #[test]
+    fn repeat_reinstatements_on_one_day_key_apart() {
+        let reinstatement = |at: &str| {
+            TrustMessage::Reinstatement(trust_schema::schema::Reinstatement {
+                train_id: "221832406".to_string(),
+                dep_timestamp: Some("1790836380000".to_string()),
+                reinstatement_timestamp: Some(at.to_string()),
+            })
+        };
+        let reference = reference_with_one_pending(1, "WAT", "2026-09-27T01:00:00Z");
+        let mut state = ProcessorState::default();
+        state.resolved.insert("221832406".to_string(), vec![1]);
+        let received_at: chrono::DateTime<chrono::Utc> = "2026-10-01T09:00:00Z".parse().unwrap();
+        let mut event_for = |message: &TrustMessage| {
+            let mut events = process_message(
+                message,
+                &reference,
+                &mut state,
+                &TEST_STANOX_CRS,
+                received_at,
+            );
+            assert_eq!(events.len(), 1);
+            events.remove(0)
+        };
+        let first = event_for(&reinstatement("1790819000000"));
+        let second = event_for(&reinstatement("1790821000000"));
+        assert_ne!(first.dedup_key, second.dedup_key);
+        assert_eq!(
+            second.dedup_key,
+            event_for(&reinstatement("1790821000000")).dedup_key,
+            "a redelivery keys the same"
+        );
+        assert_eq!(
+            first.dedup_key,
+            trust_schema::dedup::dedup_key(
+                "221832406",
+                "0005",
+                None,
+                None,
+                Some("1790819000000"),
+                "2026-10-01".parse().unwrap()
+            )
+        );
+        assert!(first.actual_timestamp.is_some());
+        assert!(first.actual_timestamp < second.actual_timestamp);
     }
 
     fn reference_with_one_pending(id: i64, crs: &str, scheduled: &str) -> Reference {
@@ -4530,5 +4618,127 @@ mod tests {
             "and must still be reachable by the Activation direct match, with its own \
              pin_scheduled_departure carried through too (finding H3)"
         );
+    }
+}
+
+/// Direct tests of `activation_is_for_service_date`'s date-and-timing rule,
+/// including both 2026 Europe/London DST change days (the 02:00 rail-day
+/// cutoff is 01:00Z on the spring day and 02:00Z, after the repeated hour,
+/// on the autumn one).
+#[cfg(test)]
+mod activation_date_tests {
+    use super::activation_is_for_service_date;
+    use chrono::{DateTime, NaiveDate, Utc};
+
+    fn instant(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    fn accepts(service_date: &str, departure: Option<&str>, activation_received_at: &str) -> bool {
+        activation_is_for_service_date(
+            service_date.parse::<NaiveDate>().unwrap(),
+            departure.map(instant),
+            common::rail_day::current_rail_day(instant(activation_received_at)),
+        )
+    }
+
+    /// The residual of finding H3: last night's post-midnight running
+    /// (service_date 08-29, 00:15 BST, so rail day 08-28) is still active
+    /// -- it never reached `completed` -- when TONIGHT's Activation (rail
+    /// day 08-29) arrives. Same calendar date, wrong running.
+    #[test]
+    fn last_nights_post_midnight_subscription_is_not_claimed_by_tonights_activation() {
+        assert!(!accepts(
+            "2026-08-29",
+            Some("2026-08-28T23:15:00Z"),
+            "2026-08-29T23:30:00Z"
+        ));
+        // ...but its own Activation, the evening before, still claims it.
+        assert!(accepts(
+            "2026-08-29",
+            Some("2026-08-28T23:15:00Z"),
+            "2026-08-28T21:00:00Z"
+        ));
+    }
+
+    #[test]
+    fn an_ordinary_same_day_departure_is_accepted() {
+        assert!(accepts(
+            "2026-08-29",
+            Some("2026-08-29T16:30:00Z"),
+            "2026-08-29T05:00:00Z"
+        ));
+    }
+
+    /// No pin means no timing to check: the date alone decides, and only
+    /// the same-date case passes.
+    #[test]
+    fn without_a_pinned_departure_only_the_same_date_is_accepted() {
+        assert!(accepts("2026-08-29", None, "2026-08-29T05:00:00Z"));
+        assert!(!accepts("2026-08-30", None, "2026-08-29T05:00:00Z"));
+        assert!(!accepts("2026-08-28", None, "2026-08-29T05:00:00Z"));
+    }
+
+    /// Spring change, 2026-03-29: clocks jump 01:00 GMT -> 02:00 BST, so
+    /// the rail-day cutoff falls at 01:00Z.
+    #[test]
+    fn spring_dst_day() {
+        // 00:30 GMT departure, dated 03-29, is still rail day 03-28.
+        assert!(accepts(
+            "2026-03-29",
+            Some("2026-03-29T00:30:00Z"),
+            "2026-03-28T22:00:00Z"
+        ));
+        // The next evening's Activation (00:00 BST 03-30 = rail day 03-29)
+        // must not take it.
+        assert!(!accepts(
+            "2026-03-29",
+            Some("2026-03-29T00:30:00Z"),
+            "2026-03-29T23:00:00Z"
+        ));
+        // 02:30 BST (01:30Z) is rail day 03-29; an Activation at 02:05 BST
+        // (01:05Z) is already rail day 03-29 too.
+        assert!(accepts(
+            "2026-03-29",
+            Some("2026-03-29T01:30:00Z"),
+            "2026-03-29T01:05:00Z"
+        ));
+        // ...whereas 00:55Z (00:55 GMT) is still rail day 03-28.
+        assert!(!accepts(
+            "2026-03-29",
+            Some("2026-03-29T01:30:00Z"),
+            "2026-03-29T00:55:00Z"
+        ));
+    }
+
+    /// Autumn change, 2026-10-25: 01:00-02:00 local happens twice (BST
+    /// 00:00-01:00Z, then GMT 01:00-02:00Z); the cutoff is 02:00 GMT = 02:00Z.
+    #[test]
+    fn autumn_dst_day() {
+        // Both readings of 01:30 local (00:30Z BST, 01:30Z GMT) are rail
+        // day 10-24.
+        for departure in ["2026-10-25T00:30:00Z", "2026-10-25T01:30:00Z"] {
+            assert!(accepts(
+                "2026-10-25",
+                Some(departure),
+                "2026-10-24T20:00:00Z"
+            ));
+            assert!(!accepts(
+                "2026-10-25",
+                Some(departure),
+                "2026-10-25T22:00:00Z"
+            ));
+        }
+        // 02:30 GMT is rail day 10-25; 01:59Z (01:59 GMT) is still 10-24.
+        assert!(accepts(
+            "2026-10-25",
+            Some("2026-10-25T02:30:00Z"),
+            "2026-10-25T02:05:00Z"
+        ));
+        assert!(!accepts(
+            "2026-10-25",
+            Some("2026-10-25T02:30:00Z"),
+            "2026-10-25T01:59:00Z"
+        ));
     }
 }

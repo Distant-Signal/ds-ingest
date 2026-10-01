@@ -343,7 +343,14 @@ pub fn process_message(
                 .increment(1);
             }
             let delay_minutes = match (planned, actual, movement.variation_status.as_deref()) {
-                (Some(p), Some(a), Some("LATE")) => Some((a - p).num_minutes() as i32),
+                // Guarded like every other TRUST delay (M11 sibling,
+                // 2026-10-01). Nothing reads `trust_event_backlog.delay_minutes`
+                // today -- both replay paths recompute from the stored
+                // timestamps -- but a corrupt pair must not store a delay of
+                // thousands of minutes (or wrap the `i32`).
+                (Some(p), Some(a), Some("LATE")) => {
+                    common::trust_timestamp::plausible_delay_minutes(a, p)
+                }
                 _ => None,
             };
 
@@ -555,14 +562,37 @@ pub fn process_message(
                         .unwrap_or(today)
                 });
 
+            // `reinstatement_timestamp` in the key's timestamp slot, so a
+            // second reinstatement of the same train on the same day is a
+            // new row rather than a "duplicate" of the first (H4 residual,
+            // 2026-10-01). The same key `trust-consumer` builds.
             let dedup = trust_schema::dedup::dedup_key(
                 &reinstatement.train_id,
                 "0005",
                 None,
                 None,
-                None,
+                reinstatement.reinstatement_timestamp.as_deref(),
                 event_date,
             );
+
+            // Stored in `actual_timestamp`, as a Cancellation's
+            // `canx_timestamp` is, so a backlog replay can tell the rows
+            // apart and key them apart too.
+            let reinstated_pair = common::trust_timestamp::parse_trust_epoch_millis_pair(
+                None,
+                reinstatement.reinstatement_timestamp.as_deref(),
+                received_at,
+                state.trust_timestamp_correction_enabled,
+            );
+            if let Some(was_corrected) = reinstated_pair.was_corrected {
+                metrics::counter!(
+                    common::metrics::metric_name(
+                        "trust_backlog_consumer_timestamp_correction_total"
+                    ),
+                    "outcome" => if was_corrected { "corrected" } else { "raw" }
+                )
+                .increment(1);
+            }
 
             Some(common::TrustBacklogEventMessage {
                 crs: None,
@@ -575,7 +605,7 @@ pub fn process_message(
                 msg_type: "0005".to_string(),
                 event_type: None,
                 planned_timestamp: None,
-                actual_timestamp: None,
+                actual_timestamp: reinstated_pair.actual,
                 variation_status: None,
                 delay_minutes: None,
                 dedup_key: dedup,
@@ -1378,6 +1408,7 @@ mod tests {
             train_id: "221832406".to_string(),
             // 2026-09-27 01:59:30, raw TRUST epoch millis.
             dep_timestamp: Some("1790474370000".to_string()),
+            reinstatement_timestamp: None,
         });
         let mut state = ProcessorState::default();
         let mut key_on = |day: &str| {
@@ -1514,6 +1545,90 @@ mod tests {
         );
     }
 
+    /// M11 sibling (2026-10-01): the `delay_minutes` written into
+    /// `trust_event_backlog` goes through the same plausibility guard as
+    /// every other TRUST delay. Nothing reads that column today (both
+    /// replay paths recompute the delay from the stored timestamps), but a
+    /// corrupt pair should not store a delay of thousands of minutes.
+    #[test]
+    fn an_implausible_movement_delay_is_not_stored() {
+        let mut corrupt = movement("221832406", "ARRIVAL", Some("87212"), Some("LATE"));
+        // Three days after the planned 2026-08-28T18:32:00Z.
+        corrupt.actual_timestamp = Some("1788201120000".to_string());
+        let mut late = movement("221832406", "DEPARTURE", Some("87212"), Some("LATE"));
+        late.actual_timestamp = Some("1787942220000".to_string());
+        let mut state = ProcessorState::default();
+        let mut delay_of = |movement: trust_schema::schema::Movement| {
+            process_message(
+                &TrustMessage::Movement(movement),
+                &mut state,
+                &stanox_table(),
+                &crs_index_with(&["WAT"]),
+                today(),
+                test_received_at(),
+            )
+            .unwrap()
+            .delay_minutes
+        };
+        assert_eq!(delay_of(corrupt), None);
+        assert_eq!(delay_of(late), Some(5));
+    }
+
+    /// H4 residual (2026-10-01): cancel -> reinstate -> cancel -> reinstate
+    /// on one day must give four distinct backlog keys. The two
+    /// reinstatements used to share `(train_id, "0005", event_date)`, so
+    /// `trust_event_backlog`'s global unique `dedup_key` kept only the
+    /// first and a replay ended "cancelled". Taken from the live shape:
+    /// `dep_timestamp` (the planned departure) repeats, and only
+    /// `reinstatement_timestamp` differs. A redelivery still keys the same,
+    /// and the reinstatement time is stored in `actual_timestamp`.
+    #[test]
+    fn repeat_reinstatements_on_one_day_get_distinct_dedup_keys() {
+        let cancellation = |canx: &str| {
+            TrustMessage::Cancellation(trust_schema::schema::Cancellation {
+                train_id: "221832406".to_string(),
+                canx_timestamp: Some(canx.to_string()),
+                canx_reason_code: None,
+                canx_type: None,
+                dep_timestamp: Some("1790836380000".to_string()),
+                loc_stanox: None,
+            })
+        };
+        let reinstatement = |at: &str| {
+            TrustMessage::Reinstatement(trust_schema::schema::Reinstatement {
+                train_id: "221832406".to_string(),
+                dep_timestamp: Some("1790836380000".to_string()),
+                reinstatement_timestamp: Some(at.to_string()),
+            })
+        };
+        let sequence = [
+            cancellation("1790818000000"),
+            reinstatement("1790819000000"),
+            cancellation("1790820000000"),
+            reinstatement("1790821000000"),
+        ];
+        let mut state = ProcessorState::default();
+        let mut run = |message: &TrustMessage| {
+            process_message(
+                message,
+                &mut state,
+                &stanox_table(),
+                &crs_index_with(&["WAT"]),
+                today(),
+                test_received_at(),
+            )
+            .unwrap()
+        };
+        let rows: Vec<_> = sequence.iter().map(&mut run).collect();
+        let keys: std::collections::HashSet<_> = rows.iter().map(|row| &row.dedup_key).collect();
+        assert_eq!(keys.len(), 4, "every event in the sequence is its own row");
+        assert!(rows[1].actual_timestamp.is_some());
+        assert!(rows[1].actual_timestamp < rows[3].actual_timestamp);
+
+        let redelivered = run(&sequence[3]);
+        assert_eq!(redelivered.dedup_key, rows[3].dedup_key);
+    }
+
     /// The Reinstatement-arm twin of the Cancellation tests above: `0005`
     /// is now recorded into the backlog rather than silently dropped
     /// upstream (the H4 finding, 2026-09-26 review).
@@ -1522,6 +1637,7 @@ mod tests {
         let reinstatement = TrustMessage::Reinstatement(trust_schema::schema::Reinstatement {
             train_id: "221832406".to_string(),
             dep_timestamp: None,
+            reinstatement_timestamp: None,
         });
         let mut state = ProcessorState::default();
         let result = process_message(
@@ -1552,6 +1668,7 @@ mod tests {
         let reinstatement = TrustMessage::Reinstatement(trust_schema::schema::Reinstatement {
             train_id: "999999999".to_string(),
             dep_timestamp: Some("1788568200000".to_string()),
+            reinstatement_timestamp: None,
         });
         let mut state = ProcessorState::default();
         let result = process_message(
@@ -1579,6 +1696,7 @@ mod tests {
         let reinstatement = TrustMessage::Reinstatement(trust_schema::schema::Reinstatement {
             train_id: "999999999".to_string(),
             dep_timestamp: Some("1788568200000".to_string()),
+            reinstatement_timestamp: None,
         });
         let result = process_message(
             &reinstatement,
