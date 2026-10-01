@@ -19,9 +19,12 @@ correctly. It starts in three steps:
 1. **Load the stanox/crs crosswalk.** A failed load is retried from 1 s,
    doubling up to 30 s. The shadow line set is derived from the crosswalk.
 2. **Wait for the first population load.** The population is loaded in a
-   background task. A failed cycle is retried from 1 s, doubling up to
-   `failed_reload_retry_delay(POPULATION_RELOAD_SECS)` (15 s at the default
-   300 s). Consumption starts only after a cycle in which every line's
+   background task. A failed cycle is retried from 1 s, doubling up to 60 s,
+   with jitter. A cycle whose first three fetches all fail (`api` is down)
+   stops there and keeps every previous snapshot, and each cycle starts one
+   line further along the list. (On 2026-10-01, with `api` answering 5xx
+   for six hours, every cycle made all ~486 requests and was retried within
+   15 s: about 24 requests a second.) Consumption starts only after a cycle in which every line's
    population for the current rail day loaded. If `api` refuses every request,
    the consumer waits indefinitely.
    - If some lines still fail after `POPULATION_INITIAL_WAIT_SECS` (default

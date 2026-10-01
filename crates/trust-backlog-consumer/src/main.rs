@@ -28,6 +28,13 @@ use movement_feed::MovementFeed;
 use movement_feed::redis_stream::RedisStreamMovementFeed;
 use movement_feed::{DeadLetter, DeadLetterSink};
 
+/// Every `trust_backlog_consumer_errors_total` operation that is a failed
+/// call to api (not a data rejection, which is `post_rejected`), registered
+/// at 0 and summed by the chart's DistantSignalConsumerApiCallsFailing alert
+/// (2026-10-01: ~2,200 failed backlog POSTs raised nothing). The chart's
+/// template lists the same operations; a test below keeps the two in step.
+const API_CALL_OPERATIONS: &[&str] = &["post_batch", "post_train_reasons", "reload_stanox_crs"];
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     common::logging::exit_code(run().await)
@@ -57,6 +64,10 @@ async fn run() -> anyhow::Result<()> {
         )
         .increment(0);
     }
+    common::metrics::register_operation_counters(
+        "trust_backlog_consumer_errors_total",
+        API_CALL_OPERATIONS,
+    );
     let (connection_state, progress) = health_http::spawn_with_progress(
         config.health_bind_url.clone(),
         "connected",
@@ -491,6 +502,25 @@ fn current_rail_day(at: chrono::DateTime<chrono::Utc>) -> chrono::NaiveDate {
 #[cfg(test)]
 mod rail_day_tests {
     use super::*;
+
+    /// The chart's DistantSignalConsumerApiCallsFailing sums exactly
+    /// [`API_CALL_OPERATIONS`] for this consumer.
+    #[test]
+    fn the_chart_alerts_on_every_api_call_operation() {
+        let template = std::fs::read_to_string(
+            common::manifest_dir!()
+                .join("../../charts/distant-signal/templates/prometheusrule.yaml"),
+        )
+        .unwrap();
+        let entry = format!(
+            r#"(list "trust_backlog_consumer" "trust-backlog-consumer" "{}")"#,
+            API_CALL_OPERATIONS.join("|")
+        );
+        assert!(
+            template.contains(&entry),
+            "the chart template has no {entry}"
+        );
+    }
 
     #[test]
     fn well_after_the_0200_cutoff_is_that_calendar_days_rail_day() {

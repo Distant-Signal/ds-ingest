@@ -17,6 +17,17 @@
 //! anything is consumed (see [`wait_for_first_load`]), and a failed cycle
 //! is retried on a short, doubling backoff instead of the full interval --
 //! the same idea as the stanox/crs reload's `failed_reload_retry_delay`.
+//!
+//! **Why a cycle stops early, and why the backoff is jittered up to 60s**
+//! (2026-10-01 outage): with api answering 5xx for six hours, every cycle
+//! still made all ~486 `(line, date)` requests back to back, and failed
+//! cycles were retried within 15s, so this one consumer sent api about
+//! 24 requests a second (~516k 5xx). Now a cycle in which the first
+//! [`ABORT_AFTER_FAILURES`] fetches all fail (nothing succeeded yet: api is
+//! down, not one line) stops there and keeps every previous snapshot, and
+//! consecutive failed cycles wait [`RETRY_BACKOFF`] (1s doubling to 60s,
+//! with jitter). Each cycle starts one line further along the list, so a
+//! few lines that always fail cannot stop the rest from ever loading.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,6 +37,15 @@ use arc_swap::ArcSwap;
 
 use crate::population::{LineGeometry, Population};
 use crate::queries;
+
+/// A cycle stops fetching once this many fetches in a row have failed with
+/// none succeeding before them (see the module docs).
+pub const ABORT_AFTER_FAILURES: usize = 3;
+
+/// The wait after each consecutive failed cycle: 1s, doubling, capped at
+/// 60s, jittered (see [`common::backoff`]).
+pub const RETRY_BACKOFF: common::backoff::Backoff =
+    common::backoff::Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
 
 /// The current population snapshot, swapped whole by the reloader.
 pub type SharedPopulation = Arc<ArcSwap<Population>>;
@@ -68,7 +88,9 @@ impl CycleOutcome {
 /// Best-effort per `(line, date)`: a failure keeps that key's previous
 /// snapshot and is reported in [`CycleOutcome::failed`]; it never blocks
 /// any other line. Every date older than `service_date` is dropped (only
-/// today's and tomorrow's are ever read).
+/// today's and tomorrow's are ever read). The reloader itself calls
+/// [`reload_cycle_from`], which also rotates the starting line.
+#[cfg(test)]
 pub async fn reload_cycle(
     client: &reqwest::Client,
     url: &str,
@@ -78,11 +100,62 @@ pub async fn reload_cycle(
     previous: &Population,
     service_date: chrono::NaiveDate,
 ) -> (Population, CycleOutcome) {
+    reload_cycle_from(
+        client,
+        url,
+        tokens,
+        line_ids,
+        geometry,
+        previous,
+        service_date,
+        0,
+    )
+    .await
+}
+
+/// [`reload_cycle`], starting at `line_ids[start % len]` and wrapping
+/// round. Stops fetching once [`ABORT_AFTER_FAILURES`] fetches in a row
+/// have failed with none succeeding before them; every key not fetched
+/// keeps its previous snapshot and is reported in [`CycleOutcome::failed`].
+#[allow(clippy::too_many_arguments)]
+pub async fn reload_cycle_from(
+    client: &reqwest::Client,
+    url: &str,
+    tokens: &common::oauth_client::OAuthTokenCache,
+    line_ids: &[String],
+    geometry: &HashMap<String, Arc<LineGeometry>>,
+    previous: &Population,
+    service_date: chrono::NaiveDate,
+    start: usize,
+) -> (Population, CycleOutcome) {
     let mut next = Population::default();
     let mut outcome = CycleOutcome::default();
     let dates = [service_date, service_date + chrono::Duration::days(1)];
-    for line_id in line_ids {
+    let start = if line_ids.is_empty() {
+        0
+    } else {
+        start % line_ids.len()
+    };
+    let mut failures_in_a_row = 0;
+    let mut aborted = false;
+    for line_id in line_ids[start..].iter().chain(&line_ids[..start]) {
         for &date in &dates {
+            if aborted {
+                next.carry_over(previous, line_id, date);
+                outcome.failed.push((line_id.clone(), date));
+                continue;
+            }
+            if outcome.succeeded == 0 && failures_in_a_row >= ABORT_AFTER_FAILURES {
+                tracing::warn!(
+                    failures = failures_in_a_row,
+                    "schedule population fetches keep failing with none succeeding; api looks down, so this cycle stops here and keeps every previous snapshot"
+                );
+                aborted = true;
+                next.carry_over(previous, line_id, date);
+                outcome.failed.push((line_id.clone(), date));
+                continue;
+            }
+            let failed_before = outcome.failed.len();
             // The ETag of what we already hold for this key, if `api` sent
             // one: an unchanged population then costs a bodyless 304
             // instead of a full re-download. See `Population::etags`.
@@ -155,6 +228,11 @@ pub async fn reload_cycle(
                     next.carry_over(previous, line_id, date);
                     outcome.failed.push((line_id.clone(), date));
                 }
+            }
+            if outcome.failed.len() > failed_before {
+                failures_in_a_row += 1;
+            } else {
+                failures_in_a_row = 0;
             }
         }
     }
@@ -248,10 +326,9 @@ pub struct Reloader {
     pub population: SharedPopulation,
     /// Wait after a cycle in which every fetch succeeded.
     pub interval: Duration,
-    /// First wait after a cycle with any failure; doubles per consecutive
-    /// failing cycle up to `max_retry`.
-    pub min_retry: Duration,
-    pub max_retry: Duration,
+    /// Wait after each consecutive cycle with any failure, by how many
+    /// failed in a row ([`RETRY_BACKOFF`] in production).
+    pub retry: common::backoff::Backoff,
     /// How long the FIRST load may keep failing for some lines (while
     /// others succeed) before consumption is let through anyway, with those
     /// lines marked partial. While EVERY fetch fails (`api` down) the first
@@ -275,14 +352,15 @@ impl Reloader {
     /// forever; those are reported in [`FirstLoad::missing_lines`]).
     async fn run(self, tx: tokio::sync::watch::Sender<Option<FirstLoad>>) {
         let started = tokio::time::Instant::now();
-        let mut retry = self.min_retry;
+        let mut failed_cycles: u32 = 0;
+        let mut cycles: usize = 0;
         loop {
             let service_date = crate::stats::current_rail_service_date(chrono::Utc::now());
             let line_ids = self.line_ids.load_full();
             let geometry = self.geometry.load_full();
             let previous = self.population.load_full();
             let cycle_start = std::time::Instant::now();
-            let (next, outcome) = reload_cycle(
+            let (next, outcome) = reload_cycle_from(
                 &self.client,
                 &self.url,
                 &self.tokens,
@@ -290,8 +368,10 @@ impl Reloader {
                 &geometry,
                 &previous,
                 service_date,
+                cycles,
             )
             .await;
+            cycles = cycles.wrapping_add(1);
             drop(previous);
             metrics::gauge!(common::metrics::metric_name(
                 "full_coverage_consumer_population_uids"
@@ -333,11 +413,11 @@ impl Reloader {
                     "full_coverage_consumer_population_last_success_timestamp_seconds"
                 ))
                 .set(chrono::Utc::now().timestamp() as f64);
-                retry = self.min_retry;
+                failed_cycles = 0;
                 self.interval
             } else {
-                let wait = retry;
-                retry = (retry * 2).min(self.max_retry);
+                let wait = self.retry.delay(failed_cycles);
+                failed_cycles = failed_cycles.saturating_add(1);
                 tracing::warn!(
                     failed = outcome.failed.len(),
                     succeeded = outcome.succeeded,
@@ -733,11 +813,165 @@ pub(crate) mod tests {
             geometry: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             population: Arc::clone(&population),
             interval: Duration::from_secs(3600),
-            min_retry: Duration::from_millis(20),
-            max_retry: Duration::from_millis(100),
+            retry: common::backoff::Backoff::new(
+                Duration::from_millis(20),
+                Duration::from_millis(100),
+            ),
             initial_wait: Duration::from_secs(3600),
         };
         (reloader, population)
+    }
+
+    fn lines(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("line-{i}")).collect()
+    }
+
+    /// 2026-10-01: with api down, every cycle still made all ~486 requests.
+    /// Now three failures with nothing succeeding stop the cycle; every key
+    /// keeps its previous snapshot and is reported failed.
+    #[tokio::test]
+    async fn a_cycle_stops_after_three_failures_while_api_is_down() {
+        let server = MockServer::start().await;
+        let tokens = mock_token_cache(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/private/schedule-line-population"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(ABORT_AFTER_FAILURES as u64)
+            .mount(&server)
+            .await;
+        let today: chrono::NaiveDate = "2026-10-01".parse().unwrap();
+        let mut previous = Population::default();
+        previous.insert_uids("line-4", today, ["C1".to_string()].into(), None);
+
+        let (next, outcome) = reload_cycle(
+            &reqwest::Client::new(),
+            &url(&server),
+            &tokens,
+            &lines(5),
+            &HashMap::new(),
+            &previous,
+            today,
+        )
+        .await;
+        server.verify().await;
+        assert_eq!(outcome.succeeded, 0);
+        assert_eq!(outcome.failed.len(), 10, "every key is reported failed");
+        assert_eq!(
+            next.uids_for("line-4", today),
+            vec!["C1"],
+            "and keeps its snapshot"
+        );
+    }
+
+    /// One line failing while api is up must not stop the others: once
+    /// anything has succeeded, the cycle fetches every key.
+    #[tokio::test]
+    async fn failures_after_a_success_do_not_stop_the_cycle() {
+        let server = MockServer::start().await;
+        let tokens = mock_token_cache(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/private/schedule-line-population"))
+            .and(wiremock::matchers::query_param("line_id", "line-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(BODY))
+            .with_priority(1)
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/private/schedule-line-population"))
+            .respond_with(ResponseTemplate::new(500))
+            .with_priority(2)
+            .expect(8)
+            .mount(&server)
+            .await;
+        let (_, outcome) = reload_cycle(
+            &reqwest::Client::new(),
+            &url(&server),
+            &tokens,
+            &lines(5),
+            &HashMap::new(),
+            &Population::default(),
+            "2026-10-01".parse().unwrap(),
+        )
+        .await;
+        server.verify().await;
+        assert_eq!(outcome.succeeded, 2);
+        assert_eq!(outcome.failed.len(), 8);
+    }
+
+    /// Each cycle starts one line further along, so lines that always fail
+    /// at the front of the list cannot starve the rest.
+    #[tokio::test]
+    async fn a_rotated_cycle_reaches_lines_behind_failing_ones() {
+        let server = MockServer::start().await;
+        let tokens = mock_token_cache(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/private/schedule-line-population"))
+            .and(wiremock::matchers::query_param("line_id", "line-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(BODY))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/private/schedule-line-population"))
+            .respond_with(ResponseTemplate::new(500))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let today: chrono::NaiveDate = "2026-10-01".parse().unwrap();
+        let fetch = |start| {
+            let (server, tokens) = (&server, &tokens);
+            async move {
+                reload_cycle_from(
+                    &reqwest::Client::new(),
+                    &url(server),
+                    tokens,
+                    &lines(3),
+                    &HashMap::new(),
+                    &Population::default(),
+                    today,
+                    start,
+                )
+                .await
+            }
+        };
+        let (_, from_0) = fetch(0).await;
+        assert_eq!(
+            from_0.succeeded, 0,
+            "line-0 and line-1 fail first, so line-2 is never tried"
+        );
+        let (next, from_2) = fetch(2).await;
+        assert_eq!(from_2.succeeded, 2);
+        assert_eq!(next.uids_for("line-2", today), vec!["C11052"]);
+    }
+
+    /// Consecutive failed cycles back off: with api down, a 100ms backoff
+    /// doubling (jittered down to half at most) allows at most 5 cycles in
+    /// the first second -- 2 requests each for one line -- where a fixed
+    /// 100ms retry would make about 10.
+    #[tokio::test]
+    async fn consecutive_failed_cycles_back_off() {
+        let server = MockServer::start().await;
+        let tokens = mock_token_cache(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/private/schedule-line-population"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let (mut reloader, _) = reloader(&server, tokens, &["waterloo-reading"]);
+        reloader.retry =
+            common::backoff::Backoff::new(Duration::from_millis(100), Duration::from_secs(60));
+        let _rx = reloader.spawn();
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let gets = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "GET")
+            .count();
+        assert!(gets >= 4, "it keeps retrying: {gets} GETs");
+        assert!(gets <= 12, "but backs off: {gets} GETs in 1s");
     }
 
     /// `api` refusing (here: 503) at startup must not cost a full reload

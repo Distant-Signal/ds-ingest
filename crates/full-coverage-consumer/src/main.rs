@@ -192,8 +192,7 @@ async fn run() -> anyhow::Result<()> {
         geometry: Arc::clone(&geometry),
         population: Arc::clone(&population),
         interval: population_reload_interval,
-        min_retry: Duration::from_secs(1),
-        max_retry: failed_reload_retry_delay(population_reload_interval),
+        retry: population_reload::RETRY_BACKOFF,
         initial_wait: Duration::from_secs(config.population_initial_wait_secs),
     }
     .spawn();
@@ -345,6 +344,19 @@ async fn run() -> anyhow::Result<()> {
 /// 2026-09-27 review found `stream_gap_detected_total` had never existed in
 /// Prometheus at all, which is indistinguishable from the check never
 /// running).
+/// Every `full_coverage_consumer_errors_total` operation that is a failed
+/// call to api, registered at 0 and summed by the chart's
+/// DistantSignalConsumerApiCallsFailing alert (2026-10-01: ~516k failed
+/// population reloads raised nothing). `post_window_stats` is left out: it
+/// has its own alert (DistantSignalFullCoverageWindowPostErrors). The
+/// chart's template lists the same operations; a test keeps them in step.
+const API_CALL_OPERATIONS: &[&str] = &[
+    "reload_line_population_fetch",
+    "post_line_stats",
+    "post_station_samples",
+    "reload_stanox_crs",
+];
+
 fn init_metrics() {
     for counter in [
         "full_coverage_consumer_stream_gap_detected_total",
@@ -378,6 +390,11 @@ fn init_metrics() {
         "operation" => "post_window_stats"
     )
     .increment(0);
+    // DistantSignalConsumerApiCallsFailing.
+    common::metrics::register_operation_counters(
+        "full_coverage_consumer_errors_total",
+        API_CALL_OPERATIONS,
+    );
     // DistantSignalTrustEnvelopeParseDrops (R-097).
     for msg_type in trust_schema::schema::ENVELOPE_FAILURE_MSG_TYPES {
         metrics::counter!(
@@ -913,6 +930,25 @@ async fn post_windows(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    /// The chart's DistantSignalConsumerApiCallsFailing sums exactly
+    /// [`API_CALL_OPERATIONS`](super::API_CALL_OPERATIONS) for this consumer.
+    #[test]
+    fn the_chart_alerts_on_every_api_call_operation() {
+        let template = std::fs::read_to_string(
+            common::manifest_dir!()
+                .join("../../charts/distant-signal/templates/prometheusrule.yaml"),
+        )
+        .unwrap();
+        let entry = format!(
+            r#"(list "full_coverage_consumer" "full-coverage-consumer" "{}")"#,
+            super::API_CALL_OPERATIONS.join("|")
+        );
+        assert!(
+            template.contains(&entry),
+            "the chart template has no {entry}"
+        );
+    }
 
     use super::*;
     use crate::feed::FakeMovementFeed;
@@ -1693,8 +1729,10 @@ mod tests {
             geometry: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             population: Arc::clone(&population),
             interval: Duration::from_secs(300),
-            min_retry: Duration::from_millis(20),
-            max_retry: failed_reload_retry_delay(Duration::from_secs(300)),
+            retry: common::backoff::Backoff::new(
+                Duration::from_millis(20),
+                Duration::from_secs(60),
+            ),
             initial_wait: Duration::from_secs(600),
         }
         .spawn();
@@ -1771,8 +1809,7 @@ mod tests {
             geometry: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             population: Arc::clone(&population),
             interval: Duration::from_secs(300),
-            min_retry: Duration::from_secs(1),
-            max_retry: Duration::from_secs(15),
+            retry: population_reload::RETRY_BACKOFF,
             initial_wait: Duration::from_secs(600),
         }
         .spawn();
