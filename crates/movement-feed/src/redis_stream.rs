@@ -143,8 +143,8 @@ pub struct RedisStreamMovementFeed {
     pel_replay_cursor: Option<String>,
     /// `(id, payload)` of every entry returned by the most recent
     /// `next_batch` call, held until `commit` XACKs them, `reject_batch`
-    /// acts on them, or they're replaced by the next call -- same
-    /// receive/confirm split `KafkaMovementFeed::last_received` already
+    /// acts on them, or they're replaced by the next call -- the
+    /// receive/confirm split the removed Kafka backend's `last_received`
     /// established, generalized to a `Vec` since one Redis Streams read
     /// can return more than one entry per call. The payload is kept so a
     /// rejected entry can be dead-lettered intact.
@@ -308,6 +308,12 @@ impl RedisStreamMovementFeed {
         .increment(0);
         metrics::counter!(
             common::metrics::metric_name(GROUP_RECREATED_METRIC),
+            "group" => group.clone()
+        )
+        .increment(0);
+        // ...and the long-pending counter, for DistantSignalMovementFeedLongPending.
+        metrics::counter!(
+            common::metrics::metric_name("movement_feed_long_pending_total"),
             "group" => group.clone()
         )
         .increment(0);

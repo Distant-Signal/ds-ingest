@@ -2,13 +2,11 @@
 //! loops (`crates/trust-consumer`, `crates/full-coverage-consumer`, and
 //! `crates/trust-backlog-consumer`) and their transport.
 //! Historically each crate hand-duplicated this trait plus its own Kafka
-//! implementation (`crates/trust-consumer/src/feed/{mod,kafka}.rs`,
-//! `crates/full-coverage-consumer/src/feed/{mod,kafka}.rs`) -- that
-//! duplication was justified while each crate's transport was genuinely
-//! per-consumer (a different Kafka `group.id` each). It stopped being
-//! justified once both became structurally identical Redis Streams
-//! readers of the same `movement-events` stream, differing only in which
-//! named consumer group they read as -- see
+//! implementation (`feed/{mod,kafka}.rs` in trust-consumer and
+//! full-coverage-consumer). That stopped being justified once both became
+//! structurally identical Redis Streams readers of the same
+//! `movement-events` stream, differing only in which named consumer group
+//! they read as, and Deploy C (PL-15a) then deleted the Kafka copies -- see
 //! docs/superpowers/specs/2026-09-04-movement-relay-design.md Decision 3
 //! and docs/superpowers/plans/2026-09-04-movement-relay-plan.md Task 2.
 //!
@@ -60,8 +58,7 @@ pub trait MovementFeed: Send {
     /// The Redis implementation dead-letters a rejected single entry and
     /// narrows a rejected multi-entry batch down one entry at a time -- see
     /// `redis_stream::RedisStreamMovementFeed::reject_batch`. The default
-    /// (the legacy Kafka backend) does nothing, leaving the batch
-    /// uncommitted exactly as before. `Err` means nothing was dead-lettered
+    /// does nothing, leaving the batch uncommitted. `Err` means nothing was dead-lettered
     /// or ACKed.
     async fn reject_batch(&mut self, _detail: &str) -> anyhow::Result<()> {
         Ok(())
@@ -98,7 +95,7 @@ pub struct DeadLetter {
 
 /// Where a consumer sends [`DeadLetter`]s. Implemented by
 /// `RedisStreamMovementFeed` (a small capped Redis stream), by
-/// [`ActiveFeed`] (which delegates, or only logs under Kafka), and by
+/// [`ActiveFeed`] (which delegates), and by
 /// [`FakeMovementFeed`] (which records them for tests).
 #[async_trait]
 pub trait DeadLetterSink: Send {

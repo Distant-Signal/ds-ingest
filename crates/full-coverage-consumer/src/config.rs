@@ -8,23 +8,14 @@ use common::config::{LineCatalogue, parse_lines};
 pub use movement_feed::MovementFeedBackend;
 
 /// CLI/env configuration for the `full-coverage-consumer` service -- a
-/// second, independent Kafka consumer against the same RDM Train
-/// Movements feed `trust-consumer` reads, correlating every event against
+/// second, independent consumer of the same `movement-events` Redis stream
+/// (movement-relay's copy of the RDM Train Movements feed) `trust-consumer`
+/// reads, correlating every event against
 /// the FULL scheduled population of every shadow-computed line. See
 /// docs/superpowers/specs/2026-09-04-option-b-live-consumer-design.md and
 /// docs/superpowers/plans/2026-09-04-option-b-live-consumer-plan.md Task 8.
 #[derive(Debug, Parser)]
 pub struct Config {
-    // Kafka: brokers/topic/consumer-group/sasl -- REUSES trustConsumer's
-    // broker/topic/mechanism values at the Helm layer (Task 15), but
-    // still has its own consumer_group default and its own env var
-    // names at the crate/binary layer, per Decision 1's "connection vs.
-    // group membership" reasoning.
-    #[command(flatten)]
-    pub kafka: common::service_args::KafkaConnectionArgs,
-    #[arg(long, env, default_value = "distant-signal-full-coverage-consumer")]
-    pub kafka_consumer_group: String,
-
     // api endpoints
     #[arg(
         long,
@@ -109,16 +100,14 @@ pub struct Config {
     #[command(flatten)]
     pub metrics: common::service_args::MetricsArgs,
 
-    /// Which transport this crate's `MovementFeed` uses. Defaults to
-    /// `redis-stream`, what production has run since Deploy B (PL-15a of
-    /// the 2026-09-27 pipelines review); `kafka` is only used when asked
-    /// for by name. See `trust-consumer/src/config.rs`'s identical field.
-    #[arg(long, env, value_enum, default_value_t = MovementFeedBackend::RedisStream)]
+    /// Which transport this crate's `MovementFeed` uses. Only
+    /// `redis-stream` remains; `kafka` was removed in Deploy C (PL-15a) and
+    /// now fails startup. See `trust-consumer/src/config.rs`'s identical
+    /// field.
+    #[arg(long, env, default_value_t = MovementFeedBackend::RedisStream)]
     pub movement_feed_backend: MovementFeedBackend,
 
-    /// Only read when `movement_feed_backend = redis-stream`. See
-    /// `trust-consumer/src/config.rs`'s identical field for the full
-    /// reasoning on why this is always required regardless of backend.
+    /// The `movement-events` Redis stream's server.
     #[arg(long, env, default_value = "redis://redis:6379")]
     pub redis_url: String,
 
@@ -132,11 +121,9 @@ pub struct Config {
     #[arg(long, env, default_value_t = 30)]
     pub redis_autoclaim_min_idle_secs: u64,
 
-    /// How often (seconds), under the `redis-stream` backend only, this
-    /// crate compares the `full-coverage-consumer` Redis Streams consumer
-    /// group's `last-delivered-id` against the stream's oldest retained
-    /// entry (`RedisStreamMovementFeed::check_gap`). A no-op timer under
-    /// the `kafka` backend.
+    /// How often (seconds) this crate compares the `full-coverage-consumer`
+    /// Redis Streams consumer group's `last-delivered-id` against the
+    /// stream's oldest retained entry (`RedisStreamMovementFeed::check_gap`).
     #[arg(long, env, default_value_t = 60)]
     pub redis_gap_check_secs: u64,
 
@@ -286,14 +273,6 @@ pub(crate) mod tests {
 
     pub(crate) fn base_config(lines: Vec<LineDefinition>, shadow_lines: &str) -> Config {
         Config {
-            kafka: common::service_args::KafkaConnectionArgs {
-                kafka_brokers: String::new(),
-                kafka_topic: String::new(),
-                kafka_sasl_username: String::new(),
-                kafka_sasl_password: String::new(),
-                kafka_sasl_mechanism: String::new(),
-            },
-            kafka_consumer_group: String::new(),
             schedule_line_population_url: String::new(),
             full_coverage_stats_url: String::new(),
             station_full_coverage_stats_url: String::new(),
@@ -317,7 +296,7 @@ pub(crate) mod tests {
             metrics: common::service_args::MetricsArgs {
                 metrics_enabled: false,
             },
-            movement_feed_backend: MovementFeedBackend::Kafka,
+            movement_feed_backend: MovementFeedBackend::RedisStream,
             redis_url: String::new(),
             redis_password: None,
             redis_autoclaim_min_idle_secs: 30,
@@ -382,16 +361,6 @@ pub(crate) mod tests {
 
         let config = Config::try_parse_from([
             "full-coverage-consumer",
-            "--kafka-brokers",
-            "kafka.example.com:9092",
-            "--kafka-topic",
-            "test-topic",
-            "--kafka-sasl-username",
-            "user",
-            "--kafka-sasl-password",
-            "pass",
-            "--kafka-sasl-mechanism",
-            "PLAIN",
             "--internal-oauth-token-url",
             "http://auth.example.com/token",
             "--internal-oauth-client-id",
@@ -415,5 +384,42 @@ pub(crate) mod tests {
         );
         assert_eq!(config.windowed.full_coverage_recent_window_minutes, 60);
         assert_eq!(config.windowed.full_coverage_grace_minutes, 10);
+    }
+
+    /// R-101 / Deploy C: an explicit `--movement-feed-backend kafka` (or
+    /// `MOVEMENT_FEED_BACKEND=kafka`) refuses to start, with the reason,
+    /// instead of being ignored; `redis-stream` (production's explicit
+    /// value) still parses.
+    #[test]
+    fn an_explicit_kafka_backend_fails_startup() {
+        let lines_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lines");
+        let parse = |backend: &str| {
+            Config::try_parse_from([
+                "full-coverage-consumer",
+                "--internal-oauth-token-url",
+                "http://auth.example.com/token",
+                "--internal-oauth-client-id",
+                "client-id",
+                "--internal-oauth-username",
+                "svc-user",
+                "--internal-oauth-password",
+                "svc-pass",
+                "--lines-dir",
+                lines_dir.to_str().unwrap(),
+                "--movement-feed-backend",
+                backend,
+            ])
+        };
+
+        let err = parse("kafka").expect_err("the kafka backend was removed");
+        assert!(
+            err.to_string()
+                .contains(movement_feed::active_feed::KAFKA_BACKEND_REMOVED),
+            "{err}"
+        );
+        assert_eq!(
+            parse("redis-stream").unwrap().movement_feed_backend,
+            MovementFeedBackend::RedisStream
+        );
     }
 }

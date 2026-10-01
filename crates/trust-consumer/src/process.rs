@@ -100,14 +100,9 @@
 //! succeeded. Rolling the maps back makes the "freshly resolved" signal
 //! idempotent under redelivery, which is the property that whole path needs.
 //!
-//! **A failed batch is retried, not skipped.** `feed/kafka.rs` stores an
-//! offset only when `commit` is called (`enable.auto.offset.store=false`),
-//! and, as of finding #3 of the same review, it also `seek`s back to the
-//! offset of any record whose cycle never confirmed before its next `recv`
-//! -- so a failed cycle re-delivers the same record instead of the next
-//! consumer read silently advancing past it and the following commit
-//! sweeping it up. Under the Redis backend the equivalent guarantee was
-//! already there (the unacked entry is reclaimed and replayed). Either way
+//! **A failed batch is retried, not skipped.** The unacked Redis stream
+//! entry is reclaimed and replayed (the removed Kafka backend got the same
+//! guarantee from a `seek` back to the unconfirmed offset). Either way
 //! the replay is safe because of the `dedup_key` path and the rollback
 //! described above.
 //!
@@ -992,17 +987,12 @@ fn msg_type_label(message: &TrustMessage) -> &'static str {
         TrustMessage::Reinstatement(_) => "0005",
         TrustMessage::ChangeOfOrigin(_) => "0006",
         TrustMessage::ChangeOfIdentity(_) => "0007",
-        // Genuinely reachable under the Kafka backend (`process_message`'s
-        // own `Unknown` arm below logs and drops these) -- `parse_batch`
-        // does NOT filter them out itself (confirmed against
+        // `parse_batch` does NOT filter these out itself (confirmed against
         // `schema.rs`'s own test asserting `Unknown` surfaces in its
-        // output). Under the redis-stream backend this should be rare to
-        // absent in practice, since `movement-relay`'s own
+        // output); `process_message`'s own `Unknown` arm logs and drops
+        // them. Rare to absent in practice, since `movement-relay`'s own
         // `confirmed_envelope_bodies` already drops unconfirmed types
-        // before ever publishing to Redis -- but this crate can still run
-        // against direct Kafka (`MovementFeedBackend::Kafka`), where no
-        // such upstream filter exists, so this label stays real rather
-        // than theoretical.
+        // before ever publishing to Redis.
         TrustMessage::Unknown(_) => "unknown",
     }
 }

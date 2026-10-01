@@ -27,15 +27,12 @@ pub enum PartialReason {
     /// The process started mid-day and the day's first events had already
     /// been trimmed from `movement-events` (or the replay could not tell).
     DayStartTrimmed,
-    /// The process started mid-day on a backend with no replay (Kafka).
-    ReplayUnsupported,
 }
 
 impl PartialReason {
     pub fn as_str(self) -> &'static str {
         match self {
             PartialReason::DayStartTrimmed => "day_start_trimmed",
-            PartialReason::ReplayUnsupported => "replay_unsupported",
         }
     }
 }

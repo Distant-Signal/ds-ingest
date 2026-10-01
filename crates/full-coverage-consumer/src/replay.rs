@@ -30,14 +30,12 @@
 //! With `MOVEMENT_STREAM_MAXLEN` at 1,048,576 (about 24 h of traffic) a
 //! whole rail day is normally retained; replaying ~1M entries takes about
 //! 4 minutes at the measured ~4.5k entries/s. When the day's first entries
-//! HAVE been trimmed (or the backend cannot replay at all -- Kafka), the
-//! day is marked partial instead: see [`crate::day::DayState::partial_reason`].
+//! HAVE been trimmed, the day is marked partial instead: see [`crate::day::DayState::partial_reason`].
 
 use std::collections::HashSet;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use movement_feed::MovementFeed;
 use movement_feed::redis_stream::{
     RangePage, RedisStreamMovementFeed, StreamPositions, stream_id_less_than,
 };
@@ -55,11 +53,10 @@ pub const REPLAY_PAGE_SIZE: usize = 1000;
 pub const LOOKBACK: chrono::Duration = chrono::Duration::hours(6);
 
 /// What a startup replay needs from a stream. Implemented by the real Redis
-/// reader and by `ActiveFeed` (which has nothing to offer under Kafka).
+/// reader and by `ActiveFeed` (which delegates to it).
 #[async_trait]
 pub trait ReplaySource: Send {
-    /// `None`: this backend cannot replay (there is no group-less read).
-    async fn positions(&mut self) -> anyhow::Result<Option<StreamPositions>>;
+    async fn positions(&mut self) -> anyhow::Result<StreamPositions>;
     async fn pending_ids(&mut self) -> anyhow::Result<HashSet<String>>;
     async fn read_range(
         &mut self,
@@ -71,8 +68,8 @@ pub trait ReplaySource: Send {
 
 #[async_trait]
 impl ReplaySource for RedisStreamMovementFeed {
-    async fn positions(&mut self) -> anyhow::Result<Option<StreamPositions>> {
-        Ok(Some(self.stream_positions().await?))
+    async fn positions(&mut self) -> anyhow::Result<StreamPositions> {
+        self.stream_positions().await
     }
     async fn pending_ids(&mut self) -> anyhow::Result<HashSet<String>> {
         self.group_pending_ids().await
@@ -88,18 +85,12 @@ impl ReplaySource for RedisStreamMovementFeed {
 }
 
 #[async_trait]
-impl<K: MovementFeed> ReplaySource for movement_feed::ActiveFeed<K> {
-    async fn positions(&mut self) -> anyhow::Result<Option<StreamPositions>> {
-        match self.redis_stream() {
-            Some(feed) => ReplaySource::positions(feed).await,
-            None => Ok(None),
-        }
+impl ReplaySource for movement_feed::ActiveFeed {
+    async fn positions(&mut self) -> anyhow::Result<StreamPositions> {
+        ReplaySource::positions(self.redis_stream()).await
     }
     async fn pending_ids(&mut self) -> anyhow::Result<HashSet<String>> {
-        match self.redis_stream() {
-            Some(feed) => ReplaySource::pending_ids(feed).await,
-            None => Ok(HashSet::new()),
-        }
+        ReplaySource::pending_ids(self.redis_stream()).await
     }
     async fn read_range(
         &mut self,
@@ -107,10 +98,7 @@ impl<K: MovementFeed> ReplaySource for movement_feed::ActiveFeed<K> {
         end: &str,
         count: usize,
     ) -> anyhow::Result<RangePage> {
-        match self.redis_stream() {
-            Some(feed) => ReplaySource::read_range(feed, start, end, count).await,
-            None => Ok(RangePage::default()),
-        }
+        ReplaySource::read_range(self.redis_stream(), start, end, count).await
     }
 }
 
@@ -244,16 +232,7 @@ pub async fn run_startup_replay<S: ReplaySource + ?Sized>(
     let mut report = ReplayReport::default();
     let day_start = crate::stats::rail_day_start(day.service_date);
 
-    let Some(positions) = retry!("read stream positions", progress, source.positions()) else {
-        tracing::warn!(
-            service_date = %day.service_date,
-            "this movement-feed backend cannot replay the rail day; marking it partial"
-        );
-        day.partial_reason = Some(PartialReason::ReplayUnsupported);
-        // Nothing before this process started has been seen.
-        day.observed_from = chrono::Utc::now();
-        return report;
-    };
+    let positions = retry!("read stream positions", progress, source.positions());
 
     let plan = plan_replay(
         &positions,
@@ -417,8 +396,8 @@ mod tests {
 
     #[async_trait]
     impl ReplaySource for FakeSource {
-        async fn positions(&mut self) -> anyhow::Result<Option<StreamPositions>> {
-            Ok(Some(self.positions.clone()))
+        async fn positions(&mut self) -> anyhow::Result<StreamPositions> {
+            Ok(self.positions.clone())
         }
         async fn pending_ids(&mut self) -> anyhow::Result<HashSet<String>> {
             Ok(HashSet::new())

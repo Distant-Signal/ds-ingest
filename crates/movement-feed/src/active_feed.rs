@@ -1,44 +1,72 @@
-//! `ActiveFeed<K>` + `MovementFeedBackend`: shared dispatch between
-//! whichever concrete `MovementFeed` backend a caller selected. Previously
-//! duplicated near-verbatim (differing only in doc-comment wording) across
-//! `trust-consumer`'s and `full-coverage-consumer`'s own `main.rs`/
-//! `config.rs`. See
+//! `ActiveFeed` + `MovementFeedBackend`: the movement feed a consumer
+//! reads, plus the readiness reporting every caller needs around it.
+//! Previously duplicated near-verbatim across `trust-consumer`'s and
+//! `full-coverage-consumer`'s own `main.rs`/`config.rs`. See
 //! docs/superpowers/specs/2026-09-05-rust-service-deduplication-design.md
-//! §3.5 -- and this plan's own "Fresh-verification corrections" section
-//! for why `ActiveFeed` is generic over its Kafka variant: `KafkaMovementFeed`
-//! is a distinct, crate-local type per caller (each crate's own
-//! `feed::kafka` module, scheduled for deletion in Deploy C, out of scope
-//! here), not actually shared the way the design spec assumed. Sharing it
-//! would require either merging those two modules (out of scope) or
-//! picking one crate's own type arbitrarily (worse than the status quo);
-//! a generic parameter avoids both.
+//! §3.5.
+//!
+//! Deploy C (PL-15a / R-101) removed the consumers' legacy direct-Kafka
+//! backend: `movement-relay` is the only Kafka client, and every consumer
+//! reads its `movement-events` Redis stream. `MOVEMENT_FEED_BACKEND=kafka`
+//! now fails startup (see [`MovementFeedBackend`]'s `FromStr`), because the
+//! chart passed trust-consumer the relay's own RDM consumer group: a
+//! consumer that silently honoured it would have joined that group and
+//! taken half its partitions away from the relay.
+
+use std::fmt;
+use std::str::FromStr;
 
 use crate::redis_stream::{GapInfo, RedisStreamMovementFeed};
 use crate::{DeadLetter, DeadLetterSink, MovementFeed};
 
-/// Which transport a `MovementFeed` consumer uses. Verbatim move of the
-/// two byte-identical enums previously duplicated in
-/// `trust-consumer/src/config.rs` and
-/// `full-coverage-consumer/src/config.rs`.
-#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+/// Which transport a `MovementFeed` consumer uses. Only `redis-stream`
+/// remains; the setting is kept so that an explicit
+/// `MOVEMENT_FEED_BACKEND=redis-stream` (production's value) still parses,
+/// and an explicit `kafka` is refused with a clear message instead of
+/// being silently ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MovementFeedBackend {
-    /// A direct Kafka consumer, via each caller's own crate-local
-    /// `feed::kafka::KafkaMovementFeed`.
-    Kafka,
     /// The Redis Streams reader (`RedisStreamMovementFeed`, this crate),
     /// reading what `movement-relay` publishes.
     RedisStream,
 }
 
-/// Wraps whichever concrete `MovementFeed` backend was selected. Generic
-/// over `K` (each caller's own Kafka implementation) -- see this module's
-/// own doc for why. The `RedisStream` variant's third field is the
-/// Prometheus gauge name to report readiness under (e.g.
+/// The refusal for `MOVEMENT_FEED_BACKEND=kafka`. Public so callers' tests
+/// can assert on it.
+pub const KAFKA_BACKEND_REMOVED: &str = "the kafka movement feed backend was removed (Deploy C, PL-15a): \
+     movement-relay is the only Kafka client and every consumer reads its movement-events \
+     Redis stream. A consumer reading Kafka directly would join movement-relay's RDM \
+     consumer group and take partitions away from it. Unset MOVEMENT_FEED_BACKEND or set \
+     it to redis-stream";
+
+impl FromStr for MovementFeedBackend {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "redis-stream" => Ok(MovementFeedBackend::RedisStream),
+            "kafka" => Err(KAFKA_BACKEND_REMOVED.to_string()),
+            other => Err(format!(
+                "unknown movement feed backend {other:?}; the only backend is redis-stream"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for MovementFeedBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MovementFeedBackend::RedisStream => f.write_str("redis-stream"),
+        }
+    }
+}
+
+/// The selected `MovementFeed` backend. The `RedisStream` variant's third
+/// field is the Prometheus gauge name to report readiness under (e.g.
 /// `"trust_consumer_ready"` / `"full_coverage_consumer_ready"`) --
 /// per-caller, so it's supplied at construction time rather than hardcoded
-/// inside this now-shared type's own `next_batch` impl.
-pub enum ActiveFeed<K: MovementFeed> {
-    Kafka(K),
+/// inside this shared type's own `next_batch` impl.
+pub enum ActiveFeed {
     RedisStream(
         Box<RedisStreamMovementFeed>,
         health_http::ConnectionState,
@@ -47,10 +75,9 @@ pub enum ActiveFeed<K: MovementFeed> {
 }
 
 #[async_trait::async_trait]
-impl<K: MovementFeed> MovementFeed for ActiveFeed<K> {
+impl MovementFeed for ActiveFeed {
     async fn next_batch(&mut self) -> anyhow::Result<Vec<String>> {
         match self {
-            ActiveFeed::Kafka(feed) => feed.next_batch().await,
             ActiveFeed::RedisStream(feed, connection_state, gauge_name) => {
                 let result = feed.next_batch().await;
                 health_http::set_connected(connection_state, gauge_name, result.is_ok());
@@ -61,82 +88,65 @@ impl<K: MovementFeed> MovementFeed for ActiveFeed<K> {
 
     async fn commit(&mut self) -> anyhow::Result<()> {
         match self {
-            ActiveFeed::Kafka(feed) => feed.commit().await,
             ActiveFeed::RedisStream(feed, _, _) => feed.commit().await,
         }
     }
 
     async fn reject_batch(&mut self, detail: &str) -> anyhow::Result<()> {
         match self {
-            ActiveFeed::Kafka(feed) => feed.reject_batch(detail).await,
             ActiveFeed::RedisStream(feed, _, _) => feed.reject_batch(detail).await,
         }
     }
 }
 
-/// The Kafka backend has no dead-letter stream (it is legacy and slated for
-/// removal), so records are only logged there -- still enough to recover
-/// them by hand. Logging cannot fail, so neither does this.
 #[async_trait::async_trait]
-impl<K: MovementFeed> DeadLetterSink for ActiveFeed<K> {
+impl DeadLetterSink for ActiveFeed {
     async fn dead_letter(&mut self, records: &[DeadLetter]) -> anyhow::Result<()> {
         match self {
-            ActiveFeed::Kafka(_) => {
-                for record in records {
-                    tracing::warn!(
-                        reason = record.reason,
-                        detail = %record.detail,
-                        payload = %record.payload,
-                        "dead-lettered record (Kafka backend: logged only)"
-                    );
-                }
-                Ok(())
-            }
             ActiveFeed::RedisStream(feed, _, _) => feed.dead_letter(records).await,
         }
     }
 }
 
-impl<K: MovementFeed> ActiveFeed<K> {
+impl ActiveFeed {
     /// The Redis Streams reader, for callers that need more than the
-    /// `MovementFeed` surface (e.g. a group-less `XRANGE` replay); `None`
-    /// under the Kafka backend, which has no equivalent.
-    pub fn redis_stream(&mut self) -> Option<&mut RedisStreamMovementFeed> {
+    /// `MovementFeed` surface (e.g. a group-less `XRANGE` replay).
+    pub fn redis_stream(&mut self) -> &mut RedisStreamMovementFeed {
         match self {
-            ActiveFeed::Kafka(_) => None,
-            ActiveFeed::RedisStream(feed, _, _) => Some(feed),
+            ActiveFeed::RedisStream(feed, _, _) => feed,
         }
     }
 
-    /// `Ok(None)` immediately for the `Kafka` variant (no analog);
-    /// delegates to `RedisStreamMovementFeed::check_gap` for the
-    /// `RedisStream` variant.
+    /// Delegates to `RedisStreamMovementFeed::check_gap`.
     pub async fn check_gap(&mut self) -> anyhow::Result<Option<GapInfo>> {
-        match self {
-            ActiveFeed::Kafka(_) => Ok(None),
-            ActiveFeed::RedisStream(feed, _, _) => feed.check_gap().await,
-        }
+        self.redis_stream().check_gap().await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FakeMovementFeed;
 
-    #[tokio::test]
-    async fn kafka_variant_check_gap_is_always_none() {
-        let mut feed: ActiveFeed<FakeMovementFeed> =
-            ActiveFeed::Kafka(FakeMovementFeed::new(vec![]));
-        assert_eq!(feed.check_gap().await.unwrap(), None);
+    #[test]
+    fn redis_stream_round_trips_through_its_name() {
+        let backend: MovementFeedBackend = "redis-stream".parse().unwrap();
+        assert_eq!(backend, MovementFeedBackend::RedisStream);
+        assert_eq!(backend.to_string(), "redis-stream");
     }
 
-    #[tokio::test]
-    async fn kafka_variant_delegates_next_batch_and_commit() {
-        let mut feed: ActiveFeed<FakeMovementFeed> =
-            ActiveFeed::Kafka(FakeMovementFeed::new(vec![vec!["one".to_string()]]));
-        let batch = feed.next_batch().await.unwrap();
-        assert_eq!(batch, vec!["one".to_string()]);
-        feed.commit().await.unwrap();
+    /// R-101: an explicit `kafka` must refuse to start, not fall back to
+    /// Redis quietly and not connect to Kafka.
+    #[test]
+    fn the_removed_kafka_backend_is_refused_with_an_explanation() {
+        let err = "kafka".parse::<MovementFeedBackend>().unwrap_err();
+        assert_eq!(err, KAFKA_BACKEND_REMOVED);
+        assert!(err.contains("removed"));
+        assert!(err.contains("redis-stream"));
+    }
+
+    #[test]
+    fn an_unknown_backend_is_refused() {
+        let err = "kafak".parse::<MovementFeedBackend>().unwrap_err();
+        assert!(err.contains("\"kafak\""), "{err}");
     }
 }

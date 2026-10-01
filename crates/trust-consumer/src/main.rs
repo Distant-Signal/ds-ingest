@@ -1,11 +1,10 @@
 //! `trust-consumer`: persistent consumer for Network Rail's TRUST Train
 //! Movements feed (via RDM), filtered to exactly the currently
-//! user-tracked `(train_uid, date)` set. By default
-//! (`--movement-feed-backend redis-stream`) it reads the `movement-events`
-//! Redis Stream that `movement-relay` fans the RDM Kafka topic into; the
-//! `kafka` backend (a direct RDM Kafka consumer) is only used when asked
-//! for by name. Matched events are forwarded to `api`'s `/private/*`
-//! ingest endpoints. NOT a cron-style poller (it consumes a push stream
+//! user-tracked `(train_uid, date)` set. It reads the `movement-events`
+//! Redis Stream that `movement-relay` fans the RDM Kafka topic into (the
+//! direct-Kafka backend was removed in Deploy C, PL-15a). Matched events
+//! are forwarded to `api`'s `/private/*` ingest endpoints. NOT a
+//! cron-style poller (it consumes a push stream
 //! continuously rather than fetching on an interval), which is why it is
 //! not named `poller-trust`.
 
@@ -22,9 +21,23 @@ use std::time::Duration;
 use clap::Parser;
 use config::{Config, MovementFeedBackend};
 use feed::MovementFeed;
-use feed::kafka::KafkaMovementFeed;
 use movement_feed::ActiveFeed;
 use movement_feed::redis_stream::RedisStreamMovementFeed;
+
+/// Registers `trust_consumer_errors_total{operation="parse_envelope",msg_type}`
+/// at 0 for every msg_type a dropped envelope can carry, so the
+/// DistantSignalTrustEnvelopeParseDrops alert's `increase()` sees the first
+/// drop too (R-097).
+fn register_parse_envelope_counters() {
+    for msg_type in trust_schema::schema::ENVELOPE_FAILURE_MSG_TYPES {
+        metrics::counter!(
+            common::metrics::metric_name("trust_consumer_errors_total"),
+            "operation" => "parse_envelope",
+            "msg_type" => msg_type
+        )
+        .increment(0);
+    }
+}
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
@@ -47,6 +60,7 @@ async fn run() -> anyhow::Result<()> {
         "trust_consumer_stream_gap_detected_total"
     ))
     .increment(0);
+    register_parse_envelope_counters();
     let (connection_state, progress) = health_http::spawn_with_progress(
         config.health_bind_url.clone(),
         "connected",
@@ -57,9 +71,6 @@ async fn run() -> anyhow::Result<()> {
     let internal_oauth = config.internal_oauth.token_cache();
 
     let mut feed = match config.movement_feed_backend {
-        MovementFeedBackend::Kafka => {
-            ActiveFeed::Kafka(KafkaMovementFeed::connect(&config, connection_state)?)
-        }
         MovementFeedBackend::RedisStream => ActiveFeed::RedisStream(
             Box::new(
                 connect_redis_feed(&config, common::startup::CONNECT_BACKOFF, &progress).await?,
@@ -152,9 +163,6 @@ async fn run() -> anyhow::Result<()> {
             last_stanox_crs_reload = tokio::time::Instant::now();
         }
 
-        // A no-op under the Kafka backend (ActiveFeed::check_gap returns
-        // Ok(None) immediately for that variant) -- only meaningful once
-        // this deployment has been cut over to Redis Streams (Deploy B).
         if last_redis_gap_check.elapsed() >= redis_gap_check_interval {
             match feed.check_gap().await {
                 Ok(Some(gap)) => {
@@ -225,7 +233,7 @@ async fn run() -> anyhow::Result<()> {
             // `api` and the log for the whole outage. A flat, short pause is
             // enough to make that a trickle; it deliberately isn't
             // exponential or configurable, because the loop has no backlog
-            // to drain (Kafka holds the backlog) and a fixed small delay
+            // to drain (the stream holds the backlog) and a fixed small delay
             // costs nothing once the outage clears.
             tokio::time::sleep(ERROR_BACKOFF).await;
         }
@@ -470,15 +478,14 @@ where
     }
 
     if let Err(err) = feed.commit().await {
-        tracing::error!(error = ?err, "failed to commit Kafka offsets");
+        tracing::error!(error = ?err, "failed to commit the movement feed batch");
         metrics::counter!(
             common::metrics::metric_name("trust_consumer_errors_total"),
             "operation" => "commit_offsets"
         )
         .increment(1);
         // Rolled back even though the post itself succeeded: an uncommitted
-        // batch WILL be redelivered (Kafka: the seek-back in
-        // `feed::kafka`; Redis: `reclaim_stale`), and the replay must build
+        // batch WILL be redelivered (`reclaim_stale`), and the replay must build
         // the same events from the same pre-batch state. Re-posting them is
         // harmless -- that is exactly what `dedup_key` and `api`'s
         // `ON CONFLICT` clauses are for.
@@ -1006,8 +1013,7 @@ mod tests {
 
     /// **Finding #4's end-to-end regression test.** A batch whose POST fails
     /// is redelivered (Redis `reclaim_stale` replays an unacked batch into
-    /// this same running process after 30 seconds; Kafka now seeks back to
-    /// it). The redelivered attempt MUST still carry the one-time
+    /// this same running process after 30 seconds). The redelivered attempt MUST still carry the one-time
     /// `resolved_train_uid`/`resolved_train_id` signal, because that is the
     /// only thing that ever flips the subscription to `'resolved'` in the
     /// database.
@@ -1123,6 +1129,24 @@ mod redis_outage_tests {
 
     use super::*;
 
+    /// R-097: every parse_envelope series exists at 0 from startup.
+    #[test]
+    fn parse_envelope_counters_are_registered_at_zero() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, register_parse_envelope_counters);
+        let rendered = handle.render();
+        for msg_type in trust_schema::schema::ENVELOPE_FAILURE_MSG_TYPES {
+            let series = format!(
+                r#"distant_signal_trust_consumer_errors_total{{operation="parse_envelope",msg_type="{msg_type}"}} 0"#
+            );
+            assert!(
+                rendered.contains(&series),
+                "{series} missing from {rendered}"
+            );
+        }
+    }
+
     /// A local port with nothing listening on it (bound, then released).
     fn closed_local_port() -> u16 {
         std::net::TcpListener::bind("127.0.0.1:0")
@@ -1137,16 +1161,6 @@ mod redis_outage_tests {
             .join("../../reference-data/stanox-crs.csv");
         Config::try_parse_from([
             "trust-consumer",
-            "--kafka-brokers",
-            "kafka.example.com:9092",
-            "--kafka-topic",
-            "test-topic",
-            "--kafka-sasl-username",
-            "user",
-            "--kafka-sasl-password",
-            "pass",
-            "--kafka-sasl-mechanism",
-            "PLAIN",
             "--internal-oauth-token-url",
             "http://auth.example.com/token",
             "--internal-oauth-client-id",

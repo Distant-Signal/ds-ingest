@@ -224,7 +224,15 @@ impl<'a> LinePopBuilder<'a> {
             let Some(time) = cp.booked_departure.or(cp.booked_arrival) else {
                 continue; // a pass, not a call
             };
-            let minutes = utc_minutes(self.date, cp.day_offset, time);
+            // `time` is the departure when there is one: a stop dwelling
+            // across midnight departs a day after its stored (arrival)
+            // day_offset (R-043).
+            let day_offset = schedule_query::records::departure_day_offset(
+                cp.booked_arrival,
+                cp.booked_departure,
+                cp.day_offset,
+            );
+            let minutes = utc_minutes(self.date, day_offset, time);
             first.get_or_insert(minutes);
             last = Some(minutes);
             if !stations.contains(&crs.as_str()) {

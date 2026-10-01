@@ -72,7 +72,6 @@ began.
 | Reason | When |
 | --- | --- |
 | `day_start_trimmed` | The day's first entries are no longer in `movement-events`. The stream's first retained entry is later than 02:00 local, and entries have been trimmed. A day whose first event simply came late looks the same, so this rule is conservative. An `XDEL` inside the day also counts. |
-| `replay_unsupported` | The Kafka backend. It has no group-less read. |
 | Missing population | That line only: its population still failed after `POPULATION_INITIAL_WAIT_SECS`. |
 
 A day entered through the in-process rail-day rollover is never partial.

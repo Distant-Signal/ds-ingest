@@ -47,6 +47,16 @@ async fn run() -> anyhow::Result<()> {
         "trust_backlog_consumer_stream_gap_detected_total"
     ))
     .increment(0);
+    // Same for every parse_envelope series, for
+    // DistantSignalTrustEnvelopeParseDrops (R-097).
+    for msg_type in trust_schema::schema::ENVELOPE_FAILURE_MSG_TYPES {
+        metrics::counter!(
+            common::metrics::metric_name("trust_backlog_consumer_errors_total"),
+            "operation" => "parse_envelope",
+            "msg_type" => msg_type
+        )
+        .increment(0);
+    }
     let (connection_state, progress) = health_http::spawn_with_progress(
         config.health_bind_url.clone(),
         "connected",
@@ -74,12 +84,8 @@ async fn run() -> anyhow::Result<()> {
     // established pattern for a Redis-Streams backend
     // (`crates/movement-feed/src/active_feed.rs`'s own `ActiveFeed::RedisStream`
     // variant already does this generically -- see that module's doc
-    // comment). `ActiveFeed<K>` is generic over a Kafka backend type `K`
-    // this crate never uses (Task 7's own "Redis-Streams-only" decision);
-    // `RedisStreamMovementFeed` itself trivially satisfies `K: MovementFeed`,
-    // so `ActiveFeed<RedisStreamMovementFeed>` type-checks even though the
-    // `Kafka` variant is never constructed.
-    let mut feed: ActiveFeed<RedisStreamMovementFeed> = ActiveFeed::RedisStream(
+    // comment).
+    let mut feed: ActiveFeed = ActiveFeed::RedisStream(
         // Redis down at startup is waited for (each attempt logged, beating
         // progress so /livez stays 200); afterwards every Redis command is
         // bounded and a failure is retried by this loop. See

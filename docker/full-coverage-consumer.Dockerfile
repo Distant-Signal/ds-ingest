@@ -1,19 +1,11 @@
 # syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
-# Multi-stage build for full-coverage-consumer. Structurally identical to
-# docker/trust-consumer.Dockerfile -- a second, independent Kafka consumer
-# against the same RDM Train Movements feed, so it needs the exact same
-# cmake/OpenSSL/libsasl2/libcurl4 builder-stage packages for rdkafka's
-# `cmake-build`/`ssl`/`sasl` features. See that Dockerfile's own header
-# comment for the full rationale (unchanged here).
+# Multi-stage build for full-coverage-consumer. A plain Rust build, same
+# shape as docker/trust-consumer.Dockerfile: the rdkafka dependency went
+# with the legacy Kafka backend in Deploy C (PL-15a).
 ARG CARGO_PROFILE=release
 
 FROM rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS builder
 ARG CARGO_PROFILE
-
-# hadolint ignore=DL3008 # apt versions unpinned on purpose; see .hadolint.yaml
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends cmake libssl-dev pkg-config libsasl2-dev libcurl4-openssl-dev \
-    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY . .
@@ -29,12 +21,11 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
 
 FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
 
-# `curl` (compose HEALTHCHECK probe of GET /healthz), libssl3, libsasl2-2 --
-# see docker/trust-consumer.Dockerfile's own runtime-stage comment for the
-# full rationale, unchanged here.
+# `curl` (compose HEALTHCHECK probe of GET /healthz) and libssl3 -- see
+# docker/trust-consumer.Dockerfile's own runtime-stage comment.
 # hadolint ignore=DL3008 # apt versions unpinned on purpose; see .hadolint.yaml
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl libssl3 libsasl2-2 \
+    && apt-get install -y --no-install-recommends ca-certificates curl libssl3 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 1000 full-coverage-consumer \
     && useradd --system --no-create-home --shell /usr/sbin/nologin --uid 1000 --gid 1000 full-coverage-consumer

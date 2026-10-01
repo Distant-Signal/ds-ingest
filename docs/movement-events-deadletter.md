@@ -54,6 +54,37 @@ stream is nearly full (`DistantSignalDeadLetterNearFull`), full
 (`DistantSignalDeadLetterFull`), or holds a record about to be deleted for
 age (`DistantSignalDeadLetterExpiring`).
 
+## Long-pending entries
+
+`DistantSignalMovementFeedLongPending` fires when a consumer group re-reads
+entries it has already been handed more than 240 times
+(`distant_signal_movement_feed_long_pending_total{group}`, registered at 0).
+They are never dead-lettered: only a data rejection is. So the cause is
+either a long `api` outage (then the lag and pending alerts usually fire as
+well) or a failure the consumer cannot classify as a rejection, such as an
+OAuth token error or a 5xx that one entry always triggers.
+
+1. Read that consumer's warn log for "pending entries have been redelivered
+   for over an hour". It names the group and the oldest entry id.
+2. `XPENDING movement-events <group> - + 10` shows the entries and their
+   delivery counts; `XRANGE movement-events <id> <id>` shows one.
+3. Fix the downstream cause. If one entry can never succeed, `XACK` it by
+   hand after saving its payload (it is then lost to that group only).
+
+Do this well before `MOVEMENT_STREAM_MAXLEN` trims the entry.
+
+## Envelope parse drops
+
+`DistantSignalTrustEnvelopeParseDrops` fires when a consumer drops TRUST
+envelopes whose body does not match its known shape
+(`distant_signal_<consumer>_errors_total{operation="parse_envelope",msg_type}`).
+These are not dead-lettered: the rest of the batch is processed. The first
+failure of each `msg_type` is logged at warn ("a TRUST envelope failed to
+parse against its known shape") with the serde error; later ones are only
+counted. A steady rate for one `msg_type` means Network Rail changed that
+message's schema: update `crates/trust-schema/src/schema.rs`. `msg_type`
+`missing` is an envelope with no `header.msg_type`.
+
 ## Retention: deleted after 24 hours
 
 Dead letters are raw TRUST data, so the TRUST 1-day retention safeguard

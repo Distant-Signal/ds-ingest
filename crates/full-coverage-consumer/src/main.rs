@@ -1,8 +1,7 @@
 //! `full-coverage-consumer`: a second, independent consumer of the same RDM
-//! Train Movements feed `trust-consumer` reads -- by default its own
-//! consumer group on the `movement-events` Redis Stream that
-//! `movement-relay` fills (`--movement-feed-backend kafka` reads RDM's
-//! Kafka topic directly instead) -- correlating every event against the
+//! Train Movements feed `trust-consumer` reads -- its own consumer group on
+//! the `movement-events` Redis Stream that `movement-relay` fills (the
+//! direct-Kafka backend was removed in Deploy C, PL-15a) -- correlating every event against the
 //! FULL scheduled population of every shadow-computed line (not a small
 //! pinned-train set) -- see
 //! docs/superpowers/specs/2026-09-04-option-b-live-consumer-design.md and
@@ -93,7 +92,6 @@ use clap::Parser;
 use config::{Config, MovementFeedBackend};
 use day::{DayState, Lookups};
 use feed::MovementFeed;
-use feed::kafka::KafkaMovementFeed;
 use movement_feed::ActiveFeed;
 use movement_feed::DeadLetterSink;
 use movement_feed::redis_stream::RedisStreamMovementFeed;
@@ -126,9 +124,6 @@ async fn run() -> anyhow::Result<()> {
     let internal_oauth = Arc::new(config.internal_oauth.token_cache());
 
     let mut feed = match config.movement_feed_backend {
-        MovementFeedBackend::Kafka => {
-            ActiveFeed::Kafka(KafkaMovementFeed::connect(&config, connection_state)?)
-        }
         MovementFeedBackend::RedisStream => ActiveFeed::RedisStream(
             // Redis down at startup is waited for (each attempt logged,
             // beating progress so /livez stays 200); afterwards every Redis
@@ -283,9 +278,7 @@ async fn run() -> anyhow::Result<()> {
             last_stanox_crs_reload = tokio::time::Instant::now();
         }
 
-        // 1b. redis-stream gap check -- a no-op under the Kafka backend
-        // (ActiveFeed::check_gap returns Ok(None) immediately for that
-        // variant). See docs/superpowers/specs/2026-09-04-movement-relay-design.md
+        // 1b. redis-stream gap check. See docs/superpowers/specs/2026-09-04-movement-relay-design.md
         // Decision 2's "definitive gap detection."
         if last_redis_gap_check.elapsed() >= redis_gap_check_interval {
             match feed.check_gap().await {
@@ -385,6 +378,15 @@ fn init_metrics() {
         "operation" => "post_window_stats"
     )
     .increment(0);
+    // DistantSignalTrustEnvelopeParseDrops (R-097).
+    for msg_type in trust_schema::schema::ENVELOPE_FAILURE_MSG_TYPES {
+        metrics::counter!(
+            common::metrics::metric_name("full_coverage_consumer_errors_total"),
+            "operation" => "parse_envelope",
+            "msg_type" => msg_type
+        )
+        .increment(0);
+    }
 }
 
 /// Waits for the first population load, then replays the current rail day
@@ -1594,39 +1596,6 @@ mod tests {
         }
     }
 
-    /// Kafka has no group-less replay: a process starting mid-day there
-    /// cannot rebuild the day, so the day is partial.
-    #[tokio::test]
-    async fn a_backend_without_replay_marks_the_starting_day_partial() {
-        let mut feed: ActiveFeed<movement_feed::FakeMovementFeed> =
-            ActiveFeed::Kafka(movement_feed::FakeMovementFeed::new(vec![]));
-        let (_, population) = todays_population();
-        let (_tx, mut rx) = tokio::sync::watch::channel(Some(population_reload::FirstLoad {
-            service_date: current_rail_service_date(chrono::Utc::now()),
-            missing_lines: vec!["other-line".to_string()],
-        }));
-        let day = start_consuming(
-            &mut feed,
-            &mut rx,
-            &shared(population),
-            &waterloo_lookups(),
-            &progress(),
-            true,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            day.partial_reason,
-            Some(day::PartialReason::ReplayUnsupported)
-        );
-        assert!(day.partial_lines.contains("other-line"));
-        assert!(day.trains.is_some(), "windowed state on when asked for");
-        assert!(
-            chrono::Utc::now() - day.observed_from < chrono::Duration::minutes(1),
-            "under Kafka nothing before the process start was seen"
-        );
-    }
-
     /// A feed that records, every time anything reads from it, whether the
     /// population had been loaded by then.
     struct RecordingFeed {
@@ -1668,9 +1637,9 @@ mod tests {
     impl replay::ReplaySource for RecordingFeed {
         async fn positions(
             &mut self,
-        ) -> anyhow::Result<Option<movement_feed::redis_stream::StreamPositions>> {
+        ) -> anyhow::Result<movement_feed::redis_stream::StreamPositions> {
             self.touch();
-            Ok(Some(movement_feed::redis_stream::StreamPositions::default()))
+            Ok(movement_feed::redis_stream::StreamPositions::default())
         }
         async fn pending_ids(&mut self) -> anyhow::Result<std::collections::HashSet<String>> {
             self.touch();
