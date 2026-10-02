@@ -37,11 +37,19 @@ pub(crate) fn to_minutes(instant: DateTime<Utc>) -> u32 {
 
 /// A live 0002.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "canx_type is TRUST's own field name for the 0002's type"
+)]
 pub(crate) struct Canx {
     pub canx_type: Option<String>,
     /// The planned departure at the location the train was cancelled
     /// from: it runs no further. `None` when the 0002 did not say.
     pub dep_min: Option<u32>,
+    /// When the 0002 arrived, in UTC minutes (the stream entry's time on a
+    /// replay): one at least `FULL_COVERAGE_CANCELLED_IN_ADVANCE_MINUTES`
+    /// before the train is due counts as cancelled in advance.
+    pub received_min: u32,
 }
 
 /// One 0003, reduced.
@@ -197,6 +205,7 @@ impl TrainState {
                 self.day_mut(which, uid).cancel = Some(Canx {
                     canx_type: c.canx_type,
                     dep_min,
+                    received_min: to_minutes(received_at),
                 });
             }
             Parked::Reinstatement => self.day_mut(which, uid).cancel = None,
@@ -451,6 +460,7 @@ mod tests {
             Some(Canx {
                 canx_type: Some("EN ROUTE".to_string()),
                 dep_min: Some(to_minutes(at("2026-01-27T09:30:00Z"))),
+                received_min: to_minutes(at("2026-01-27T08:00:00Z")),
             })
         );
         assert_eq!(s.parked_count(), 0);

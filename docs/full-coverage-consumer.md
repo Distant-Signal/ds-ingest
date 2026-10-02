@@ -121,6 +121,8 @@ before.
 | `FULL_COVERAGE_WINDOW_ENFORCE_LINES` | aggregator | empty | Lines `enforce` may change (comma list, or `*`). Empty: nothing is enforced until lines are named. |
 | `FULL_COVERAGE_WINDOW_MIN_ESCALATION_RANK` | aggregator | 4 | Only Severe Delays / Part Suspended are enforced. Minor Delays / Reduced Service are recorded as `would_escalate_to` with `below_min_rank`. |
 | `FULL_COVERAGE_WINDOW_STATS_RETENTION_DAYS` | aggregator | 14 | Prunes both window tables, in every mode. |
+| `FULL_COVERAGE_WINDOW_SPARSE_ENFORCE_LINES` (`aggregator.fullCoverageWindow.sparseEnforceLines`) | aggregator | empty | Lines `enforce` may raise with a sparse all-cancelled verdict (below the sample size, every train explicitly cancelled: Part Suspended). Its own allowlist; `FULL_COVERAGE_WINDOW_ENFORCE_LINES` does not cover these. Empty: recorded only. |
+| `FULL_COVERAGE_SPARSE_MIN_CANCELLED` (`aggregator.fullCoverageWindow.sparseMinCancelled`), `full_coverage_sparse_min_cancelled` per line | aggregator / `severity_overrides` | 2 | The sparse rule needs at least this many cancelled trains, all of the window's, nothing pending or presumed, `full` relevance. 0 turns it off. |
 | `full_coverage_delay_threshold_minutes` / `full_coverage_min_sample_size` / `full_coverage_min_affected` / `full_coverage_severe_min_affected` | `Defaults`, per line via `severity_overrides` | 3 / 6 / 3 / 5 | Delayed = 3+ minutes late at the train's first report on the line; a window needs 6 evaluable trains, a Minor Delays / Reduced Service tier 3 affected trains, and a Severe Delays / Part Suspended tier 5 (2026-10-02 calibration). |
 
 **Rollout.** Deploy `schedule-reference` and `api` first (the population then
@@ -156,8 +158,9 @@ cancellations for that line and date.
 `recent` windows), `full_coverage_consumer_parked_messages` (0002/0005/0006
 waiting for their Activation), `full_coverage_consumer_unattributed_total{msg_type}`
 (given up at the rollover); aggregator
-`aggregator_full_coverage_window_verdicts_total{verdict}`,
-`aggregator_full_coverage_window_escalations_total{severity,mode,below_min_rank}`,
+`aggregator_full_coverage_window_verdicts_total{verdict,basis}`,
+`aggregator_full_coverage_window_escalations_total{severity,mode,below_min_rank,basis}`
+(`basis`: `none`, `rate` or `sparse_all_cancelled`),
 `aggregator_full_coverage_window_stats_pruned_total`.
 
 **Fixes in the legacy row (all modes).** A late train's delay now comes

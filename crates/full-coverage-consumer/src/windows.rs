@@ -20,7 +20,9 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use common::full_coverage_window::FULL_COVERAGE_STATS_VERSION;
+use common::full_coverage_window::{
+    FULL_COVERAGE_CANCELLED_IN_ADVANCE_MINUTES, FULL_COVERAGE_STATS_VERSION,
+};
 use common::{
     FullCoverageLineStatsRow, FullCoverageWindowCounts, FullCoverageWindowKind,
     FullCoverageWindowStatsRow,
@@ -160,6 +162,18 @@ pub(crate) fn classify_line_train(
     (TrainClass::Pending, 0)
 }
 
+/// Whether an explicitly cancelled train's 0002 arrived at least
+/// `FULL_COVERAGE_CANCELLED_IN_ADVANCE_MINUTES` before it was due on the
+/// line. A train "cancelled" by a change of origin past the line has no
+/// 0002 and is never in advance. Only annotates the sparse rule's reason.
+fn cancelled_in_advance(train: &LineTrain, day: Option<&TrainDay>) -> bool {
+    day.and_then(|d| d.cancel.as_ref()).is_some_and(|c| {
+        c.received_min
+            .saturating_add(FULL_COVERAGE_CANCELLED_IN_ADVANCE_MINUTES)
+            <= train.due_min
+    })
+}
+
 /// Adds one classified train to `counts`; returns its delay when it
 /// counts toward the average (every non-cancelled train in `total`).
 fn count(counts: &mut FullCoverageWindowCounts, class: TrainClass, delay: i32) -> Option<i32> {
@@ -285,7 +299,11 @@ impl LineInputs<'_> {
             let lo = trains.partition_point(|t| t.due_min < from);
             let hi = trains.partition_point(|t| t.due_min <= to);
             for train in trains.get(lo..hi).unwrap_or_default() {
-                let (class, delay) = classify_line_train(train, state.get(&*train.uid), &ctx);
+                let day = state.get(&*train.uid);
+                let (class, delay) = classify_line_train(train, day, &ctx);
+                if class == TrainClass::CancelledExplicit && cancelled_in_advance(train, day) {
+                    counts.cancelled_in_advance += 1;
+                }
                 if let Some(delay) = count(&mut counts, class, delay) {
                     delay_sum += i64::from(delay);
                     delay_n += 1;
@@ -509,6 +527,7 @@ mod tests {
             cancel: Some(Canx {
                 canx_type: Some("EN ROUTE".into()),
                 dep_min: Some(m("2026-09-27T09:20:00Z")),
+                received_min: m("2026-09-27T09:15:00Z"),
             }),
             reports: vec![report("2026-09-27T09:00:00Z", 6, 7)],
             ..TrainDay::default()
@@ -533,6 +552,7 @@ mod tests {
             cancel: Some(Canx {
                 canx_type: Some("AT ORIGIN".into()),
                 dep_min: None,
+                received_min: m("2026-09-27T08:00:00Z"),
             }),
             ..TrainDay::default()
         };
@@ -543,6 +563,7 @@ mod tests {
             cancel: Some(Canx {
                 canx_type: Some("EN ROUTE".into()),
                 dep_min: Some(m("2026-09-27T10:30:00Z")),
+                received_min: m("2026-09-27T08:00:00Z"),
             }),
             ..TrainDay::default()
         };
@@ -745,6 +766,57 @@ mod tests {
         assert!(!w.presumed_enabled);
         assert_eq!(w.relevance, "stops_only");
         assert_eq!(w.counts.cancelled_presumed, 0);
+    }
+
+    /// A 0002 that arrived 3 hours or more before the train was due counts
+    /// as cancelled in advance; a later one, or a change of origin past the
+    /// line, does not.
+    #[test]
+    fn cancellations_that_arrived_three_hours_ahead_are_counted_in_advance() {
+        let mut trains = TrainState::new("2026-09-27".parse().unwrap());
+        let cancelled = |received: &str| TrainDay {
+            activated: true,
+            cancel: Some(Canx {
+                canx_type: Some("AT ORIGIN".into()),
+                dep_min: None,
+                received_min: m(received),
+            }),
+            ..TrainDay::default()
+        };
+        trains
+            .current
+            .insert("EARLY".into(), cancelled("2026-09-27T08:00:00Z"));
+        trains
+            .current
+            .insert("EDGE".into(), cancelled("2026-09-27T08:10:00Z"));
+        trains
+            .current
+            .insert("LATE".into(), cancelled("2026-09-27T08:12:00Z"));
+        trains.current.insert(
+            "MOVED".into(),
+            TrainDay {
+                activated: true,
+                origin_change_dep_min: Some(m("2026-09-27T13:00:00Z")),
+                ..TrainDay::default()
+            },
+        );
+        let due = |uid: &str, time: &str| train(uid, time, time, "2026-09-27T10:00:00Z");
+        let pop = line_pop(
+            vec![
+                due("EARLY", "2026-09-27T11:00:00Z"),
+                due("EDGE", "2026-09-27T11:10:00Z"),
+                due("LATE", "2026-09-27T11:11:00Z"),
+                due("MOVED", "2026-09-27T11:20:00Z"),
+            ],
+            Relevance::Full,
+        );
+        let defaults = common::Defaults::default();
+        let now = at("2026-09-27T12:00:00Z");
+        let [(kind, from, to), _] =
+            window_ranges("2026-09-27".parse().unwrap(), now, &params(), false);
+        let w = inputs(&pop, &trains, &defaults, false).window(kind, from, to, now);
+        assert_eq!(w.counts.cancelled_explicit, 4, "{:?}", w.counts);
+        assert_eq!(w.counts.cancelled_in_advance, 2, "EARLY and EDGE");
     }
 
     #[test]
