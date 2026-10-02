@@ -728,6 +728,9 @@ async fn write_stats(
                 line_id,
                 service_date,
                 pop,
+                next_pop: population
+                    .line_pop(line_id, service_date + chrono::Duration::days(1))
+                    .map(Arc::as_ref),
                 trains,
                 geometry: ctx.geometry.get(line_id).map(Arc::as_ref),
                 thresholds,

@@ -7,8 +7,17 @@
 //! See docs/superpowers/specs/2026-09-27-full-coverage-windowed-stats-design.md,
 //! and its "Decisions (2026-09-27)" section for the delay threshold (3
 //! minutes late at the train's first calling point on the line).
+//!
+//! **A train belongs to the rail day its due time falls in** ("Decisions
+//! (2026-10-02)" item 3). Populations are published per CIF service date,
+//! but rail day D runs from 02:00 London on D to 02:00 on D + 1, so the
+//! trains of service date D + 1 that are due after midnight and before
+//! 02:00 are rail day D's. Every window of rail day D therefore counts
+//! D's population (with the TRUST state of `TrainState::current`) plus
+//! D + 1's trains due before `rail_day_start(D + 1)` (with
+//! `TrainState::next`, where their Activations already go).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use common::full_coverage_window::FULL_COVERAGE_STATS_VERSION;
@@ -199,6 +208,11 @@ pub(crate) struct LineInputs<'a> {
     pub line_id: &'a str,
     pub service_date: chrono::NaiveDate,
     pub pop: &'a LinePop,
+    /// The line's population for `service_date + 1`, when held: its trains
+    /// due before that date's rail day starts belong to this rail day (see
+    /// the module doc). `None` makes every window that reaches local
+    /// midnight `partial`, since those trains cannot be counted.
+    pub next_pop: Option<&'a LinePop>,
     pub trains: &'a TrainState,
     pub geometry: Option<&'a LineGeometry>,
     pub thresholds: &'a common::Defaults,
@@ -210,7 +224,7 @@ pub(crate) struct LineInputs<'a> {
 }
 
 impl LineInputs<'_> {
-    fn ctx(&self) -> ClassifyCtx {
+    fn ctx(&self, pop: &LinePop) -> ClassifyCtx {
         let line_tiplocs = self
             .geometry
             .map(|g| {
@@ -222,7 +236,7 @@ impl LineInputs<'_> {
             .unwrap_or_default();
         ClassifyCtx {
             delay_threshold: self.thresholds.full_coverage_delay_threshold_minutes,
-            presumed_allowed: self.presumed_enabled(),
+            presumed_allowed: pop.relevance == Relevance::Full && !self.feed_stale,
             observed_from_min: to_minutes(self.observed_from),
             line_tiplocs,
         }
@@ -230,6 +244,21 @@ impl LineInputs<'_> {
 
     fn presumed_enabled(&self) -> bool {
         self.pop.relevance == Relevance::Full && !self.feed_stale
+    }
+
+    /// The first instant of the next rail day: `service_date + 1`'s trains
+    /// due before it are this rail day's.
+    fn next_rail_day_start(&self) -> DateTime<Utc> {
+        crate::stats::rail_day_start(self.service_date + chrono::Duration::days(1))
+    }
+
+    /// Local midnight starting `service_date + 1`: the earliest a train of
+    /// that date can be due.
+    fn next_service_date_start(&self) -> DateTime<Utc> {
+        common::rail_day::london_to_utc(
+            self.service_date + chrono::Duration::days(1),
+            chrono::NaiveTime::MIN,
+        )
     }
 
     /// Counts every train with `due` in `[from, to]` (inclusive, UTC
@@ -247,19 +276,28 @@ impl LineInputs<'_> {
         reason = "counts stay far below 2^52, so the f64 ratio is exact"
     )]
     fn counts_in(&self, from: u32, to: u32) -> FullCoverageWindowCounts {
-        let ctx = self.ctx();
-        let trains = &self.pop.trains;
-        let lo = trains.partition_point(|t| t.due_min < from);
-        let hi = trains.partition_point(|t| t.due_min <= to);
         let mut counts = FullCoverageWindowCounts::default();
         let mut delay_sum = 0i64;
         let mut delay_n = 0i64;
-        for train in trains.get(lo..hi).unwrap_or_default() {
-            let (class, delay) =
-                classify_line_train(train, self.trains.current.get(&*train.uid), &ctx);
-            if let Some(delay) = count(&mut counts, class, delay) {
-                delay_sum += i64::from(delay);
-                delay_n += 1;
+        let mut add = |pop: &LinePop, state: &HashMap<String, TrainDay>, from: u32, to: u32| {
+            let ctx = self.ctx(pop);
+            let trains = &pop.trains;
+            let lo = trains.partition_point(|t| t.due_min < from);
+            let hi = trains.partition_point(|t| t.due_min <= to);
+            for train in trains.get(lo..hi).unwrap_or_default() {
+                let (class, delay) = classify_line_train(train, state.get(&*train.uid), &ctx);
+                if let Some(delay) = count(&mut counts, class, delay) {
+                    delay_sum += i64::from(delay);
+                    delay_n += 1;
+                }
+            }
+        };
+        add(self.pop, &self.trains.current, from, to);
+        if let Some(next_pop) = self.next_pop {
+            // Only the next date's trains due before its rail day starts.
+            let to = to.min(to_minutes(self.next_rail_day_start()).saturating_sub(1));
+            if from <= to {
+                add(next_pop, &self.trains.next, from, to);
             }
         }
         counts.avg_delay_minutes = if delay_n == 0 {
@@ -282,7 +320,11 @@ impl LineInputs<'_> {
         to: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> FullCoverageWindowStatsRow {
+        // Without the next date's population, the trains due between local
+        // midnight and the end of the rail day cannot be counted.
+        let next_pop_missing = self.next_pop.is_none() && to >= self.next_service_date_start();
         let partial = self.line_partial
+            || next_pop_missing
             || from
                 < self.observed_from
                     + chrono::Duration::minutes(i64::from(ACTIVATION_LEAD_MINUTES));
@@ -623,6 +665,7 @@ mod tests {
             line_id: "line-a",
             service_date: "2026-09-27".parse().unwrap(),
             pop,
+            next_pop: None,
             trains,
             geometry: None,
             thresholds: defaults,
@@ -744,7 +787,9 @@ mod tests {
             Relevance::Full,
         );
         let defaults = common::Defaults::default();
-        let i = inputs(&pop, &trains, &defaults, false);
+        let next_pop = LinePop::default();
+        let mut i = inputs(&pop, &trains, &defaults, false);
+        i.next_pop = Some(&next_pop);
         let close = at("2026-09-28T00:00:30Z");
         let [_, (kind, from, to)] = window_ranges(i.service_date, close, &params(), true);
         let whole_day = i.window(kind, from, to, close);
@@ -758,5 +803,157 @@ mod tests {
         assert_eq!(row.stats.delayed, 1);
         assert_eq!(row.breakdown.as_ref(), Some(&whole_day.counts));
         assert_eq!(line_row_v2(&whole_day, false).availability, "pending");
+    }
+
+    // --- 2026-10-02: a train belongs to the rail day its due time is in ---
+
+    /// A train of service date `date` booked at `time` London time.
+    fn local_train(uid: &str, date: &str, time: &str) -> LineTrain {
+        let due = to_minutes(common::rail_day::london_to_utc(
+            date.parse().unwrap(),
+            time.parse().unwrap(),
+        ));
+        LineTrain {
+            uid: uid.into(),
+            due_min: due,
+            last_due_min: due + 20,
+            origin_dep_min: due.saturating_sub(10),
+        }
+    }
+
+    fn late_at(train: &LineTrain, delay: i16) -> TrainDay {
+        TrainDay {
+            activated: true,
+            reports: vec![Report {
+                planned_min: train.due_min,
+                delay,
+                tiploc: 1,
+            }],
+            ..TrainDay::default()
+        }
+    }
+
+    /// Rail day `date`'s day-to-date (`now`) and closed-day windows for a
+    /// line whose `date` population holds `today` and whose `date + 1`
+    /// population holds `tomorrow`; each train is 5 minutes late (its
+    /// TRUST state in the map the service date routes it to).
+    fn rail_day_counts(
+        date: &str,
+        today: &[LineTrain],
+        tomorrow: &[LineTrain],
+        now: DateTime<Utc>,
+    ) -> (FullCoverageWindowCounts, FullCoverageWindowCounts, bool) {
+        let service_date: chrono::NaiveDate = date.parse().unwrap();
+        let mut trains = TrainState::new(service_date);
+        for t in today {
+            trains.current.insert(t.uid.to_string(), late_at(t, 5));
+        }
+        for t in tomorrow {
+            trains.next.insert(t.uid.to_string(), late_at(t, 5));
+        }
+        let pop = line_pop(today.to_vec(), Relevance::Full);
+        let next_pop = line_pop(tomorrow.to_vec(), Relevance::Full);
+        let defaults = common::Defaults::default();
+        let mut i = inputs(&pop, &trains, &defaults, false);
+        i.service_date = service_date;
+        i.observed_from = crate::stats::rail_day_start(service_date) - chrono::Duration::hours(6);
+        i.next_pop = Some(&next_pop);
+        let [_, (kind, from, to)] = window_ranges(service_date, now, &params(), false);
+        let so_far = i.window(kind, from, to, now);
+        let close = crate::stats::rail_day_start(service_date + chrono::Duration::days(1))
+            + chrono::Duration::seconds(30);
+        let [_, (kind, from, to)] = window_ranges(service_date, close, &params(), true);
+        let closed = i.window(kind, from, to, close);
+        (so_far.counts, closed.counts, closed.partial)
+    }
+
+    /// The bug the 2026-10-02 shadow evaluation found: a train of service
+    /// date D + 1 departing 00:30 London is due inside rail day D, so it
+    /// belongs to D's day-to-date and closed-day counts (it used to fall in
+    /// no window at all). A train of D + 1 due after 02:00 is not D's.
+    #[test]
+    fn the_next_dates_trains_before_0200_belong_to_this_rail_day() {
+        let today = [local_train("DAY", "2026-09-30", "18:00:00")];
+        let tomorrow = [
+            local_train("EARLY", "2026-10-01", "00:30:00"),
+            local_train("AFTER", "2026-10-01", "02:30:00"),
+        ];
+        // 00:50 London (23:50Z): the 00:30 train is due and counted.
+        let (so_far, closed, partial) =
+            rail_day_counts("2026-09-30", &today, &tomorrow, at("2026-09-30T23:50:00Z"));
+        assert_eq!((so_far.total, so_far.delayed), (2, 2), "{so_far:?}");
+        assert_eq!((closed.total, closed.delayed), (2, 2), "{closed:?}");
+        assert!(!partial);
+    }
+
+    /// The 00:30 train is in the recent window around it, judged on the
+    /// next date's TRUST state (its Activation went to `next`).
+    #[test]
+    fn the_recent_window_before_0200_counts_the_next_dates_trains() {
+        let service_date: chrono::NaiveDate = "2026-09-30".parse().unwrap();
+        let early = local_train("EARLY", "2026-10-01", "00:30:00");
+        let mut trains = TrainState::new(service_date);
+        // The same UID runs on both dates: each date's state is its own.
+        trains.current.insert("EARLY".into(), late_at(&early, 0));
+        trains.next.insert("EARLY".into(), late_at(&early, 9));
+        let pop = line_pop(vec![], Relevance::Full);
+        let next_pop = line_pop(vec![early], Relevance::Full);
+        let defaults = common::Defaults::default();
+        let mut i = inputs(&pop, &trains, &defaults, false);
+        i.service_date = service_date;
+        i.next_pop = Some(&next_pop);
+        let now = at("2026-10-01T00:00:00Z"); // 01:00 London
+        let [(kind, from, to), _] = window_ranges(service_date, now, &params(), false);
+        let w = i.window(kind, from, to, now);
+        assert_eq!((w.counts.total, w.counts.delayed), (1, 1), "{:?}", w.counts);
+        assert_eq!(w.counts.avg_delay_minutes, 9.0);
+        assert!(!w.partial);
+    }
+
+    /// The autumn change (2026-10-25, a 25-hour rail day 10-24) and the
+    /// spring change (2027-03-28, a 23-hour rail day 03-27): the next
+    /// date's trains before 02:00 local are still counted, and its trains
+    /// after 02:00 local are not.
+    #[test]
+    fn the_rail_day_boundary_follows_dst() {
+        // Autumn: 00:30 BST and the first 01:30 (BST) are before 02:00 GMT
+        // (02:00Z); 02:15 GMT is after.
+        let tomorrow = [
+            local_train("A0030", "2026-10-25", "00:30:00"),
+            local_train("A0130", "2026-10-25", "01:30:00"),
+            local_train("A0215", "2026-10-25", "02:15:00"),
+        ];
+        let (_, closed, _) =
+            rail_day_counts("2026-10-24", &[], &tomorrow, at("2026-10-25T01:50:00Z"));
+        assert_eq!(closed.total, 2, "{closed:?}");
+        // Spring: 00:30 GMT is before 02:00 BST (01:00Z); a booked 01:30
+        // falls in the skipped hour and reads as 02:30 BST, so it is the
+        // next rail day's.
+        let tomorrow = [
+            local_train("S0030", "2027-03-28", "00:30:00"),
+            local_train("S0130", "2027-03-28", "01:30:00"),
+        ];
+        let (_, closed, _) =
+            rail_day_counts("2027-03-27", &[], &tomorrow, at("2027-03-28T00:50:00Z"));
+        assert_eq!(closed.total, 1, "{closed:?}");
+    }
+
+    /// Without the next date's population, a window that reaches local
+    /// midnight is partial (its after-midnight trains cannot be counted);
+    /// one that ends before midnight is not.
+    #[test]
+    fn a_window_past_midnight_without_the_next_population_is_partial() {
+        let trains = TrainState::new("2026-09-27".parse().unwrap());
+        let pop = line_pop(vec![], Relevance::Full);
+        let defaults = common::Defaults::default();
+        let i = inputs(&pop, &trains, &defaults, false);
+        let evening = at("2026-09-27T22:00:00Z"); // 23:00 BST
+        let [(kind, from, to), _] = window_ranges(i.service_date, evening, &params(), false);
+        assert!(!i.window(kind, from, to, evening).partial);
+        let night = at("2026-09-27T23:30:00Z"); // 00:30 BST, window ends 00:20
+        let [(kind, from, to), (dkind, dfrom, dto)] =
+            window_ranges(i.service_date, night, &params(), false);
+        assert!(i.window(kind, from, to, night).partial);
+        assert!(i.window(dkind, dfrom, dto, night).partial);
     }
 }

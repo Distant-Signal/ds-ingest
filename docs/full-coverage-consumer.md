@@ -55,6 +55,12 @@ entries, 21 MB of JSON), the startup peak RSS was **381,492 KB (about
 For comparison, the previous binary reached 304,984 KB (about 298 MiB) after
 consuming the same day through the group.
 
+With windowed stats on, production's shadow run (2026-09-29 to 10-02)
+measured a steady working set of 430-570 MiB. It is bounded, and it drops
+back at each rail-day rollover. That was accepted on 2026-10-02: the
+resource target is about 650 MiB, the chart requests 640Mi, and the limit
+stays 1Gi.
+
 `/healthz` keeps beating throughout startup. A long wait for `api` is
 therefore not restarted by the liveness probe; `full_coverage_consumer_startup_complete`
 reports it instead.
@@ -115,7 +121,7 @@ before.
 | `FULL_COVERAGE_WINDOW_ENFORCE_LINES` | aggregator | empty | Lines `enforce` may change (comma list, or `*`). Empty: nothing is enforced until lines are named. |
 | `FULL_COVERAGE_WINDOW_MIN_ESCALATION_RANK` | aggregator | 4 | Only Severe Delays / Part Suspended are enforced. Minor Delays / Reduced Service are recorded as `would_escalate_to` with `below_min_rank`. |
 | `FULL_COVERAGE_WINDOW_STATS_RETENTION_DAYS` | aggregator | 14 | Prunes both window tables, in every mode. |
-| `full_coverage_delay_threshold_minutes` / `full_coverage_min_sample_size` / `full_coverage_min_affected` | `Defaults`, per line via `severity_overrides` | 3 / 6 / 3 | Delayed = 3+ minutes late at the train's first report on the line; a window needs 6 evaluable trains and a tier 3 affected trains. |
+| `full_coverage_delay_threshold_minutes` / `full_coverage_min_sample_size` / `full_coverage_min_affected` / `full_coverage_severe_min_affected` | `Defaults`, per line via `severity_overrides` | 3 / 6 / 3 / 5 | Delayed = 3+ minutes late at the train's first report on the line; a window needs 6 evaluable trains, a Minor Delays / Reduced Service tier 3 affected trains, and a Severe Delays / Part Suspended tier 5 (2026-10-02 calibration). |
 
 **Rollout.** Deploy `schedule-reference` and `api` first (the population then
 carries `operator_atoc`/`train_status`, and the route and migrations exist),
@@ -127,6 +133,12 @@ Rollback at any stage: `FULL_COVERAGE_WINDOW_MODE=off`.
 reports bucket health, the would-escalate log (enforced tier vs lower tiers),
 the comparison with LDBWS, the closed-day audit rows, the aggregator's own
 verdicts, and per-line volume with suggested pilot lines.
+
+**A train counts in the rail day its due time falls in.** Rail day D
+(02:00 London on D to 02:00 on D + 1) counts D's population plus D + 1's
+trains due after midnight and before 02:00, judged on the next date's TRUST
+state. If D + 1's population is not loaded yet, any window that reaches
+local midnight is `partial`.
 
 **Expect more "delayed" trains than the design measured.** It measured at 5
 minutes; the threshold is 3.
