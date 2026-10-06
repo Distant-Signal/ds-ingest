@@ -213,6 +213,7 @@ async fn run() -> anyhow::Result<()> {
     )
     .await?;
 
+    let mut feed_failures = common::backoff::FailureStreak::new(FEED_RETRY_BACKOFF);
     let stats_write_interval = Duration::from_secs(config.stats_write_interval_secs);
     let mut last_stats_write = tokio::time::Instant::now() - stats_write_interval;
 
@@ -316,11 +317,18 @@ async fn run() -> anyhow::Result<()> {
         // `Arc`), not `load`: the snapshot is held across `next_batch`'s
         // blocking read, and `ArcSwap` guards are meant to be short-lived.
         let cycle_start = std::time::Instant::now();
-        consume_once(&mut feed, &mut day, &lookups, &population.load_full()).await;
+        let failed = consume_once(&mut feed, &mut day, &lookups, &population.load_full()).await;
         metrics::histogram!(common::metrics::metric_name(
             "full_coverage_consumer_cycle_duration_seconds"
         ))
         .record(cycle_start.elapsed().as_secs_f64());
+        if failed {
+            progress
+                .idle(tokio::time::sleep(feed_failures.failed(None)))
+                .await;
+        } else {
+            feed_failures.succeeded();
+        }
 
         // 3. stats write.
         if last_stats_write.elapsed() >= stats_write_interval {
@@ -478,13 +486,15 @@ fn publish_day_partial_metrics(day: &DayState) {
     }
 }
 
-/// One read-dispatch-commit step against the group.
+/// One read-dispatch-commit step against the group. Returns `true` when
+/// the feed read or the dead-letter write failed (the batch stays pending),
+/// so the caller backs off ([`FEED_RETRY_BACKOFF`]) before the next step.
 async fn consume_once<F: MovementFeed + DeadLetterSink>(
     feed: &mut F,
     day: &mut DayState,
     lookups: &Lookups,
     population: &population::Population,
-) {
+) -> bool {
     let batch = match feed.next_batch().await {
         Ok(batch) => batch,
         Err(err) => {
@@ -494,8 +504,7 @@ async fn consume_once<F: MovementFeed + DeadLetterSink>(
                 "operation" => "movement_feed_receive"
             )
             .increment(1);
-            tokio::time::sleep(ERROR_BACKOFF).await;
-            return;
+            return true;
         }
     };
     let mut unparseable = Vec::new();
@@ -527,7 +536,7 @@ async fn consume_once<F: MovementFeed + DeadLetterSink>(
             "operation" => "dead_letter"
         )
         .increment(1);
-        tokio::time::sleep(ERROR_BACKOFF).await;
+        return true;
     }
     // Commit as soon as the batch is dispatched into in-memory state -- see
     // this module's doc for why, and for what restores that state after a
@@ -540,6 +549,7 @@ async fn consume_once<F: MovementFeed + DeadLetterSink>(
         )
         .increment(1);
     }
+    false
 }
 
 /// Fetches the stanox/crs crosswalk and rebuilds everything derived from
@@ -610,11 +620,12 @@ async fn load_stanox_crs_until_ok(
     }
 }
 
-/// How long to wait before retrying after a feed-level failure -- flat,
-/// not exponential, same reasoning as `trust-consumer::main::ERROR_BACKOFF`:
-/// the stream holds the backlog, so there's nothing to drain, only a log/API
-/// to avoid hammering.
-const ERROR_BACKOFF: Duration = Duration::from_secs(2);
+/// Wait after a feed-level failure (a failed Redis read or dead-letter
+/// write): 1s doubling to 30s, jittered, reset by the next good step. It
+/// used to be a flat 2s; the stream holds the backlog, so a longer wait
+/// loses nothing (the same change as trust-consumer's `CYCLE_RETRY_BACKOFF`).
+const FEED_RETRY_BACKOFF: common::backoff::Backoff =
+    common::backoff::Backoff::new(Duration::from_secs(1), Duration::from_secs(30));
 
 /// What the top of the loop must do about the rail day, given the day it is
 /// currently correlating into and the current instant. Split out of the loop
@@ -1877,6 +1888,24 @@ mod tests {
                 .derived
                 .contains_key(&("waterloo-reading".to_string(), "C11052".to_string()))
         );
+    }
+
+    /// A step whose dead-letter write fails commits nothing and asks the
+    /// loop to back off; a good step does not.
+    #[tokio::test]
+    async fn a_failed_step_asks_for_a_backoff_and_commits_nothing() {
+        let population = shared(population::Population::default());
+        let lookups = waterloo_lookups();
+        let mut day = DayState::new(current_rail_service_date(chrono::Utc::now()));
+
+        let mut feed = FakeMovementFeed::new(vec![vec!["not json at all".to_string()]]);
+        feed.fail_next_dead_letter = true;
+        assert!(consume_once(&mut feed, &mut day, &lookups, &population.load()).await);
+        assert_eq!(feed.committed_count, 0);
+
+        let mut feed = FakeMovementFeed::new(vec![vec![ACTIVATION_C11052.to_string()]]);
+        assert!(!consume_once(&mut feed, &mut day, &lookups, &population.load()).await);
+        assert_eq!(feed.committed_count, 1);
     }
 
     // --- 2026-09-27: windowed stats end to end through write_stats ---

@@ -162,6 +162,8 @@ async fn run() -> anyhow::Result<()> {
     let mut reference_reload =
         common::backoff::RetrySchedule::new(reload_interval, TRACKED_TRAINS_RETRY);
     reference_reload.succeeded();
+    // Consecutive failed cycles; see `CYCLE_RETRY_BACKOFF`.
+    let mut cycle_failures = common::backoff::FailureStreak::new(CYCLE_RETRY_BACKOFF);
 
     loop {
         if reference_reload.is_due() {
@@ -179,7 +181,8 @@ async fn run() -> anyhow::Result<()> {
                 Err(err) => {
                     // An already-loaded reference is kept as it is: a stale
                     // snapshot is far better than none (PL-11).
-                    let retry_in = reference_reload.failed();
+                    let retry_in =
+                        reference_reload.failed_honouring(common::ingest::retry_after(&err));
                     tracing::error!(
                         error = ?err,
                         failures = reference_reload.failures(),
@@ -223,6 +226,9 @@ async fn run() -> anyhow::Result<()> {
             last_redis_gap_check = tokio::time::Instant::now();
         }
 
+        // api's Retry-After when the POST got a 503 (its database is
+        // unavailable).
+        let mut retry_after = None;
         let outcome = run_cycle(
             &mut feed,
             &reference,
@@ -235,7 +241,8 @@ async fn run() -> anyhow::Result<()> {
                     &internal_oauth,
                     events,
                 )
-                .await?;
+                .await
+                .inspect_err(|err| retry_after = common::ingest::retry_after(err))?;
                 // Forward signals only for events api actually wrote.
                 let rejected: std::collections::HashSet<usize> =
                     response.rejected.iter().map(|row| row.index).collect();
@@ -264,17 +271,19 @@ async fn run() -> anyhow::Result<()> {
         )
         .await;
 
-        if outcome == Cycle::Failed {
+        if let Some(wait) = cycle_wait(&outcome, &mut cycle_failures, retry_after) {
             // Nothing here waits on anything: `run_once` returns as soon as
             // the feed hands over a batch, and every failure path above
             // skips the commit, so a persistently-down `api` or an erroring
-            // feed would otherwise spin this loop at full speed -- hammering
-            // `api` and the log for the whole outage. A flat, short pause is
-            // enough to make that a trickle; it deliberately isn't
-            // exponential or configurable, because the loop has no backlog
-            // to drain (the stream holds the backlog) and a fixed small delay
-            // costs nothing once the outage clears.
-            tokio::time::sleep(ERROR_BACKOFF).await;
+            // feed would otherwise spin this loop at full speed. The batch
+            // stays pending in the stream (at-least-once), so waiting longer
+            // loses nothing; see `CYCLE_RETRY_BACKOFF`.
+            tracing::warn!(
+                failures = cycle_failures.failures(),
+                retry_in_ms = wait.as_millis() as u64,
+                "cycle failed; backing off before the redelivery"
+            );
+            progress.idle(tokio::time::sleep(wait)).await;
         }
         // One loop iteration completed, however it went -- see
         // `health_http::Progress`.
@@ -289,7 +298,7 @@ async fn run() -> anyhow::Result<()> {
 /// default) instead of the pod being killed or exiting into
 /// `CrashLoopBackOff`. After startup each Redis command is bounded (see
 /// `common::redis_conn`) and a failure is a `Cycle::Failed`: backed off by
-/// `ERROR_BACKOFF`, progress beaten, retried.
+/// `CYCLE_RETRY_BACKOFF`, progress beaten, retried.
 async fn connect_redis_feed(
     config: &Config,
     backoff: common::backoff::Backoff,
@@ -312,9 +321,29 @@ async fn connect_redis_feed(
     .await
 }
 
-/// How long to wait before retrying after a failed cycle. See its one use
-/// site above for why a flat constant is the right shape here.
-const ERROR_BACKOFF: Duration = Duration::from_secs(2);
+/// Wait after a failed cycle (a failed POST, a feed error, a failed
+/// dead-letter write): 2s doubling to 60s, jittered, and at least `api`'s
+/// `Retry-After` on a 503. It used to be a flat 2s, deliberately: the
+/// stream holds the backlog, so waiting longer loses nothing, but a flat 2s
+/// through the six-hour 2026-10-01 Postgres outage was a POST every 2s.
+const CYCLE_RETRY_BACKOFF: common::backoff::Backoff =
+    common::backoff::Backoff::new(Duration::from_secs(2), Duration::from_secs(60));
+
+/// How long to wait after a cycle, if at all: a committed cycle resets the
+/// streak, a failed one waits its next backoff (honouring `retry_after`).
+fn cycle_wait(
+    outcome: &Cycle,
+    failures: &mut common::backoff::FailureStreak,
+    retry_after: Option<Duration>,
+) -> Option<Duration> {
+    match outcome {
+        Cycle::Committed => {
+            failures.succeeded();
+            None
+        }
+        Cycle::Failed => Some(failures.failed(retry_after)),
+    }
+}
 
 /// First and largest retry delay for the startup reference load (PL-11):
 /// 1 s, doubling, capped at 30 s -- the same shape full-coverage-consumer
@@ -803,8 +832,37 @@ mod tests {
             prefix: "ingestion POST failed",
             status: reqwest::StatusCode::from_u16(status).unwrap(),
             body: String::new(),
+            retry_after: None,
         }
         .into()
+    }
+
+    /// Consecutive failed cycles back off exponentially (capped at 60s),
+    /// honour api's Retry-After, and reset after a committed cycle.
+    #[test]
+    fn failed_cycles_back_off_exponentially_and_reset_on_success() {
+        let mut failures = common::backoff::FailureStreak::new(CYCLE_RETRY_BACKOFF);
+        let mut previous_ceiling = Duration::ZERO;
+        for attempt in 0..8 {
+            let wait = cycle_wait(&Cycle::Failed, &mut failures, None).unwrap();
+            let ceiling = CYCLE_RETRY_BACKOFF.ceiling(attempt);
+            assert!(
+                wait >= ceiling / 2 && wait <= ceiling,
+                "{attempt}: {wait:?}"
+            );
+            assert!(ceiling >= previous_ceiling);
+            previous_ceiling = ceiling;
+        }
+        assert_eq!(previous_ceiling, Duration::from_secs(60));
+        let wait = cycle_wait(&Cycle::Failed, &mut failures, Some(Duration::from_secs(30)));
+        assert!(wait.unwrap() >= Duration::from_secs(30));
+        assert_eq!(cycle_wait(&Cycle::Committed, &mut failures, None), None);
+        assert_eq!(failures.failures(), 0);
+        let wait = cycle_wait(&Cycle::Failed, &mut failures, Some(Duration::from_secs(30)));
+        assert!(
+            wait.unwrap() >= Duration::from_secs(30),
+            "Retry-After honoured"
+        );
     }
 
     /// PL-2: transient failures (timeouts, 5xx, auth, ...) never reach

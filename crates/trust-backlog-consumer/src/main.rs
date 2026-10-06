@@ -143,6 +143,10 @@ async fn run() -> anyhow::Result<()> {
     let redis_gap_check_interval = Duration::from_secs(config.redis_gap_check_secs);
     let mut last_redis_gap_check = tokio::time::Instant::now() - redis_gap_check_interval;
 
+    // Consecutive failed deliveries and feed reads; see `delivery_wait`.
+    let mut delivery_failures = common::backoff::FailureStreak::new(DELIVERY_RETRY_BACKOFF);
+    let mut feed_failures = common::backoff::FailureStreak::new(FEED_RETRY_BACKOFF);
+
     loop {
         // 1. stanox_crs reload.
         if last_stanox_crs_reload.elapsed() >= stanox_crs_reload_interval {
@@ -195,6 +199,7 @@ async fn run() -> anyhow::Result<()> {
         let cycle_start = std::time::Instant::now();
         match feed.next_batch().await {
             Ok(batch) => {
+                feed_failures.succeeded();
                 let now = chrono::Utc::now();
                 let today = current_rail_day(now);
                 // Age out parked Activations once per rail day (finding #5):
@@ -280,21 +285,31 @@ async fn run() -> anyhow::Result<()> {
                     .increment(1);
                 }
 
+                // api's Retry-After when the POST got a 503 (its database is
+                // unavailable), for `delivery_wait`.
+                let mut retry_after = None;
                 let delivery = deliver_batch(&mut feed, &events, &unparseable, async |events| {
-                    queries::post_trust_event_backlog(
+                    let posted = queries::post_trust_event_backlog(
                         &http,
                         &config.api_ingest_url,
                         &internal_oauth,
                         events,
                     )
-                    .await
+                    .await;
+                    if let Err(err) = &posted {
+                        retry_after = common::ingest::retry_after(err);
+                    }
+                    posted
                 })
                 .await;
-                if matches!(
-                    delivery,
-                    Delivery::PostFailed | Delivery::Rejected | Delivery::DeadLetterFailed
-                ) {
-                    tokio::time::sleep(ERROR_BACKOFF).await;
+                if let Some(wait) = delivery_wait(&delivery, &mut delivery_failures, retry_after) {
+                    tracing::warn!(
+                        failures = delivery_failures.failures(),
+                        retry_in_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+                        "trust-event-backlog batch not delivered; backing off before the redelivery"
+                    );
+                    // Beats while it waits: a long backoff is not a stall.
+                    progress.idle(tokio::time::sleep(wait)).await;
                 }
             }
             Err(err) => {
@@ -304,7 +319,9 @@ async fn run() -> anyhow::Result<()> {
                     "operation" => "movement_feed_receive"
                 )
                 .increment(1);
-                tokio::time::sleep(ERROR_BACKOFF).await;
+                progress
+                    .idle(tokio::time::sleep(feed_failures.failed(None)))
+                    .await;
             }
         }
         metrics::histogram!(common::metrics::metric_name(
@@ -330,7 +347,40 @@ fn unparseable_payload(raw: &str, err: &impl std::fmt::Debug) -> DeadLetter {
     }
 }
 
-const ERROR_BACKOFF: Duration = Duration::from_secs(2);
+/// Wait after a batch that was not delivered (POST failed, `api` rejected
+/// it, or a dead-letter write failed): 2s doubling to 60s, jittered, and at
+/// least `api`'s `Retry-After` on a 503. It used to be a flat 2s, so through
+/// the 2026-10-01 Postgres outage this consumer re-POSTed its pending batch
+/// every 2s for six hours (~2,200 failures).
+const DELIVERY_RETRY_BACKOFF: common::backoff::Backoff =
+    common::backoff::Backoff::new(Duration::from_secs(2), Duration::from_secs(60));
+
+/// Wait after a failed read from the movement feed (Redis): 1s doubling to
+/// 30s, jittered.
+const FEED_RETRY_BACKOFF: common::backoff::Backoff =
+    common::backoff::Backoff::new(Duration::from_secs(1), Duration::from_secs(30));
+
+/// How long to wait after `delivery` before the next batch, if at all: a
+/// committed batch resets the streak; a batch left pending (nothing
+/// `XACKed`, so it is redelivered: at-least-once) waits the streak's next
+/// backoff, honouring `retry_after`. A failed XACK does not wait: the batch
+/// landed, and its redelivery is a harmless duplicate.
+fn delivery_wait(
+    delivery: &Delivery,
+    failures: &mut common::backoff::FailureStreak,
+    retry_after: Option<Duration>,
+) -> Option<Duration> {
+    match delivery {
+        Delivery::Committed => {
+            failures.succeeded();
+            None
+        }
+        Delivery::CommitFailed => None,
+        Delivery::PostFailed | Delivery::Rejected | Delivery::DeadLetterFailed => {
+            Some(failures.failed(retry_after))
+        }
+    }
+}
 
 /// What [`deliver_batch`] did with one batch.
 #[derive(Debug, PartialEq, Eq)]
@@ -712,6 +762,118 @@ mod deliver_batch_tests {
 
     /// If the rejected rows cannot be stored, `ACKing` would lose them: the
     /// batch stays pending and is retried instead.
+    /// Consecutive undelivered batches wait longer and longer (2s, 4s, 8s,
+    /// ... jittered, capped at 60s) instead of a flat 2s, at least api's
+    /// Retry-After on a 503, and a delivered batch resets that.
+    #[test]
+    fn undelivered_batches_back_off_exponentially_and_reset_on_success() {
+        let mut failures = common::backoff::FailureStreak::new(DELIVERY_RETRY_BACKOFF);
+        let mut previous_ceiling = Duration::ZERO;
+        for attempt in 0..8 {
+            let wait = delivery_wait(&Delivery::PostFailed, &mut failures, None)
+                .expect("a failed post waits");
+            let ceiling = DELIVERY_RETRY_BACKOFF.ceiling(attempt);
+            assert!(
+                wait >= ceiling / 2 && wait <= ceiling,
+                "{attempt}: {wait:?}"
+            );
+            assert!(ceiling >= previous_ceiling);
+            previous_ceiling = ceiling;
+        }
+        assert_eq!(previous_ceiling, Duration::from_secs(60), "capped");
+        let wait = delivery_wait(
+            &Delivery::PostFailed,
+            &mut failures,
+            Some(Duration::from_secs(90)),
+        )
+        .unwrap();
+        assert!(
+            wait >= Duration::from_secs(90),
+            "Retry-After honoured: {wait:?}"
+        );
+        assert!(delivery_wait(&Delivery::Rejected, &mut failures, None).is_some());
+        assert!(delivery_wait(&Delivery::DeadLetterFailed, &mut failures, None).is_some());
+        assert_eq!(
+            delivery_wait(&Delivery::CommitFailed, &mut failures, None),
+            None
+        );
+        assert_eq!(
+            delivery_wait(&Delivery::Committed, &mut failures, None),
+            None
+        );
+        assert_eq!(
+            failures.failures(),
+            0,
+            "a delivered batch resets the streak"
+        );
+        let wait = delivery_wait(&Delivery::PostFailed, &mut failures, None).unwrap();
+        assert!(wait <= Duration::from_secs(2), "{wait:?}");
+    }
+
+    /// A 503 + Retry-After from api reaches `delivery_wait` through the
+    /// real POST, and the batch stays pending (at-least-once).
+    #[tokio::test]
+    async fn a_503_leaves_the_batch_pending_and_carries_retry_after() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The OAuth token endpoint answers normally; the ingest POST gets
+        // api's database-unavailable 503.
+        let _server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let (status, extra, body) = if buf[..n].starts_with(b"POST /token/") {
+                    (
+                        "200 OK",
+                        "",
+                        r#"{"access_token":"fake-jwt","expires_in":300}"#,
+                    )
+                } else {
+                    (
+                        "503 Service Unavailable",
+                        "retry-after: 30\r\n",
+                        r#"{"error":"service_unavailable","retryable":true}"#,
+                    )
+                };
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+            }
+        });
+        let client = reqwest::Client::new();
+        let tokens =
+            common::oauth_client::OAuthTokenCache::new(common::oauth_client::OAuthCredentials {
+                token_url: format!("http://{addr}/token/"),
+                client_id: "c".to_string(),
+                scope: "groups".to_string(),
+                username: "u".to_string(),
+                password: "p".to_string(),
+            });
+        let url = format!("http://{addr}/private/trust-event-backlog");
+        let mut feed = feed_with_one_batch().await;
+        let events = vec![event("0003", "good")];
+        let mut retry_after = None;
+        let delivery = deliver_batch(&mut feed, &events, &[], async |events| {
+            let posted = queries::post_trust_event_backlog(&client, &url, &tokens, events).await;
+            if let Err(err) = &posted {
+                retry_after = common::ingest::retry_after(err);
+            }
+            posted
+        })
+        .await;
+        assert_eq!(delivery, Delivery::PostFailed);
+        assert_eq!(feed.committed_count, 0, "nothing acked");
+        assert!(feed.dead_lettered.is_empty(), "nothing dead-lettered");
+        assert!(feed.rejected_batches.is_empty(), "a 503 is not a rejection");
+        assert_eq!(retry_after, Some(Duration::from_secs(30)));
+        let mut failures = common::backoff::FailureStreak::new(DELIVERY_RETRY_BACKOFF);
+        let wait = delivery_wait(&delivery, &mut failures, retry_after).unwrap();
+        assert!(wait >= Duration::from_secs(30), "{wait:?}");
+    }
+
     #[tokio::test]
     async fn a_failed_dead_letter_write_leaves_the_batch_un_acked() {
         let mut feed = feed_with_one_batch().await;
@@ -746,6 +908,7 @@ mod deliver_batch_tests {
                     prefix: "ingestion POST failed",
                     status: reqwest::StatusCode::from_u16(status).unwrap(),
                     body: String::new(),
+                    retry_after: None,
                 }
                 .into())
             })
@@ -768,6 +931,7 @@ mod deliver_batch_tests {
                 prefix: "ingestion POST failed",
                 status: reqwest::StatusCode::UNPROCESSABLE_ENTITY,
                 body: "bad row".to_string(),
+                retry_after: None,
             }
             .into())
         })
