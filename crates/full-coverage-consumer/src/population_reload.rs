@@ -119,7 +119,8 @@ pub(crate) async fn reload_cycle(
 /// keeps its previous snapshot and is reported in [`CycleOutcome::failed`].
 #[expect(
     clippy::too_many_arguments,
-    reason = "each argument is an independent input from the single caller; a struct would only wrap them"
+    clippy::too_many_lines,
+    reason = "each argument is an independent input from the single caller; a struct would only wrap them. One loop body per fetch outcome, read top to bottom"
 )]
 pub(crate) async fn reload_cycle_from(
     client: &reqwest::Client,
@@ -200,6 +201,14 @@ pub(crate) async fn reload_cycle_from(
                     drop(body);
                     match parsed {
                         Ok(Some(pop)) => {
+                            if let Some(shadow) = &pop.membership_shadow {
+                                let day = if date == dates[0] {
+                                    "today"
+                                } else {
+                                    "tomorrow"
+                                };
+                                report_membership_shadow(line_id, date, day, shadow);
+                            }
                             next.insert_line_pop(line_id, date, pop, etag);
                             outcome.succeeded += 1;
                         }
@@ -240,6 +249,63 @@ pub(crate) async fn reload_cycle_from(
         }
     }
     (next, outcome)
+}
+
+/// `FULL_COVERAGE_LINE_MEMBERSHIP=shadow`: exports one line and day's
+/// comparison of the two relevance rules, set on every fresh download of
+/// its population, and logs it -- the evidence for switching to `scope`.
+///
+/// * `full_coverage_consumer_line_membership_trains{line,day,rule}` --
+///   relevant trains under `legacy` (§4.1) and under `scope`;
+/// * `full_coverage_consumer_line_membership_differences{line,day,kind}` --
+///   trains only one rule keeps (`legacy_only`, `scope_only`);
+/// * `full_coverage_consumer_line_membership_scoped_entries{line,day}` --
+///   entries carrying `scope` (0: the population predates it).
+fn report_membership_shadow(
+    line_id: &str,
+    date: chrono::NaiveDate,
+    day: &'static str,
+    shadow: &crate::population::MembershipShadow,
+) {
+    for (rule, count) in [("legacy", shadow.legacy), ("scope", shadow.scope)] {
+        metrics::gauge!(
+            common::metrics::metric_name("full_coverage_consumer_line_membership_trains"),
+            "line" => line_id.to_string(),
+            "day" => day,
+            "rule" => rule
+        )
+        .set(f64::from(count));
+    }
+    for (kind, count) in [
+        ("legacy_only", shadow.legacy_only),
+        ("scope_only", shadow.scope_only),
+    ] {
+        metrics::gauge!(
+            common::metrics::metric_name("full_coverage_consumer_line_membership_differences"),
+            "line" => line_id.to_string(),
+            "day" => day,
+            "kind" => kind
+        )
+        .set(f64::from(count));
+    }
+    metrics::gauge!(
+        common::metrics::metric_name("full_coverage_consumer_line_membership_scoped_entries"),
+        "line" => line_id.to_string(),
+        "day" => day
+    )
+    .set(f64::from(shadow.scoped_entries));
+    tracing::info!(
+        line_id,
+        %date,
+        legacy = shadow.legacy,
+        scope = shadow.scope,
+        legacy_only = shadow.legacy_only,
+        scope_only = shadow.scope_only,
+        scoped_entries = shadow.scoped_entries,
+        legacy_only_sample = ?shadow.legacy_only_sample,
+        scope_only_sample = ?shadow.scope_only_sample,
+        "line membership shadow comparison"
+    );
 }
 
 /// How many of `line_ids` have no population held for `date` (never
@@ -793,6 +859,7 @@ pub(crate) mod tests {
                 calling_points: vec![],
                 operator_atoc: None,
                 train_status: None,
+                ..Default::default()
             }],
         );
         let lines = vec!["waterloo-reading".to_string()];

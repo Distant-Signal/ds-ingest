@@ -167,6 +167,33 @@ pub(crate) struct WindowedStatsArgs {
     /// this marks the write `feed_stale`.
     #[arg(long, env, default_value_t = 300)]
     pub full_coverage_feed_stale_secs: u64,
+    /// Which rule picks a line's relevant trains for the windowed stats
+    /// (windowed-stats design, 2026-10-06 decision): `legacy` (§4.1,
+    /// operator + calls at two stations), `scope` (the population's train
+    /// membership, `scope == "line"`, falling back to §4.1 per entry
+    /// without one), or `shadow` (output stays `legacy`; both are computed
+    /// and compared in metrics and logs). Default `legacy`.
+    #[arg(
+        long = "full-coverage-line-membership",
+        env = "FULL_COVERAGE_LINE_MEMBERSHIP",
+        value_enum,
+        default_value_t = LineMembershipMode::Legacy
+    )]
+    pub line_membership: LineMembershipMode,
+}
+
+/// See [`WindowedStatsArgs::line_membership`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, clap::ValueEnum)]
+pub(crate) enum LineMembershipMode {
+    /// Windowed-stats design §4.1.
+    #[default]
+    Legacy,
+    /// The population entry's `scope == "line"` (train membership,
+    /// docs/superpowers/specs/2026-10-06-line-membership-design.md), §4.1
+    /// for an entry without `scope`.
+    Scope,
+    /// `legacy` output, with `scope` computed alongside and compared.
+    Shadow,
 }
 
 impl Config {
@@ -261,6 +288,8 @@ pub(crate) mod tests {
             headcode_prefixes: vec![],
             full_coverage_enabled: false,
             pass_through: Vec::new(),
+            crs_aliases: std::collections::BTreeMap::new(),
+            trunk_for: Vec::new(),
         }
     }
 
@@ -312,6 +341,7 @@ pub(crate) mod tests {
                 full_coverage_grace_minutes: 10,
                 full_coverage_activations_min: 20,
                 full_coverage_feed_stale_secs: 300,
+                line_membership: LineMembershipMode::Legacy,
             },
         }
     }

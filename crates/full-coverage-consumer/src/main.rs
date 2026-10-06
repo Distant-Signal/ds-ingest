@@ -573,6 +573,7 @@ async fn reload_stanox_crs(
         geometry.store(Arc::new(population::build_line_geometry(
             &config.lines,
             &records,
+            config.windowed.line_membership,
         )));
     }
     Ok(())
@@ -1011,6 +1012,7 @@ mod tests {
                     calling_points: vec![],
                     operator_atoc: None,
                     train_status: None,
+                    ..Default::default()
                 }],
             );
         }
@@ -1325,6 +1327,7 @@ mod tests {
                 calling_points: vec![],
                 operator_atoc: None,
                 train_status: None,
+                ..Default::default()
             }],
         );
 
@@ -1418,6 +1421,7 @@ mod tests {
                     calling_points: vec![],
                     operator_atoc: None,
                     train_status: None,
+                    ..Default::default()
                 })
                 .collect(),
         );

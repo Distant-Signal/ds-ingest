@@ -232,6 +232,7 @@ mod tests {
                 calling_points: vec![],
                 operator_atoc: None,
                 train_status: None,
+                ..Default::default()
             }],
         );
         population

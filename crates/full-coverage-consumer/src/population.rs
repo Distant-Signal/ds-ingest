@@ -5,6 +5,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::config::LineMembershipMode;
+
 #[cfg(test)]
 use schedule_query::LinePopulationEntry;
 
@@ -64,37 +66,84 @@ pub(crate) struct LinePop {
     pub geometry_hash: u64,
     /// Buses and ships left out.
     pub buses_excluded: u32,
+    /// With `FULL_COVERAGE_LINE_MEMBERSHIP=shadow`: how the train-membership
+    /// rule's relevant trains compare with the §4.1 ones `trains` holds.
+    pub membership_shadow: Option<MembershipShadow>,
 }
+
+/// One line and date's shadow comparison of the two relevance rules
+/// (`FULL_COVERAGE_LINE_MEMBERSHIP=shadow`): counts, and a few UIDs of each
+/// kind of disagreement for the log.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MembershipShadow {
+    /// Trains relevant under §4.1 (what `trains` holds in shadow mode).
+    pub legacy: u32,
+    /// Trains relevant under train membership.
+    pub scope: u32,
+    /// Relevant under §4.1 only / under membership only.
+    pub legacy_only: u32,
+    pub scope_only: u32,
+    /// Entries that carried a `scope` (0: the population predates train
+    /// membership, and both rules are §4.1).
+    pub scoped_entries: u32,
+    /// Up to [`SHADOW_SAMPLE_UIDS`] UIDs of each disagreement.
+    pub legacy_only_sample: Vec<Box<str>>,
+    pub scope_only_sample: Vec<Box<str>>,
+}
+
+/// How many disagreeing UIDs a [`MembershipShadow`] keeps per kind.
+const SHADOW_SAMPLE_UIDS: usize = 5;
 
 /// What a line's population is reduced against: its stations' TIPLOCs
 /// (resolved through the same `stanox_crs` crosswalk as
-/// [`build_tiploc_index`]) and its operators.
+/// [`build_tiploc_index`]), its operators, and which relevance rule
+/// applies (`FULL_COVERAGE_LINE_MEMBERSHIP`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct LineGeometry {
     /// Bare TIPLOC -> CRS, for the line's stations.
     pub crs_by_tiploc: HashMap<String, String>,
     pub operators: HashSet<String>,
-    /// Stable fingerprint of the two fields above.
+    pub membership: LineMembershipMode,
+    /// Stable fingerprint of the three fields above: changing the mode
+    /// re-reduces every held population, like a station change does.
     pub hash: u64,
 }
 
 impl LineGeometry {
     pub(crate) fn new(crs_by_tiploc: HashMap<String, String>, operators: HashSet<String>) -> Self {
+        let mut geometry = Self {
+            crs_by_tiploc,
+            operators,
+            membership: LineMembershipMode::Legacy,
+            hash: 0,
+        };
+        geometry.rehash();
+        geometry
+    }
+
+    /// The same geometry under relevance rule `membership`.
+    pub(crate) fn with_membership(mut self, membership: LineMembershipMode) -> Self {
+        self.membership = membership;
+        self.rehash();
+        self
+    }
+
+    fn rehash(&mut self) {
         use std::hash::{Hash, Hasher};
-        let mut pairs: Vec<(&String, &String)> = crs_by_tiploc.iter().collect();
+        let mut pairs: Vec<(&String, &String)> = self.crs_by_tiploc.iter().collect();
         pairs.sort();
-        let mut ops: Vec<&String> = operators.iter().collect();
+        let mut ops: Vec<&String> = self.operators.iter().collect();
         ops.sort();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         pairs.hash(&mut hasher);
         ops.hash(&mut hasher);
-        // Never 0, which means "no geometry".
-        let hash = hasher.finish().max(1);
-        Self {
-            crs_by_tiploc,
-            operators,
-            hash,
+        // Legacy hashes as before this field existed, so deploying it
+        // re-downloads nothing.
+        if self.membership != LineMembershipMode::Legacy {
+            self.membership.hash(&mut hasher);
         }
+        // Never 0, which means "no geometry".
+        self.hash = hasher.finish().max(1);
     }
 }
 
@@ -102,6 +151,7 @@ impl LineGeometry {
 pub(crate) fn build_line_geometry(
     lines: &[common::LineDefinition],
     stanox_crs_records: &[common::StanoxCrsRecord],
+    membership: LineMembershipMode,
 ) -> HashMap<String, Arc<LineGeometry>> {
     let crs_to_tiploc = crs_to_tiploc_map(stanox_crs_records);
     lines
@@ -120,7 +170,7 @@ pub(crate) fn build_line_geometry(
             let operators = line.operators.iter().cloned().collect();
             (
                 line.id.clone(),
-                Arc::new(LineGeometry::new(crs_by_tiploc, operators)),
+                Arc::new(LineGeometry::new(crs_by_tiploc, operators).with_membership(membership)),
             )
         })
         .collect()
@@ -149,6 +199,10 @@ struct EntryLite {
     operator_atoc: Option<String>,
     #[serde(default)]
     train_status: Option<char>,
+    /// Train membership (`line`/`shared`/`touch`); absent on a population
+    /// published before it existed.
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -161,6 +215,23 @@ struct EntryUidOnly {
 struct Candidate {
     train: LineTrain,
     operator_ok: bool,
+    /// Calls at two or more of the line's stations (§4.1).
+    two_stations: bool,
+    /// `Some(scope == "line")` when the entry carried a `scope`.
+    scope_line: Option<bool>,
+}
+
+impl Candidate {
+    /// §4.1: the line's operator (once the population carries operators)
+    /// and calls at two of its stations.
+    fn legacy(&self, full: bool) -> bool {
+        self.two_stations && (!full || self.operator_ok)
+    }
+
+    /// Train membership, §4.1 for an entry without it.
+    fn scope(&self, full: bool) -> bool {
+        self.scope_line.unwrap_or_else(|| self.legacy(full))
+    }
 }
 
 struct LinePopBuilder<'a> {
@@ -239,12 +310,14 @@ impl<'a> LinePopBuilder<'a> {
                 stations.push(crs);
             }
         }
+        // A train with no call at any of the line's stations is never
+        // relevant: it is never due on the line. One calling at only one
+        // station can still be a `scope == "line"` train (a fast train
+        // through the line), so the two-stations rule is applied later.
         let (Some(due_min), Some(last_due_min)) = (first, last) else {
             return;
         };
-        if stations.len() < 2 {
-            return;
-        }
+        let two_stations = stations.len() >= 2;
         let origin_dep_min = entry
             .calling_points
             .first()
@@ -267,6 +340,8 @@ impl<'a> LinePopBuilder<'a> {
                 origin_dep_min,
             },
             operator_ok,
+            two_stations,
+            scope_line: entry.scope.as_deref().map(|scope| scope == "line"),
         });
     }
 
@@ -277,16 +352,48 @@ impl<'a> LinePopBuilder<'a> {
             Relevance::StopsOnly
         };
         let full = self.pop.relevance == Relevance::Full;
+        let mode = self
+            .geometry
+            .map_or(LineMembershipMode::Legacy, |g| g.membership);
+        if mode == LineMembershipMode::Shadow {
+            self.pop.membership_shadow = Some(shadow_compare(&self.candidates, full));
+        }
         self.pop.trains = self
             .candidates
             .into_iter()
-            .filter(|c| !full || c.operator_ok)
+            .filter(|c| match mode {
+                LineMembershipMode::Scope => c.scope(full),
+                LineMembershipMode::Legacy | LineMembershipMode::Shadow => c.legacy(full),
+            })
             .map(|c| c.train)
             .collect();
         self.pop.trains.sort_by_key(|t| t.due_min);
         self.pop.trains.shrink_to_fit();
         self.pop
     }
+}
+
+/// Both relevance rules over one line's candidates.
+fn shadow_compare(candidates: &[Candidate], full: bool) -> MembershipShadow {
+    let mut shadow = MembershipShadow::default();
+    for c in candidates {
+        let (legacy, scope) = (c.legacy(full), c.scope(full));
+        shadow.legacy += u32::from(legacy);
+        shadow.scope += u32::from(scope);
+        shadow.scoped_entries += u32::from(c.scope_line.is_some());
+        if legacy && !scope {
+            shadow.legacy_only += 1;
+            if shadow.legacy_only_sample.len() < SHADOW_SAMPLE_UIDS {
+                shadow.legacy_only_sample.push(c.train.uid.clone());
+            }
+        } else if scope && !legacy {
+            shadow.scope_only += 1;
+            if shadow.scope_only_sample.len() < SHADOW_SAMPLE_UIDS {
+                shadow.scope_only_sample.push(c.train.uid.clone());
+            }
+        }
+    }
+    shadow
 }
 
 struct PopulationSeed<'a> {
@@ -809,6 +916,90 @@ mod tests {
             / 60) as u32
     }
 
+    // --- 2026-10-06: FULL_COVERAGE_LINE_MEMBERSHIP ---
+
+    /// Four trains on a two-station line: OWN (the operator's, both
+    /// stations, scope line), FAST (scope line, calls at one station only),
+    /// OTHER (another operator, both stations, scope shared), OLD (no scope:
+    /// both rules fall back to §4.1).
+    fn membership_entries() -> Vec<serde_json::Value> {
+        let both = || {
+            vec![
+                cp("LLJ", None, Some("08:00:00"), 0),
+                cp("BFF", Some("09:00:00"), None, 0),
+            ]
+        };
+        let with_scope = |mut e: serde_json::Value, scope: &str| {
+            e["scope"] = scope.into();
+            e
+        };
+        vec![
+            with_scope(entry("OWN", Some("AW"), Some("P"), both()), "line"),
+            with_scope(
+                entry(
+                    "FAST",
+                    Some("AW"),
+                    Some("P"),
+                    vec![
+                        cp("LLJ", None, Some("08:30:00"), 0),
+                        cp("BFF", None, None, 0),
+                    ],
+                ),
+                "line",
+            ),
+            with_scope(entry("OTHER", Some("XC"), Some("P"), both()), "shared"),
+            entry("OLD", Some("AW"), Some("P"), both()),
+        ]
+    }
+
+    fn train_uids(pop: &LinePop) -> Vec<&str> {
+        let mut uids: Vec<&str> = pop.trains.iter().map(|t| &*t.uid).collect();
+        uids.sort_unstable();
+        uids
+    }
+
+    #[test]
+    fn line_membership_modes_pick_their_relevant_trains() {
+        let g = geometry(&[("LLJ", "LLJ"), ("BFF", "BFF")], &["AW"]);
+
+        let legacy = parse(membership_entries(), &g, "2026-07-15");
+        assert_eq!(train_uids(&legacy), ["OLD", "OWN"]);
+        assert_eq!(legacy.membership_shadow, None);
+
+        let scope_g = g.clone().with_membership(LineMembershipMode::Scope);
+        assert_ne!(scope_g.hash, g.hash, "a mode change re-reduces populations");
+        let scope = parse(membership_entries(), &scope_g, "2026-07-15");
+        assert_eq!(train_uids(&scope), ["FAST", "OLD", "OWN"]);
+
+        // Shadow: legacy output, both compared.
+        let shadow_g = g.with_membership(LineMembershipMode::Shadow);
+        let shadow = parse(membership_entries(), &shadow_g, "2026-07-15");
+        assert_eq!(train_uids(&shadow), ["OLD", "OWN"]);
+        assert_eq!(
+            shadow.membership_shadow,
+            Some(MembershipShadow {
+                legacy: 2,
+                scope: 3,
+                legacy_only: 0,
+                scope_only: 1,
+                scoped_entries: 3,
+                legacy_only_sample: vec![],
+                scope_only_sample: vec!["FAST".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn the_legacy_geometry_hash_is_unchanged_by_the_membership_field() {
+        // Deploying the field must not re-download every population.
+        use std::hash::{Hash, Hasher};
+        let g = geometry(&[("LLJ", "LLJ")], &["AW"]);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        vec![(&"LLJ".to_string(), &"LLJ".to_string())].hash(&mut hasher);
+        vec![&"AW".to_string()].hash(&mut hasher);
+        assert_eq!(g.hash, hasher.finish().max(1));
+    }
+
     /// Due is the first call at a line station -- its departure, or its
     /// arrival when it has none -- in UTC (BST here); `last_due` the last;
     /// origin the schedule's first calling point.
@@ -993,16 +1184,16 @@ mod tests {
             fixture_stanox_crs_record("SHR", "SHARED"),
             fixture_stanox_crs_record("ZZA", "ONLY_A"),
         ];
-        let geometry = build_line_geometry(&lines, &records);
+        let geometry = build_line_geometry(&lines, &records, LineMembershipMode::Legacy);
         let g = &geometry["line-a"];
         assert_eq!(
             g.crs_by_tiploc.get("SHARED").map(String::as_str),
             Some("SHR")
         );
         assert_ne!(g.hash, 0);
-        let again = build_line_geometry(&lines, &records);
+        let again = build_line_geometry(&lines, &records, LineMembershipMode::Legacy);
         assert_eq!(again["line-a"].hash, g.hash);
-        let fewer = build_line_geometry(&lines, &records[..1]);
+        let fewer = build_line_geometry(&lines, &records[..1], LineMembershipMode::Legacy);
         assert_ne!(fewer["line-a"].hash, g.hash);
     }
 
@@ -1018,6 +1209,7 @@ mod tests {
                 calling_points: vec![fixture_calling_point("WATRLMN")],
                 operator_atoc: None,
                 train_status: None,
+                ..Default::default()
             }],
         );
         assert_eq!(
@@ -1039,6 +1231,7 @@ mod tests {
             calling_points: vec![fixture_calling_point("WATRLMN")],
             operator_atoc: None,
             train_status: None,
+            ..Default::default()
         };
 
         assert_eq!(population.etag_for("waterloo-reading", today), None);
@@ -1123,6 +1316,7 @@ mod tests {
                 calling_points: heavy_calling_points,
                 operator_atoc: None,
                 train_status: None,
+                ..Default::default()
             }],
         );
 
@@ -1169,6 +1363,8 @@ mod tests {
             headcode_prefixes: vec![],
             full_coverage_enabled: false,
             pass_through: Vec::new(),
+            crs_aliases: std::collections::BTreeMap::new(),
+            trunk_for: Vec::new(),
         }
     }
 
