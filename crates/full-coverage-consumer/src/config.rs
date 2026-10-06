@@ -260,6 +260,7 @@ pub(crate) mod tests {
             destination_crs_filter: vec![],
             headcode_prefixes: vec![],
             full_coverage_enabled: false,
+            pass_through: Vec::new(),
         }
     }
 
