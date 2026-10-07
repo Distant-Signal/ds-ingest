@@ -5,10 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
-# A library target as well as the binary: the loop runner is meant to move
-# into `ds-store` once that crate exists (plan 1B.7, so the api's loops can
-# take the same locks the same way), and a library module moves without a
-# rewrite. Nothing depends on this crate.
+# A library target as well as the binary, so its tests reach the config and
+# the loop registration. The loop runner itself is `ds_store::loops` (plan
+# 1B.7: the api's loops take the same locks the same way). Nothing depends
+# on this crate.
 [lib]
 path = "src/lib.rs"
 
@@ -20,12 +20,14 @@ path = "src/main.rs"
 # the notifier uses (without its push stack). No new crate.
 [dependencies]
 anyhow = "1.0.102"
+# The reconciliation sweep's grace period (`chrono::Duration`).
+chrono = "0.4.44"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 common = { path = "../common", features = ["postgres"] }
-# The schema gate (`ds_store::schema::wait_for_schema`, plan 1B.2).
+# The schema gate (`ds_store::schema::wait_for_schema`, plan 1B.2), the
+# loop runner and the train-domain loops (`ds_store::loops`).
 ds-store = { path = "../ds-store" }
 health-http = { path = "../health-http" }
-metrics = "0.24"
 sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio", "tls-native-tls"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
 tracing = "0.1.44"

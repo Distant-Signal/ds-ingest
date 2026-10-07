@@ -1,17 +1,15 @@
-//! `ingest-writer` (spec §10, plan 1B.6): today a skeleton that connects as
-//! the writer role, loads the line catalogue, serves health and metrics,
-//! and (with `INGEST_WRITER_LOOPS` on) runs its loops under their advisory
-//! locks. See `loops.rs` for what is still to come.
+//! `ingest-writer` (spec §10, plan 1B.6): connects as the writer role,
+//! loads the line catalogue, serves health and metrics, and (with
+//! `INGEST_WRITER_LOOPS` on) runs the train-domain loops under their
+//! advisory locks. See `loops.rs`.
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use clap::Parser;
+use ds_store::loops::{LockSession, LoopRunner};
 use ingest_writer::config::Config;
-use ingest_writer::loop_runner::{LockSession, LoopRunner};
 
-/// The metric prefix: `distant_signal_ingest_writer_*`.
-const SERVICE: &str = "ingest_writer";
 const APPLICATION_NAME: &str = "distant-signal-ingest-writer";
 /// The lock session's `pg_stat_activity.application_name`, so whoever holds
 /// a loop lock is visible beside `pg_locks`.
@@ -65,11 +63,7 @@ async fn run() -> anyhow::Result<()> {
         "ingest-writer started"
     );
 
-    let mut runner = LoopRunner::new(
-        SERVICE,
-        pool.clone(),
-        LockSession::new(pool, LOCK_APPLICATION_NAME),
-    );
+    let mut runner = LoopRunner::new(pool.clone(), LockSession::new(pool, LOCK_APPLICATION_NAME));
     if config.loops_enabled {
         ingest_writer::loops::register(&mut runner, &config)?;
     }
