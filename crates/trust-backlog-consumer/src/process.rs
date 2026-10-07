@@ -310,6 +310,7 @@ pub(crate) fn process_message(
                 variation_status: None,
                 delay_minutes: None,
                 dedup_key: dedup,
+                gbtt_timestamp: None,
             })
         }
 
@@ -341,6 +342,22 @@ pub(crate) fn process_message(
             );
             let planned = timestamp_pair.planned;
             let actual = timestamp_pair.actual;
+            // The public-timetable time, under the SAME correction decision
+            // as `planned` (anchored on the same `actual`), exactly as
+            // trust-consumer parses it. Empty or absent (a pass, a
+            // non-public stop): `None`. This consumer is the primary writer
+            // of `train_movement_events`, so without this every stored
+            // `gbtt_timestamp` was NULL and no stop ever had a public delay.
+            let gbtt = common::trust_timestamp::parse_trust_epoch_millis_pair(
+                movement
+                    .gbtt_timestamp
+                    .as_deref()
+                    .filter(|raw| !raw.trim().is_empty()),
+                movement.actual_timestamp.as_deref(),
+                received_at,
+                state.trust_timestamp_correction_enabled,
+            )
+            .planned;
             if let Some(was_corrected) = timestamp_pair.was_corrected {
                 metrics::counter!(
                     common::metrics::metric_name(
@@ -436,6 +453,7 @@ pub(crate) fn process_message(
                 variation_status: movement.variation_status.clone(),
                 delay_minutes,
                 dedup_key: dedup,
+                gbtt_timestamp: gbtt,
             })
         }
 
@@ -521,6 +539,7 @@ pub(crate) fn process_message(
                 variation_status: None,
                 delay_minutes: None,
                 dedup_key: dedup,
+                gbtt_timestamp: None,
             })
         }
 
@@ -607,6 +626,7 @@ pub(crate) fn process_message(
                 variation_status: None,
                 delay_minutes: None,
                 dedup_key: dedup,
+                gbtt_timestamp: None,
             })
         }
 
@@ -1545,6 +1565,92 @@ mod tests {
             first.dedup_key, second.dedup_key,
             "two distinct same-day cancellations for the same train must not collapse to one row"
         );
+    }
+
+    /// The public-timetable `gbtt_timestamp` reaches the backlog row, under
+    /// the same timestamp correction as `planned_timestamp`. Before
+    /// 2026-10-07 this consumer dropped it, and since it is the primary
+    /// writer of `train_movement_events`, every stored `gbtt_timestamp` in
+    /// production was NULL. The payload is the exact shape the
+    /// `movement-events` stream carries (one envelope per entry), with a
+    /// public time one minute before the working one.
+    #[test]
+    fn a_movements_gbtt_timestamp_is_carried_under_the_same_correction() {
+        let payload = r#"{"body":{"actual_timestamp":"1787945580000","auto_expected":"true",
+            "correction_ind":"false","event_source":"AUTOMATIC","event_type":"DEPARTURE",
+            "gbtt_timestamp":"1787945460000","loc_stanox":"87212",
+            "planned_event_type":"DEPARTURE","planned_timestamp":"1787945520000",
+            "platform":" 1","reporting_stanox":"87212","timetable_variation":"1",
+            "toc_id":"23","train_id":"221832406","train_terminated":"false",
+            "variation_status":"LATE"},
+            "header":{"msg_queue_timestamp":"1787945581000","msg_type":"0003",
+            "original_data_source":"SMART","source_system_id":"TRUST"}}"#;
+        let parsed = trust_schema::schema::parse_batch_detailed(payload).unwrap();
+        assert_eq!(parsed.messages.len(), 1);
+        // TRUST sends London local time as if it were UTC: the raw 19:32Z
+        // is 19:32 BST, i.e. 18:32Z. Received a second after the (corrected)
+        // actual time, so the correction is plausible and fires.
+        let received_at = "2026-08-28T18:33:01Z".parse().unwrap();
+        let mut state = ProcessorState::default();
+        let event = process_message(
+            &parsed.messages[0],
+            &mut state,
+            &stanox_table(),
+            &crs_index_with(&["WAT"]),
+            today(),
+            received_at,
+        )
+        .unwrap();
+        assert_eq!(
+            event.planned_timestamp,
+            Some("2026-08-28T18:32:00Z".parse().unwrap())
+        );
+        assert_eq!(
+            event.gbtt_timestamp,
+            Some("2026-08-28T18:31:00Z".parse().unwrap())
+        );
+
+        // And on the wire to `api`.
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["gbtt_timestamp"], "2026-08-28T18:31:00Z");
+    }
+
+    /// An empty, whitespace-only or absent `gbtt_timestamp` (a pass, or a
+    /// stop with no public time) is `None`, and an Activation never has one.
+    #[test]
+    fn a_missing_or_empty_gbtt_timestamp_is_none() {
+        for raw in [None, Some(""), Some("  ")] {
+            let mut message = movement("221832406", "ARRIVAL", Some("87212"), Some("ON TIME"));
+            message.gbtt_timestamp = raw.map(str::to_string);
+            let mut state = ProcessorState::default();
+            let event = process_message(
+                &TrustMessage::Movement(message),
+                &mut state,
+                &stanox_table(),
+                &crs_index_with(&["WAT"]),
+                today(),
+                test_received_at(),
+            )
+            .unwrap();
+            assert_eq!(event.gbtt_timestamp, None, "raw {raw:?}");
+            assert!(
+                !serde_json::to_string(&event)
+                    .unwrap()
+                    .contains("gbtt_timestamp"),
+                "omitted from the payload when absent"
+            );
+        }
+        let mut state = ProcessorState::default();
+        let activation = process_message(
+            &TrustMessage::Activation(activation("221832406", "C12345", "2026-09-01")),
+            &mut state,
+            &stanox_table(),
+            &crs_index_with(&["WAT"]),
+            today(),
+            test_received_at(),
+        )
+        .unwrap();
+        assert_eq!(activation.gbtt_timestamp, None);
     }
 
     /// M11 sibling (2026-10-01): the `delay_minutes` written into
