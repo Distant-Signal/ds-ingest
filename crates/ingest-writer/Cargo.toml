@@ -1,0 +1,32 @@
+[package]
+name = "ingest-writer"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# A library target as well as the binary: the loop runner is meant to move
+# into `ds-store` once that crate exists (plan 1B.7, so the api's loops can
+# take the same locks the same way), and a library module moves without a
+# rewrite. Nothing depends on this crate.
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "ingest-writer"
+path = "src/main.rs"
+
+# Every dependency is already in the workspace, at the versions and features
+# the notifier uses (without its push stack). No new crate.
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive", "env"] }
+common = { path = "../common", features = ["postgres"] }
+health-http = { path = "../health-http" }
+metrics = "0.24"
+sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio", "tls-native-tls"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+tracing = "0.1.44"
+
+[lints]
+workspace = true
