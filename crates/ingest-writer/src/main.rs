@@ -54,8 +54,10 @@ async fn run() -> anyhow::Result<()> {
     let pool = common::pg::PoolSettings::from_env(APPLICATION_NAME, DEFAULT_MAX_CONNECTIONS)?
         .connect(config.database_url.expose())
         .await?;
-    // Pending ds-store (plan 1B.2): `ds_store::schema::wait_for_schema`
-    // goes here, before readiness and before any loop starts.
+    // The schema gate (spec §12.2, plan 1B.2): before readiness and before
+    // any loop starts; exits after 15 minutes.
+    ds_store::schema::wait_for_schema(&pool, ds_store::schema::DbRole::Writer, Some(&progress))
+        .await?;
     ready.store(true, Ordering::Relaxed);
     tracing::info!(
         lines = config.lines.len(),
