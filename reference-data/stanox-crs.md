@@ -157,7 +157,7 @@ path to a working STANOX/CRS table.
 
 As of docs/superpowers/plans/2026-09-24-tiploc-crs-crosswalk-plan.md, `api`
 also has a second table, `tiploc_crs` (`PRIMARY KEY (tiploc)`,
-`crates/api/migrations/20260924130000_tiploc_crs.sql`), populated by
+`crates/ds-store/migrations/20260924130000_tiploc_crs.sql`), populated by
 `crates/schedule-reference`'s new `parser::resolve_tiploc_crs`. It exists
 **alongside** the live `stanox_crs` table described above, not in place of
 it: `stanox_crs` keeps its one-row-per-STANOX shape and keeps serving the
