@@ -304,10 +304,12 @@ async fn connect_redis_feed(
     backoff: common::backoff::Backoff,
     progress: &health_http::Progress,
 ) -> anyhow::Result<RedisStreamMovementFeed> {
-    // REDIS_PASSWORD, when set, is applied here (common::redis_auth). The
-    // result carries the password: pass it on, never log it.
-    let redis_url = common::redis_auth::redis_url_with_password(
+    // REDIS_USERNAME and REDIS_PASSWORD, when set, are applied here
+    // (common::redis_auth). The result carries the password: pass it on,
+    // never log it.
+    let redis_url = common::redis_auth::redis_url_with_credentials(
         &config.redis_url,
+        config.redis_username.as_deref(),
         config.redis_password.as_ref(),
     )?;
     RedisStreamMovementFeed::connect_until_ready(

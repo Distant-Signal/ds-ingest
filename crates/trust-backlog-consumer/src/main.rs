@@ -108,8 +108,9 @@ async fn run() -> anyhow::Result<()> {
         // `common::redis_conn`.
         Box::new(
             RedisStreamMovementFeed::connect_until_ready(
-                common::redis_auth::redis_url_with_password(
+                common::redis_auth::redis_url_with_credentials(
                     &config.redis_url,
+                    config.redis_username.as_deref(),
                     config.redis_password.as_ref(),
                 )?
                 .expose(),

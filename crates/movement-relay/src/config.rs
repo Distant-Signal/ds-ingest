@@ -31,6 +31,12 @@ pub(crate) struct Config {
     #[arg(long, env, hide_env_values = true)]
     pub redis_password: Option<common::secret::Secret>,
 
+    /// Redis ACL user (chart `redis.acl`; ingest architecture phase 0c).
+    /// Unset or empty: the `default` user, exactly as before. Combined with
+    /// `redis_password` by `common::redis_auth::redis_url_with_credentials`.
+    #[arg(long, env)]
+    pub redis_username: Option<String>,
+
     #[arg(long, env, default_value = "0.0.0.0:8083")]
     pub health_bind_url: String,
     /// Liveness watchdog: `/livez` (and `/healthz`) answer 503 ("stalled")
@@ -250,14 +256,17 @@ mod chart_env_wiring_tests {
             declared.iter().any(|env| env == "PROGRESS_STALL_SECS"),
             "sanity check: {declared:?}"
         );
-        // REDIS_PASSWORD is rendered by the shared `distant-signal.redisPasswordEnv`
-        // helper (only when redis.auth.enabled), so it never appears literally.
+        // REDIS_USERNAME and REDIS_PASSWORD are rendered by the shared
+        // `distant-signal.redisClientAuthEnv` helper (only with redis.auth or
+        // redis.acl on), so they never appear literally.
         let missing: Vec<&String> = declared
             .iter()
             .filter(|env| !block.contains(&format!("- name: {env}\n")))
             .filter(|env| {
-                !(env.as_str() == "REDIS_PASSWORD"
-                    && block.contains(r#"include "distant-signal.redisPasswordEnv""#))
+                !(matches!(env.as_str(), "REDIS_PASSWORD" | "REDIS_USERNAME")
+                    && block.contains(
+                        r#"include "distant-signal.redisClientAuthEnv" (dict "root" . "client" "movementRelay" "user" "movement-relay")"#,
+                    ))
             })
             .collect();
         assert!(

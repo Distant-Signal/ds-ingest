@@ -555,6 +555,7 @@ fn test_config() -> Config {
         kafka_consumer_group: "test-group".to_string(),
         redis_url: "redis://localhost:6379".to_string(),
         redis_password: None,
+        redis_username: None,
         health_bind_url: "0.0.0.0:8083".to_string(),
         progress_stall_secs: 900,
         metrics_port: 9094,

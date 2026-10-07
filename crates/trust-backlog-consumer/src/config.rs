@@ -33,6 +33,12 @@ pub(crate) struct Config {
     #[arg(long, env, hide_env_values = true)]
     pub redis_password: Option<common::secret::Secret>,
 
+    /// Redis ACL user (chart `redis.acl`; ingest architecture phase 0c).
+    /// Unset or empty: the `default` user, exactly as before. Combined with
+    /// `redis_password` by `common::redis_auth::redis_url_with_credentials`.
+    #[arg(long, env)]
+    pub redis_username: Option<String>,
+
     /// How long an entry may sit unacked in this consumer's own
     /// pending-entries list before its periodic sweep reclaims it. Same
     /// default/reasoning as `trust-consumer`'s identical field.

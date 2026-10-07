@@ -117,6 +117,12 @@ pub(crate) struct Config {
     #[arg(long, env, hide_env_values = true)]
     pub redis_password: Option<common::secret::Secret>,
 
+    /// Redis ACL user (chart `redis.acl`; ingest architecture phase 0c).
+    /// Unset or empty: the `default` user, exactly as before. Combined with
+    /// `redis_password` by `common::redis_auth::redis_url_with_credentials`.
+    #[arg(long, env)]
+    pub redis_username: Option<String>,
+
     /// See `trust-consumer/src/config.rs`'s identical field.
     #[arg(long, env, default_value_t = 30)]
     pub redis_autoclaim_min_idle_secs: u64,
@@ -332,6 +338,7 @@ pub(crate) mod tests {
             movement_feed_backend: MovementFeedBackend::RedisStream,
             redis_url: String::new(),
             redis_password: None,
+            redis_username: None,
             redis_autoclaim_min_idle_secs: 30,
             redis_gap_check_secs: 60,
             windowed: WindowedStatsArgs {
