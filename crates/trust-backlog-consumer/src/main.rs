@@ -226,7 +226,11 @@ async fn run() -> anyhow::Result<()> {
                 let mut events = Vec::new();
                 let mut reasons = Vec::new();
                 let mut unparseable = Vec::new();
-                for raw in &batch {
+                for entry in &batch {
+                    let raw = &entry.payload;
+                    // `now`/`today` above stay the wall clock, for pruning;
+                    // each message is dated by when it arrived (`arrival`).
+                    let (received_at, arrival_rail_day) = arrival(entry, now);
                     match trust_schema::schema::parse_batch_detailed(raw) {
                         Ok(parsed) => {
                             // PL-8: count every envelope the parser dropped.
@@ -239,9 +243,12 @@ async fn run() -> anyhow::Result<()> {
                                 .increment(1);
                             }
                             for message in parsed.messages {
-                                if let Some(reason) =
-                                    reasons::reason_message(&message, &process_state, today, now)
-                                {
+                                if let Some(reason) = reasons::reason_message(
+                                    &message,
+                                    &process_state,
+                                    arrival_rail_day,
+                                    received_at,
+                                ) {
                                     reasons.push(reason);
                                 }
                                 if let Some(event) = process::process_message(
@@ -249,8 +256,8 @@ async fn run() -> anyhow::Result<()> {
                                     &mut process_state,
                                     &snapshot,
                                     &crs_index,
-                                    today,
-                                    now,
+                                    arrival_rail_day,
+                                    received_at,
                                 ) {
                                     events.push(event);
                                 }
@@ -555,6 +562,23 @@ fn current_rail_day(at: chrono::DateTime<chrono::Utc>) -> chrono::NaiveDate {
     common::rail_day::current_rail_day(at)
 }
 
+/// The instant and rail day a feed entry's messages are dated by
+/// (`process::process_message`'s `received_at`/`today`): when the entry
+/// ARRIVED -- the relay's `XADD`, see `movement_feed::FeedEntry::received_at`
+/// -- not when this possibly-lagging consumer reads it. Otherwise an
+/// Activation with no `tp_origin_timestamp` that arrived at 23:59 London
+/// would be filed under the next day's `service_date` when processed after
+/// midnight, and a message with no date of its own that arrived at 01:59
+/// would get the next rail day as its `event_date` when processed after
+/// 02:00. `now` stands in only when the arrival time is unknown.
+fn arrival(
+    entry: &movement_feed::FeedEntry,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (chrono::DateTime<chrono::Utc>, chrono::NaiveDate) {
+    let received_at = entry.received_at_or(now);
+    (received_at, current_rail_day(received_at))
+}
+
 #[cfg(test)]
 mod rail_day_tests {
     use super::*;
@@ -649,6 +673,78 @@ mod tests {
             "the PASS event must be dropped, only the DEPARTURE kept"
         );
         assert_eq!(events[0].event_type, Some("DEPARTURE".to_string()));
+    }
+
+    fn utc(s: &str) -> chrono::DateTime<chrono::Utc> {
+        s.parse().unwrap()
+    }
+
+    fn entry_arrived_at(at: &str) -> movement_feed::FeedEntry {
+        movement_feed::FeedEntry {
+            payload: String::new(),
+            received_at: Some(utc(at)),
+        }
+    }
+
+    /// A message that arrived at 01:59 London but is processed at 02:05 (a
+    /// lagging consumer) is dated by the earlier rail day it arrived in.
+    #[test]
+    fn an_entry_that_arrived_before_0200_is_dated_by_the_earlier_rail_day() {
+        // 00:59Z / 01:05Z on 2026-10-01 are 01:59 / 02:05 BST.
+        let (received_at, rail_day) = arrival(
+            &entry_arrived_at("2026-10-01T00:59:00Z"),
+            utc("2026-10-01T01:05:00Z"),
+        );
+        assert_eq!(received_at, utc("2026-10-01T00:59:00Z"));
+        assert_eq!(rail_day, "2026-09-30".parse::<chrono::NaiveDate>().unwrap());
+    }
+
+    #[test]
+    fn an_entry_with_no_known_arrival_time_is_dated_by_now() {
+        let now = utc("2026-10-01T01:05:00Z");
+        let (received_at, rail_day) = arrival(&movement_feed::FeedEntry::new("p"), now);
+        assert_eq!(received_at, now);
+        assert_eq!(rail_day, "2026-10-01".parse::<chrono::NaiveDate>().unwrap());
+    }
+
+    /// End to end through `process_message`: an Activation with no
+    /// `tp_origin_timestamp` that arrived at 23:59 London, processed at
+    /// 00:05, keeps the `service_date` of the day it arrived on (processing
+    /// time would put it in the post-midnight window and file it a day
+    /// later).
+    #[test]
+    fn a_lagging_activation_keeps_the_service_date_of_its_arrival() {
+        let activation =
+            trust_schema::schema::TrustMessage::Activation(trust_schema::schema::Activation {
+                train_id: "221832406".to_string(),
+                train_uid: "C21373".to_string(),
+                toc_id: Some("SW".to_string()),
+                train_service_code: None,
+                schedule_wtt_id: None,
+                schedule_start_date: Some("2026-08-01".to_string()),
+                schedule_end_date: Some("2026-12-01".to_string()),
+                tp_origin_timestamp: None,
+            });
+        let stanox = stanox_crs::StanoxCrsTable::from_records(Vec::new());
+        let crs_index = std::collections::HashSet::new();
+        // 22:59Z on 2026-09-30 is 23:59 BST; 23:05Z is 00:05 BST on 10-01.
+        let (received_at, rail_day) = arrival(
+            &entry_arrived_at("2026-09-30T22:59:00Z"),
+            utc("2026-09-30T23:05:00Z"),
+        );
+        let event = process::process_message(
+            &activation,
+            &mut process::ProcessorState::default(),
+            &stanox,
+            &crs_index,
+            rail_day,
+            received_at,
+        )
+        .unwrap();
+        assert_eq!(
+            event.service_date,
+            "2026-09-30".parse::<chrono::NaiveDate>().unwrap()
+        );
     }
 }
 

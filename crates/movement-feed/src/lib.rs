@@ -23,16 +23,65 @@ pub use redis_stream::LONG_PENDING_DELIVERIES;
 
 use async_trait::async_trait;
 
+/// One delivered `movement-events` entry: its payload plus the time it
+/// arrived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedEntry {
+    /// The entry's `payload` field -- the surviving envelope's raw bytes,
+    /// unchanged from what `movement-relay` `XADD`ed; per
+    /// `trust_schema::schema::parse_batch`'s input shape, that's normally a
+    /// single bare `{header, body}` envelope object.
+    pub payload: String,
+    /// When the message arrived: the millisecond part of the entry's
+    /// stream id, i.e. the moment `movement-relay` `XADD`ed it (Redis
+    /// assigns `<ms>-<seq>` ids from its own clock). This is the closest
+    /// record of arrival the entry carries -- the relay writes only
+    /// `payload` and `msg_type`, no Kafka timestamp -- and, unlike the
+    /// consumer's own clock, it does not move when the consumer lags.
+    ///
+    /// `None` when the id did not parse (logged, and counted in
+    /// `movement_feed_entry_id_unparseable_total`), and for every entry of
+    /// [`FakeMovementFeed::new`]; callers fall back to their own "now" via
+    /// [`FeedEntry::received_at_or`].
+    pub received_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl FeedEntry {
+    /// An entry with no known arrival time.
+    pub fn new(payload: impl Into<String>) -> Self {
+        Self {
+            payload: payload.into(),
+            received_at: None,
+        }
+    }
+
+    /// The time this entry arrived, or `now` when that is unknown. Never
+    /// later than `now`: an entry cannot arrive after it is processed, so a
+    /// stream id slightly ahead of this process's clock (clock skew between
+    /// the Redis and consumer pods) is clamped rather than trusted. With no
+    /// lag this is within milliseconds of `now`.
+    #[must_use]
+    pub fn received_at_or(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> chrono::DateTime<chrono::Utc> {
+        self.received_at.map_or(now, |at| at.min(now))
+    }
+}
+
+/// The instant a stream entry id (`<ms>-<seq>`) was generated at, or
+/// `None` if its millisecond part does not parse.
+pub fn stream_id_time(id: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let millis: i64 = id.split('-').next()?.parse().ok()?;
+    chrono::DateTime::from_timestamp_millis(millis)
+}
+
 #[async_trait]
 pub trait MovementFeed: Send {
-    /// Returns the next batch of raw JSON message-batch bodies (each
-    /// element is one Redis Stream entry's `payload` field -- the
-    /// surviving envelope's raw bytes, unchanged from what `movement-relay`
-    /// `XADD`ed; per `trust_schema::schema::parse_batch`'s input shape,
-    /// that's normally a single bare `{header, body}` envelope object) not
-    /// yet acknowledged. An empty `Vec` means "nothing new right now," not
-    /// an error.
-    async fn next_batch(&mut self) -> anyhow::Result<Vec<String>>;
+    /// Returns the next batch of entries (see [`FeedEntry`]) not yet
+    /// acknowledged. An empty `Vec` means "nothing new right now," not an
+    /// error.
+    async fn next_batch(&mut self) -> anyhow::Result<Vec<FeedEntry>>;
 
     /// Acknowledges (`XACK`s, for the real implementation) everything
     /// returned by the most recent `next_batch` call. Only called after
@@ -111,7 +160,7 @@ pub trait DeadLetterSink: Send {
 /// did not advance the feed" and mean it.
 #[cfg(any(test, feature = "test-util"))]
 pub struct FakeMovementFeed {
-    batches: std::collections::VecDeque<Vec<String>>,
+    batches: std::collections::VecDeque<Vec<FeedEntry>>,
     received_since_commit: bool,
     pub committed_count: usize,
     /// Everything passed to [`DeadLetterSink::dead_letter`], in order.
@@ -124,7 +173,19 @@ pub struct FakeMovementFeed {
 
 #[cfg(any(test, feature = "test-util"))]
 impl FakeMovementFeed {
+    /// Payload-only batches: no entry has a known arrival time, so the
+    /// consumer under test falls back to its own "now".
     pub fn new(batches: Vec<Vec<String>>) -> Self {
+        Self::with_entries(
+            batches
+                .into_iter()
+                .map(|batch| batch.into_iter().map(FeedEntry::new).collect())
+                .collect(),
+        )
+    }
+
+    /// Batches of full entries, for tests that set an arrival time.
+    pub fn with_entries(batches: Vec<Vec<FeedEntry>>) -> Self {
         Self {
             batches: batches.into(),
             received_since_commit: false,
@@ -139,7 +200,7 @@ impl FakeMovementFeed {
 #[cfg(any(test, feature = "test-util"))]
 #[async_trait]
 impl MovementFeed for FakeMovementFeed {
-    async fn next_batch(&mut self) -> anyhow::Result<Vec<String>> {
+    async fn next_batch(&mut self) -> anyhow::Result<Vec<FeedEntry>> {
         let batch = self.batches.pop_front().unwrap_or_default();
         if !batch.is_empty() {
             self.received_since_commit = true;
@@ -171,5 +232,65 @@ impl DeadLetterSink for FakeMovementFeed {
         }
         self.dead_lettered.extend_from_slice(records);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn utc(s: &str) -> chrono::DateTime<chrono::Utc> {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn a_stream_id_parses_to_its_millisecond_time() {
+        assert_eq!(
+            stream_id_time("1790384340123-7"),
+            Some(utc("2026-09-26T00:59:00.123Z"))
+        );
+        // A bare `<ms>` with no sequence part is still a time.
+        assert_eq!(stream_id_time("0"), Some(utc("1970-01-01T00:00:00Z")));
+    }
+
+    #[test]
+    fn a_malformed_stream_id_has_no_time() {
+        for id in [
+            "",
+            "-1",
+            "abc-0",
+            "1.5-0",
+            " 12-0",
+            "99999999999999999999-0",
+        ] {
+            assert_eq!(stream_id_time(id), None, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_arrival_time_falls_back_to_now() {
+        let now = utc("2026-10-01T01:05:00Z");
+        assert_eq!(FeedEntry::new("p").received_at_or(now), now);
+    }
+
+    #[test]
+    fn a_lagging_entry_keeps_its_arrival_time() {
+        let now = utc("2026-10-01T01:05:00Z");
+        let arrived = utc("2026-10-01T00:59:00Z");
+        let entry = FeedEntry {
+            payload: "p".to_string(),
+            received_at: Some(arrived),
+        };
+        assert_eq!(entry.received_at_or(now), arrived);
+    }
+
+    #[test]
+    fn an_arrival_time_ahead_of_now_is_clamped_to_now() {
+        let now = utc("2026-10-01T01:05:00Z");
+        let entry = FeedEntry {
+            payload: "p".to_string(),
+            received_at: Some(now + chrono::Duration::seconds(2)),
+        };
+        assert_eq!(entry.received_at_or(now), now);
     }
 }

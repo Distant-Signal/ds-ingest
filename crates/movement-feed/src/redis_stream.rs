@@ -49,6 +49,13 @@ const DEAD_LETTER_MAX_LEN: usize = 10_000;
 /// `increase()`.
 const GROUP_RECREATED_METRIC: &str = "movement_feed_group_recreated_total";
 
+/// Counter (labelled `group`) of delivered entries whose stream id has no
+/// parseable millisecond part, so their arrival time is unknown and the
+/// consumer stamps them with its own clock instead (see
+/// [`crate::FeedEntry::received_at`]). Redis only ever generates `<ms>-<seq>`
+/// ids, so anything above 0 means something unexpected wrote the stream.
+const ENTRY_ID_UNPARSEABLE_METRIC: &str = "movement_feed_entry_id_unparseable_total";
+
 /// Delivery count past which a pending entry the PEL replay hands out again
 /// is reported as long-pending (a warn log plus
 /// `distant_signal_movement_feed_long_pending_total`). **Visibility only**:
@@ -318,6 +325,11 @@ impl RedisStreamMovementFeed {
         // ...and the long-pending counter, for DistantSignalMovementFeedLongPending.
         metrics::counter!(
             common::metrics::metric_name("movement_feed_long_pending_total"),
+            "group" => group.clone()
+        )
+        .increment(0);
+        metrics::counter!(
+            common::metrics::metric_name(ENTRY_ID_UNPARSEABLE_METRIC),
             "group" => group.clone()
         )
         .increment(0);
@@ -805,7 +817,7 @@ impl MovementFeed for RedisStreamMovementFeed {
     /// restart would, so entries added before the recreate are not skipped
     /// (see [`recreate_start_id`]). The error is still returned, so the
     /// caller's loop backs off as for any failed read.
-    async fn next_batch(&mut self) -> anyhow::Result<Vec<String>> {
+    async fn next_batch(&mut self) -> anyhow::Result<Vec<crate::FeedEntry>> {
         let result = self.read_next_batch().await;
         if let Err(err) = &result
             && is_nogroup(err)
@@ -877,7 +889,7 @@ impl RedisStreamMovementFeed {
         }
     }
 
-    async fn read_next_batch(&mut self) -> anyhow::Result<Vec<String>> {
+    async fn read_next_batch(&mut self) -> anyhow::Result<Vec<crate::FeedEntry>> {
         // Periodic XAUTOCLAIM sweep, checked once per call -- cheap
         // (skips immediately if not due) and keeps this on the same
         // "checked every loop iteration" shape every existing multi-cadence
@@ -977,9 +989,35 @@ impl RedisStreamMovementFeed {
                 next_pel_replay_cursor(last_raw_id, raw_len, PEL_REPLAY_BATCH_COUNT);
         }
 
-        let payloads = entries.iter().map(|(_, payload)| payload.clone()).collect();
+        let delivered = entries
+            .iter()
+            .map(|(id, payload)| crate::FeedEntry {
+                payload: payload.clone(),
+                received_at: self.entry_arrival_time(id),
+            })
+            .collect();
         self.pending = entries;
-        Ok(payloads)
+        Ok(delivered)
+    }
+
+    /// The arrival time of the entry `id` (see [`crate::FeedEntry::received_at`]),
+    /// or `None` -- logged and counted -- if the id has no parseable time.
+    fn entry_arrival_time(&self, id: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        let time = crate::stream_id_time(id);
+        if time.is_none() {
+            tracing::warn!(
+                stream = %self.stream,
+                group = %self.group,
+                id,
+                "stream entry id has no parseable time; using this consumer's clock as its arrival time"
+            );
+            metrics::counter!(
+                common::metrics::metric_name(ENTRY_ID_UNPARSEABLE_METRIC),
+                "group" => self.group.clone()
+            )
+            .increment(1);
+        }
+        time
     }
 
     /// Reclaims entries that have sat unacked in the consumer group's
@@ -1638,6 +1676,47 @@ mod long_pending_entries_tests {
 mod redis_tests {
     use super::*;
 
+    /// Just the payloads of a delivered batch, for the assertions below that
+    /// only care about which entries came back.
+    fn payloads(batch: Vec<crate::FeedEntry>) -> Vec<String> {
+        batch.into_iter().map(|entry| entry.payload).collect()
+    }
+
+    /// Each delivered entry carries the time its stream id was generated
+    /// (the relay's `XADD`), not the time it was read -- so a consumer that
+    /// reads it long after still sees when it arrived.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn a_delivered_entry_carries_its_stream_id_time() {
+        let stream = unique_stream("arrival_time");
+        cleanup(&stream).await;
+        let mut feed = connect(&stream).await;
+        assert!(payloads(feed.next_batch().await.unwrap()).is_empty()); // drain empty startup PEL
+
+        let client = redis::Client::open(redis_url()).unwrap();
+        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        // An explicit id 2026-10-01T00:59:00Z (01:59 London): long before
+        // this read, as for a lagging consumer.
+        let _: String = redis::cmd("XADD")
+            .arg(&stream)
+            .arg("1790816340000-0")
+            .arg("payload")
+            .arg("late")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let batch = feed.next_batch().await.unwrap();
+        assert_eq!(
+            batch,
+            vec![crate::FeedEntry {
+                payload: "late".to_string(),
+                received_at: Some("2026-10-01T00:59:00Z".parse().unwrap()),
+            }]
+        );
+        cleanup(&stream).await;
+    }
+
     /// `REDIS_URL` plus `REDIS_PASSWORD` (when set), combined exactly as the
     /// services do, so this suite also runs against a Redis started with
     /// `--requirepass` (the chart's `redis.auth`).
@@ -1680,7 +1759,7 @@ mod redis_tests {
         )
         .await
         .expect("AUTH default <password> accepted");
-        assert!(feed.next_batch().await.unwrap().is_empty());
+        assert!(payloads(feed.next_batch().await.unwrap()).is_empty());
         cleanup(&stream).await;
     }
 
@@ -1759,9 +1838,9 @@ mod redis_tests {
         let stream = unique_stream("transient-forever");
         let mut feed = connect(&stream).await;
         xadd(&stream, "healthy").await;
-        feed.next_batch().await.unwrap(); // drain empty startup PEL
+        payloads(feed.next_batch().await.unwrap()); // drain empty startup PEL
         assert_eq!(
-            feed.next_batch().await.unwrap(),
+            payloads(feed.next_batch().await.unwrap()),
             vec!["healthy".to_string()]
         );
         let id = pending_ids(&mut feed, &stream).await.remove(0);
@@ -1784,7 +1863,7 @@ mod redis_tests {
         for _ in 0..3 {
             let mut feed = connect(&stream).await;
             assert_eq!(
-                feed.next_batch().await.unwrap(),
+                payloads(feed.next_batch().await.unwrap()),
                 vec!["healthy".to_string()],
                 "still handed out for retry, not diverted"
             );
@@ -1793,7 +1872,7 @@ mod redis_tests {
 
         let mut feed = connect(&stream).await;
         assert_eq!(
-            feed.next_batch().await.unwrap(),
+            payloads(feed.next_batch().await.unwrap()),
             vec!["healthy".to_string()]
         );
         assert!(
@@ -1819,9 +1898,9 @@ mod redis_tests {
         let mut feed = connect(&stream).await;
         xadd(&stream, "good").await;
         xadd(&stream, "poison").await;
-        feed.next_batch().await.unwrap(); // drain empty startup PEL
+        payloads(feed.next_batch().await.unwrap()); // drain empty startup PEL
         assert_eq!(
-            feed.next_batch().await.unwrap(),
+            payloads(feed.next_batch().await.unwrap()),
             vec!["good".to_string(), "poison".to_string()]
         );
         feed.reject_batch("422 Unprocessable Entity").await.unwrap();
@@ -1832,9 +1911,15 @@ mod redis_tests {
         assert_eq!(pending_ids(&mut feed, &stream).await.len(), 2);
 
         // Isolation: one entry at a time.
-        assert_eq!(feed.next_batch().await.unwrap(), vec!["good".to_string()]);
+        assert_eq!(
+            payloads(feed.next_batch().await.unwrap()),
+            vec!["good".to_string()]
+        );
         feed.commit().await.unwrap();
-        assert_eq!(feed.next_batch().await.unwrap(), vec!["poison".to_string()]);
+        assert_eq!(
+            payloads(feed.next_batch().await.unwrap()),
+            vec!["poison".to_string()]
+        );
         feed.reject_batch("422 Unprocessable Entity: bad row")
             .await
             .unwrap();
@@ -1849,10 +1934,13 @@ mod redis_tests {
         assert!(!letters[0]["source_id"].is_empty());
 
         // The PEL is empty, so isolation ends and live reads resume.
-        assert!(feed.next_batch().await.unwrap().is_empty());
+        assert!(payloads(feed.next_batch().await.unwrap()).is_empty());
         assert!(!feed.isolating);
         xadd(&stream, "later").await;
-        assert_eq!(feed.next_batch().await.unwrap(), vec!["later".to_string()]);
+        assert_eq!(
+            payloads(feed.next_batch().await.unwrap()),
+            vec!["later".to_string()]
+        );
         cleanup(&stream).await;
     }
 
@@ -1865,13 +1953,19 @@ mod redis_tests {
         let mut feed = connect(&stream).await;
         xadd(&stream, "a").await;
         xadd(&stream, "b").await;
-        feed.next_batch().await.unwrap();
-        feed.next_batch().await.unwrap();
+        payloads(feed.next_batch().await.unwrap());
+        payloads(feed.next_batch().await.unwrap());
         feed.reject_batch("400 Bad Request").await.unwrap();
 
-        assert_eq!(feed.next_batch().await.unwrap(), vec!["a".to_string()]);
+        assert_eq!(
+            payloads(feed.next_batch().await.unwrap()),
+            vec!["a".to_string()]
+        );
         // Transient failure: no commit, no reject.
-        assert_eq!(feed.next_batch().await.unwrap(), vec!["a".to_string()]);
+        assert_eq!(
+            payloads(feed.next_batch().await.unwrap()),
+            vec!["a".to_string()]
+        );
         assert!(dead_letters(&stream).await.is_empty());
         assert_eq!(pending_ids(&mut feed, &stream).await.len(), 2);
         cleanup(&stream).await;
@@ -1897,8 +1991,11 @@ mod redis_tests {
         let _: () = pipe.query_async(&mut feed.conn).await.unwrap();
 
         xadd(&stream, "poison").await;
-        feed.next_batch().await.unwrap();
-        assert_eq!(feed.next_batch().await.unwrap(), vec!["poison".to_string()]);
+        payloads(feed.next_batch().await.unwrap());
+        assert_eq!(
+            payloads(feed.next_batch().await.unwrap()),
+            vec!["poison".to_string()]
+        );
         assert!(feed.reject_batch("422").await.is_err());
         assert_eq!(
             pending_ids(&mut feed, &stream).await.len(),
@@ -1994,8 +2091,8 @@ mod redis_tests {
             .await
             .unwrap();
 
-        feed.next_batch().await.unwrap(); // drain empty startup PEL
-        let batch = feed.next_batch().await.unwrap();
+        payloads(feed.next_batch().await.unwrap()); // drain empty startup PEL
+        let batch = payloads(feed.next_batch().await.unwrap());
         assert!(
             batch.is_empty(),
             "a malformed entry yields no deliverable payload"
@@ -2060,10 +2157,10 @@ mod redis_tests {
         xadd(&stream, "payload-1").await;
 
         assert!(
-            feed.next_batch().await.unwrap().is_empty(),
+            payloads(feed.next_batch().await.unwrap()).is_empty(),
             "startup PEL drain: nothing pending yet"
         );
-        let batch = feed.next_batch().await.unwrap();
+        let batch = payloads(feed.next_batch().await.unwrap());
         assert_eq!(batch, vec!["payload-1".to_string()]);
         // Deliberately NOT acked, then dropped -- simulates a crash before
         // XACK.
@@ -2078,7 +2175,7 @@ mod redis_tests {
         )
         .await
         .unwrap();
-        let replayed = feed2.next_batch().await.unwrap();
+        let replayed = payloads(feed2.next_batch().await.unwrap());
         assert_eq!(
             replayed,
             vec!["payload-1".to_string()],
@@ -2103,8 +2200,8 @@ mod redis_tests {
         .await
         .unwrap();
         xadd(&stream, "payload-1").await;
-        feed.next_batch().await.unwrap(); // drain empty startup PEL
-        let delivered = feed.next_batch().await.unwrap();
+        payloads(feed.next_batch().await.unwrap()); // drain empty startup PEL
+        let delivered = payloads(feed.next_batch().await.unwrap());
         assert_eq!(delivered, vec!["payload-1".to_string()]);
 
         let pending_before: redis::streams::StreamPendingCountReply = feed
@@ -2141,8 +2238,8 @@ mod redis_tests {
         .await
         .unwrap();
         xadd(&stream, "payload-1").await;
-        feed.next_batch().await.unwrap(); // drain empty startup PEL
-        let first = feed.next_batch().await.unwrap();
+        payloads(feed.next_batch().await.unwrap()); // drain empty startup PEL
+        let first = payloads(feed.next_batch().await.unwrap());
         assert_eq!(first, vec!["payload-1".to_string()]);
 
         // A third call, still without committing the second's delivery --
@@ -2150,7 +2247,7 @@ mod redis_tests {
         // "delivered, not yet acked", which only a reconnect's PEL replay
         // should surface). Nothing new is in the stream, so this blocks on
         // `>` for up to 5s and then returns empty.
-        let third = feed.next_batch().await.unwrap();
+        let third = payloads(feed.next_batch().await.unwrap());
         assert!(
             third.is_empty(),
             "an already-connected feed must not re-deliver its own undelivered batch"
@@ -2176,8 +2273,8 @@ mod redis_tests {
         .await
         .unwrap();
         xadd(&stream, "payload-1").await;
-        dead.next_batch().await.unwrap(); // drain empty startup PEL
-        let to_dead = dead.next_batch().await.unwrap();
+        payloads(dead.next_batch().await.unwrap()); // drain empty startup PEL
+        let to_dead = payloads(dead.next_batch().await.unwrap());
         assert_eq!(
             to_dead,
             vec!["payload-1".to_string()],
@@ -2200,7 +2297,7 @@ mod redis_tests {
         // dead-consumer at this point (idle well past autoclaim_min_idle),
         // so the sweep should reclaim it and this same call should return
         // it via the reclaim -> PEL-replay path.
-        let reclaimed = live.next_batch().await.unwrap();
+        let reclaimed = payloads(live.next_batch().await.unwrap());
         assert_eq!(
             reclaimed,
             vec!["payload-1".to_string()],
@@ -2248,10 +2345,10 @@ mod redis_tests {
 
         // Deliver the whole backlog to "dead-consumer" (live `>` reads, 100
         // at a time) and never ack it -- a consumer rename / dead pod.
-        dead.next_batch().await.unwrap(); // drain empty startup PEL
+        payloads(dead.next_batch().await.unwrap()); // drain empty startup PEL
         let mut delivered_to_dead = 0;
         while delivered_to_dead < BACKLOG {
-            let batch = dead.next_batch().await.unwrap();
+            let batch = payloads(dead.next_batch().await.unwrap());
             assert!(!batch.is_empty(), "backlog should still be readable");
             delivered_to_dead += batch.len();
         }
@@ -2268,7 +2365,7 @@ mod redis_tests {
         )
         .await
         .unwrap();
-        let replayed = live.next_batch().await.unwrap();
+        let replayed = payloads(live.next_batch().await.unwrap());
         assert_eq!(
             replayed.len(),
             PEL_REPLAY_BATCH_COUNT,
@@ -2337,7 +2434,7 @@ mod redis_tests {
         let mut feed = connect().await;
         let mut replayed = Vec::new();
         for _ in 0..3 {
-            let batch = feed.next_batch().await.unwrap();
+            let batch = payloads(feed.next_batch().await.unwrap());
             assert!(
                 !batch.is_empty(),
                 "every replay call must deliver pending entries"
@@ -2376,8 +2473,8 @@ mod redis_tests {
 
         xadd(&stream, "payload-1").await;
         xadd(&stream, "payload-2").await;
-        feed.next_batch().await.unwrap(); // drain empty startup PEL
-        let delivered = feed.next_batch().await.unwrap();
+        payloads(feed.next_batch().await.unwrap()); // drain empty startup PEL
+        let delivered = payloads(feed.next_batch().await.unwrap());
         assert_eq!(delivered.len(), 2);
         feed.commit().await.unwrap();
 
@@ -2431,8 +2528,8 @@ mod redis_tests {
         .unwrap();
 
         xadd(&stream, "payload-1").await;
-        feed.next_batch().await.unwrap(); // drain empty startup PEL
-        let delivered = feed.next_batch().await.unwrap();
+        payloads(feed.next_batch().await.unwrap()); // drain empty startup PEL
+        let delivered = payloads(feed.next_batch().await.unwrap());
         assert_eq!(delivered, vec!["payload-1".to_string()]);
         feed.commit().await.unwrap();
 
@@ -2453,8 +2550,8 @@ mod redis_tests {
         for i in 0..3 {
             xadd(&stream, &format!("read-{i}")).await;
         }
-        feed.next_batch().await.unwrap(); // drain empty startup PEL
-        assert_eq!(feed.next_batch().await.unwrap().len(), 3);
+        payloads(feed.next_batch().await.unwrap()); // drain empty startup PEL
+        assert_eq!(payloads(feed.next_batch().await.unwrap()).len(), 3);
         feed.commit().await.unwrap();
 
         let _: String = redis::cmd("XADD")
@@ -2489,8 +2586,8 @@ mod redis_tests {
         let mut feed = connect(&stream).await;
         xadd(&stream, "a").await;
         xadd(&stream, "b").await;
-        feed.next_batch().await.unwrap(); // drain empty startup PEL
-        assert_eq!(feed.next_batch().await.unwrap().len(), 2);
+        payloads(feed.next_batch().await.unwrap()); // drain empty startup PEL
+        assert_eq!(payloads(feed.next_batch().await.unwrap()).len(), 2);
         // No commit: both stay pending.
         let _: String = redis::cmd("XADD")
             .arg(&stream)
@@ -2551,8 +2648,8 @@ mod redis_tests {
         assert_eq!(positions.stream_length, 5);
         assert_eq!(positions.stream_entries_added, Some(5));
 
-        feed.next_batch().await.unwrap(); // drain empty startup PEL
-        assert_eq!(feed.next_batch().await.unwrap().len(), 5);
+        payloads(feed.next_batch().await.unwrap()); // drain empty startup PEL
+        assert_eq!(payloads(feed.next_batch().await.unwrap()).len(), 5);
         let pending = feed.group_pending_ids().await.unwrap();
         assert_eq!(pending.len(), 5);
         let positions = feed.stream_positions().await.unwrap();
@@ -2602,13 +2699,13 @@ mod redis_tests {
         // Each group's own startup PEL-replay pass is legitimately empty
         // first (see this module's own doc comment on every other test here),
         // then the SAME entry is delivered to all three independently.
-        trust_consumer.next_batch().await.unwrap();
-        full_coverage_consumer.next_batch().await.unwrap();
-        trust_backlog_consumer.next_batch().await.unwrap();
+        payloads(trust_consumer.next_batch().await.unwrap());
+        payloads(full_coverage_consumer.next_batch().await.unwrap());
+        payloads(trust_backlog_consumer.next_batch().await.unwrap());
 
-        let a = trust_consumer.next_batch().await.unwrap();
-        let b = full_coverage_consumer.next_batch().await.unwrap();
-        let c = trust_backlog_consumer.next_batch().await.unwrap();
+        let a = payloads(trust_consumer.next_batch().await.unwrap());
+        let b = payloads(full_coverage_consumer.next_batch().await.unwrap());
+        let c = payloads(trust_backlog_consumer.next_batch().await.unwrap());
 
         assert_eq!(
             a,
@@ -2651,13 +2748,13 @@ mod redis_tests {
     async fn a_lost_consumer_group_is_recreated_after_nogroup() {
         let stream = unique_stream("nogroup");
         let mut feed = connect(&stream).await;
-        assert!(feed.next_batch().await.unwrap().is_empty());
+        assert!(payloads(feed.next_batch().await.unwrap()).is_empty());
 
         cleanup(&stream).await;
         let err = feed.next_batch().await.expect_err("the group is gone");
         assert!(is_nogroup(&err), "{err:?}");
 
-        assert!(feed.next_batch().await.unwrap().is_empty());
+        assert!(payloads(feed.next_batch().await.unwrap()).is_empty());
         let client = redis::Client::open(redis_url()).unwrap();
         let mut conn = common::redis_conn::connect(&client).await.unwrap();
         let _: String = redis::cmd("XADD")
@@ -2668,7 +2765,10 @@ mod redis_tests {
             .query_async(&mut conn)
             .await
             .unwrap();
-        assert_eq!(feed.next_batch().await.unwrap(), vec!["after-recreate"]);
+        assert_eq!(
+            payloads(feed.next_batch().await.unwrap()),
+            vec!["after-recreate"]
+        );
         feed.commit().await.unwrap();
         cleanup(&stream).await;
     }
@@ -2679,7 +2779,7 @@ mod redis_tests {
         let mut out = Vec::new();
         let mut empty_reads = 0;
         while empty_reads < 2 {
-            let batch = feed.next_batch().await.unwrap();
+            let batch = payloads(feed.next_batch().await.unwrap());
             if batch.is_empty() {
                 empty_reads += 1;
             }

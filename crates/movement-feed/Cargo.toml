@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"
+chrono = "0.4.45"
 clap = { version = "4.6.6", features = ["derive"] }
 common = { path = "../common", features = ["redis"] }
 health-http = { path = "../health-http" }

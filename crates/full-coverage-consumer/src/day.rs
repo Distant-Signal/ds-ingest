@@ -198,9 +198,11 @@ impl DayState {
     /// `Err` only for an unparseable payload (the caller decides whether to
     /// dead-letter it).
     ///
-    /// `received_at`: when the payload arrived -- `Utc::now()` live, the
-    /// stream entry id's time in the startup replay. It anchors TRUST's
-    /// skewed timestamps and the feed-health history.
+    /// `received_at`: when the payload arrived -- the stream entry id's time,
+    /// both live (`movement_feed::FeedEntry::received_at_or`) and in the
+    /// startup replay, so a lagging consumer still judges a cancellation
+    /// "in advance" against when it arrived. It anchors TRUST's skewed
+    /// timestamps and the feed-health history.
     pub(crate) fn dispatch_payload(
         &mut self,
         raw: &str,

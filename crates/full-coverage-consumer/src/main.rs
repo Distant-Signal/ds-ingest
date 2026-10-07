@@ -509,8 +509,12 @@ async fn consume_once<F: MovementFeed + DeadLetterSink>(
         }
     };
     let mut unparseable = Vec::new();
-    for raw in &batch {
-        if let Err(err) = day.dispatch_payload(raw, lookups, population, chrono::Utc::now()) {
+    let now = chrono::Utc::now();
+    for entry in &batch {
+        let raw = &entry.payload;
+        // When the entry arrived, not when this (possibly lagging) read ran.
+        let received_at = entry.received_at_or(now);
+        if let Err(err) = day.dispatch_payload(raw, lookups, population, received_at) {
             tracing::error!(error = ?err, raw = %raw, "failed to parse TRUST batch; dead-lettering this payload");
             metrics::counter!(
                 common::metrics::metric_name("full_coverage_consumer_errors_total"),
@@ -1348,7 +1352,7 @@ mod tests {
 
         let batch = feed.next_batch().await.unwrap();
         for raw in &batch {
-            for message in trust_schema::schema::parse_batch(raw).unwrap() {
+            for message in trust_schema::schema::parse_batch(&raw.payload).unwrap() {
                 dispatch_message(
                     message,
                     &mut correlation_state,
@@ -1689,7 +1693,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MovementFeed for RecordingFeed {
-        async fn next_batch(&mut self) -> anyhow::Result<Vec<String>> {
+        async fn next_batch(&mut self) -> anyhow::Result<Vec<movement_feed::FeedEntry>> {
             self.touch();
             self.inner.next_batch().await
         }
@@ -1907,6 +1911,33 @@ mod tests {
         let mut feed = FakeMovementFeed::new(vec![vec![ACTIVATION_C11052.to_string()]]);
         assert!(!consume_once(&mut feed, &mut day, &lookups, &population.load()).await);
         assert_eq!(feed.committed_count, 1);
+    }
+
+    /// The live path dates each entry by when it arrived (its stream id),
+    /// as the startup replay always has -- not by when a lagging consumer
+    /// reads it. Seen here through the feed-health history: an Activation
+    /// that arrived two hours ago is not one "in the last hour".
+    #[tokio::test]
+    async fn the_live_path_dates_an_entry_by_its_arrival_time() {
+        let population = shared(population::Population::default());
+        let lookups = waterloo_lookups();
+        let now = chrono::Utc::now();
+        let mut day = DayState::new(current_rail_service_date(now));
+
+        let mut feed = FakeMovementFeed::with_entries(vec![vec![
+            movement_feed::FeedEntry {
+                payload: ACTIVATION_C11052.to_string(),
+                received_at: Some(now - chrono::Duration::hours(2)),
+            },
+            movement_feed::FeedEntry::new(ACTIVATION_C22222),
+        ]]);
+        assert!(!consume_once(&mut feed, &mut day, &lookups, &population.load()).await);
+
+        assert_eq!(
+            day.activations_in_last_hour(chrono::Utc::now()),
+            1,
+            "only the entry with no known arrival time (dated now) is recent"
+        );
     }
 
     // --- 2026-09-27: windowed stats end to end through write_stats ---

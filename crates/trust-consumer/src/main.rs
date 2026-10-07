@@ -479,11 +479,10 @@ where
 {
     let snapshot = stanox_crs.read().expect("stanox_crs lock poisoned").clone();
 
-    // The real wall-clock "now" for this whole cycle -- see `run_once`'s own
-    // doc comment for why a single per-cycle value (rather than reading the
-    // clock again per message) is the right granularity here.
-    let received_at = chrono::Utc::now();
-    let events = match process::run_once(feed, reference, state, &snapshot, received_at).await {
+    // The real wall-clock "now" for this cycle. Each message is still dated
+    // by when it arrived, not by this -- see `run_once`'s own doc comment.
+    let now = chrono::Utc::now();
+    let events = match process::run_once(feed, reference, state, &snapshot, now).await {
         Ok(events) => events,
         Err(err) => {
             tracing::error!(error = ?err, "error processing movement feed batch");

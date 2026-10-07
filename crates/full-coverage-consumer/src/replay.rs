@@ -39,6 +39,7 @@ use async_trait::async_trait;
 use movement_feed::redis_stream::{
     RangePage, RedisStreamMovementFeed, StreamPositions, stream_id_less_than,
 };
+use movement_feed::stream_id_time;
 
 use crate::day::{DayState, Lookups, PartialReason};
 use crate::population_reload::SharedPopulation;
@@ -171,12 +172,6 @@ fn day_start_trimmed(positions: &StreamPositions, start_id: &str) -> bool {
             .as_deref()
             .is_some_and(|last| !stream_id_less_than(last, start_id)),
     }
-}
-
-/// The instant a stream entry id (`<ms>-<seq>`) was generated at.
-pub(crate) fn stream_id_time(id: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    let millis: i64 = id.split('-').next()?.parse().ok()?;
-    chrono::DateTime::from_timestamp_millis(millis)
 }
 
 /// Retries `$op` until it succeeds: 1 s, doubling to 30 s, beating

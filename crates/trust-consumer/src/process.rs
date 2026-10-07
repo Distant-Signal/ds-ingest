@@ -850,33 +850,38 @@ pub(crate) fn build_forward_signals(
 /// `main.rs`'s real loop posts this return value and only then calls
 /// `feed.commit()`.
 ///
-/// `received_at` is the wall-clock time this whole batch is being
-/// processed at, supplied by the caller (`main.rs` passes
-/// `chrono::Utc::now()`) rather than read from the clock in here, so this
-/// function stays a pure function of its arguments -- same posture as
-/// `prune_expired_activations`'s own caller-supplied `today`. One value for
-/// the whole batch, not one per message, is a deliberate simplification:
-/// `next_batch` returns whatever Kafka/Redis Streams has ready right now,
-/// and the messages in one batch are processed within, at most, a handful
-/// of milliseconds of each other -- far inside
-/// `common::trust_timestamp::MAX_TIMESTAMP_SKEW_AHEAD_OF_RECEIPT` -- so a
-/// single per-batch timestamp is indistinguishable from a per-message one
-/// for the plausibility guard's purposes. Threaded into every TRUST
-/// timestamp parsed this cycle (via
-/// `common::trust_timestamp::parse_trust_epoch_millis`) and into
-/// `matching::resolve_origin_departure`'s own guard.
+/// Each message's `received_at` is when its feed entry ARRIVED (the
+/// relay's `XADD`, from the stream id -- see
+/// `movement_feed::FeedEntry::received_at`), not when this cycle runs. It
+/// decides an Activation's rail day and the fallback event date, and
+/// anchors the TRUST timestamp plausibility guard and BST/GMT correction
+/// (`common::trust_timestamp::parse_trust_epoch_millis`,
+/// `matching::resolve_origin_departure`). Stamping the processing clock
+/// instead used to misattribute an Activation that arrived at 01:59 London
+/// but was processed after 02:00 (a lagging consumer) to the next rail day.
+///
+/// `now` is the wall-clock time of this cycle, supplied by the caller
+/// (`main.rs` passes `chrono::Utc::now()`) rather than read from the clock
+/// in here, so this function stays a pure function of its arguments --
+/// same posture as `prune_expired_activations`'s own caller-supplied
+/// `today`. It stands in for an entry whose arrival time is unknown, and
+/// caps one that claims to be later (see
+/// `movement_feed::FeedEntry::received_at_or`); with no lag an entry's
+/// arrival time is within milliseconds of it.
 pub(crate) async fn run_once<F: MovementFeed + movement_feed::DeadLetterSink>(
     feed: &mut F,
     reference: &Reference,
     state: &mut ProcessorState,
     stanox_crs: &crate::stanox_crs::StanoxCrsTable,
-    received_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<Vec<common::TrainMovementEventMessage>> {
-    let raw_batches = feed.next_batch().await?;
+    let entries = feed.next_batch().await?;
     let mut events = Vec::new();
     let mut unparseable = Vec::new();
 
-    for raw in raw_batches {
+    for entry in entries {
+        let received_at = entry.received_at_or(now);
+        let raw = entry.payload;
         // ONE unparseable payload must not take the rest of the batch down
         // with it (finding #8 of the 2026-09-25 review). This used to be a
         // `?`, which aborted the whole `run_once` call: under the Redis
@@ -3796,6 +3801,57 @@ mod tests {
                 .map(|a| a.observed_rail_day),
             Some("2026-08-28".parse().unwrap()),
             "the rail day, not the UTC calendar date"
+        );
+    }
+
+    /// The observed rail day is the one the Activation ARRIVED in, not the
+    /// one a lagging consumer processes it in: arrived at 01:59 BST,
+    /// processed at 02:05, it still belongs to the rail day that began the
+    /// previous morning. An entry with no known arrival time in the same
+    /// batch falls back to the processing time.
+    #[tokio::test]
+    async fn a_lagging_activation_records_the_rail_day_it_arrived_in() {
+        let activation = |train_id: &str| {
+            format!(
+                r#"[{{"header":{{"msg_type":"0001"}},"body":{{
+                "train_id":"{train_id}","train_uid":"C21373","toc_id":"SW",
+                "train_service_code":"22345000","schedule_wtt_id":"WTT1",
+                "schedule_start_date":"2026-08-28","schedule_end_date":"2026-12-11"
+            }}}}]"#
+            )
+        };
+        let mut feed = FakeMovementFeed::with_entries(vec![vec![
+            movement_feed::FeedEntry {
+                payload: activation("221832406"),
+                // 00:59 UTC on the 29th = 01:59 BST.
+                received_at: Some("2026-08-29T00:59:00Z".parse().unwrap()),
+            },
+            movement_feed::FeedEntry::new(activation("221832407")),
+        ]]);
+        let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
+        let mut state = ProcessorState::default();
+
+        // 01:05 UTC = 02:05 BST: past the cutoff, the 29th's rail day.
+        let now: chrono::DateTime<chrono::Utc> = "2026-08-29T01:05:00Z".parse().unwrap();
+        run_once(&mut feed, &reference, &mut state, &TEST_STANOX_CRS, now)
+            .await
+            .unwrap();
+
+        let observed = |train_id: &str| {
+            state
+                .pending_activations
+                .get(train_id)
+                .map(|a| a.observed_rail_day)
+        };
+        assert_eq!(
+            observed("221832406"),
+            Some("2026-08-28".parse().unwrap()),
+            "dated by when it arrived (01:59), not when it was processed (02:05)"
+        );
+        assert_eq!(
+            observed("221832407"),
+            Some("2026-08-29".parse().unwrap()),
+            "no arrival time: dated by the processing time"
         );
     }
 

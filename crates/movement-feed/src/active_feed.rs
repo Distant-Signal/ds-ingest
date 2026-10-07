@@ -76,7 +76,7 @@ pub enum ActiveFeed {
 
 #[async_trait::async_trait]
 impl MovementFeed for ActiveFeed {
-    async fn next_batch(&mut self) -> anyhow::Result<Vec<String>> {
+    async fn next_batch(&mut self) -> anyhow::Result<Vec<crate::FeedEntry>> {
         match self {
             ActiveFeed::RedisStream(feed, connection_state, gauge_name) => {
                 let result = feed.next_batch().await;
