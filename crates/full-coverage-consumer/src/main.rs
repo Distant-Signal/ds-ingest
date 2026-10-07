@@ -111,7 +111,7 @@ async fn main() -> std::process::ExitCode {
     reason = "long but linear; splitting it would scatter its shared state across helpers"
 )]
 async fn run() -> anyhow::Result<()> {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
     common::logging::init("full-coverage-consumer");
     let config = Config::parse();
     if config.metrics.metrics_enabled {

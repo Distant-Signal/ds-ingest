@@ -201,14 +201,15 @@ pub(crate) async fn reload_cycle_from(
                     drop(body);
                     match parsed {
                         Ok(Some(pop)) => {
+                            let day = if date == dates[0] {
+                                "today"
+                            } else {
+                                "tomorrow"
+                            };
                             if let Some(shadow) = &pop.membership_shadow {
-                                let day = if date == dates[0] {
-                                    "today"
-                                } else {
-                                    "tomorrow"
-                                };
                                 report_membership_shadow(line_id, date, day, shadow);
                             }
+                            report_entries_after_next_rail_day(line_id, date, day, &pop);
                             next.insert_line_pop(line_id, date, pop, etag);
                             outcome.succeeded += 1;
                         }
@@ -249,6 +250,31 @@ pub(crate) async fn reload_cycle_from(
         }
     }
     (next, outcome)
+}
+
+/// `full_coverage_consumer_line_entries_after_next_rail_day{line,day}`: how
+/// many of the line's relevant trains for `date` are due after the next
+/// rail day has started, and so are counted in no day
+/// (`windows::due_after_next_rail_day_start`; design doc "Decisions
+/// (2026-10-07)"). About 9 entries a day network-wide on 2026-10-04/05;
+/// growth means more overnight services fall in the gap. Set on every fresh
+/// download, like the membership gauges, with the same bounded labels (one
+/// series per configured line and `today`/`tomorrow`). Always 0 without the
+/// line's geometry (no reduced trains).
+fn report_entries_after_next_rail_day(
+    line_id: &str,
+    date: chrono::NaiveDate,
+    day: &'static str,
+    pop: &crate::population::LinePop,
+) {
+    metrics::gauge!(
+        common::metrics::metric_name("full_coverage_consumer_line_entries_after_next_rail_day"),
+        "line" => line_id.to_string(),
+        "day" => day
+    )
+    .set(f64::from(crate::windows::due_after_next_rail_day_start(
+        pop, date,
+    )));
 }
 
 /// `FULL_COVERAGE_LINE_MEMBERSHIP=shadow`: exports one line and day's

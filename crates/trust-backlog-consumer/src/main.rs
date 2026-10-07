@@ -46,7 +46,7 @@ async fn main() -> std::process::ExitCode {
     reason = "a poisoned lock means another thread already panicked; long but linear; splitting it would scatter its shared state across helpers"
 )]
 async fn run() -> anyhow::Result<()> {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
     common::logging::init("trust-backlog-consumer");
     let config = Config::parse();
     if config.metrics.metrics_enabled {

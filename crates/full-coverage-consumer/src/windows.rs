@@ -396,6 +396,24 @@ pub(crate) fn window_ranges(
     ]
 }
 
+/// How many of service date `service_date`'s relevant trains are due on
+/// the line at or after `rail_day_start(service_date + 1)`. These are
+/// counted in NO rail day: rail day D's windows end there, and rail day
+/// D + 1 counts only D + 1's population (plus D + 2's trains before 02:00).
+/// Accepted and documented ("Decisions (2026-10-07)" in the design doc):
+/// about 9 line-train entries a day, the up and down Night Riviera on the
+/// GWR lines and the up Highlander Caledonian Sleeper on the WCML, all in
+/// overnight windows that are 90%+ empty. Exported per line and day as
+/// `full_coverage_consumer_line_entries_after_next_rail_day` so growth is
+/// visible.
+pub(crate) fn due_after_next_rail_day_start(pop: &LinePop, service_date: chrono::NaiveDate) -> u32 {
+    let next = to_minutes(crate::stats::rail_day_start(
+        service_date + chrono::Duration::days(1),
+    ));
+    let first = pop.trains.partition_point(|t| t.due_min < next);
+    u32::try_from(pop.trains.len().saturating_sub(first)).unwrap_or(u32::MAX)
+}
+
 /// The v2 `full_coverage_line_stats` row from a `day_to_date` window: the
 /// open day's running counts (`pending`), or -- once closed -- the day's
 /// audit record (`available` unless partial).
@@ -1027,5 +1045,36 @@ mod tests {
             window_ranges(i.service_date, night, &params(), false);
         assert!(i.window(kind, from, to, night).partial);
         assert!(i.window(dkind, dfrom, dto, night).partial);
+    }
+
+    /// Decisions (2026-10-07): a train of service date D due on the line
+    /// after rail day D + 1 has started (the up and down Night Riviera on
+    /// the GWR lines, the up Highlander sleeper on the WCML, due 02:54 to
+    /// 04:37) is counted in no rail day. D's closed day ends at
+    /// `rail_day_start(D + 1)`, and D + 1's windows count only D + 1's
+    /// population. Accepted as bounded; `due_after_next_rail_day_start`
+    /// counts them for the metric.
+    #[test]
+    fn a_sleeper_due_after_the_next_rail_day_starts_is_counted_in_no_day() {
+        let today = [
+            local_train("DAY", "2026-09-30", "18:00:00"),
+            local_train("RIVIERA", "2026-10-01", "04:18:00"),
+        ];
+        let pop = line_pop(today.to_vec(), Relevance::Full);
+        let service_date: chrono::NaiveDate = "2026-09-30".parse().unwrap();
+        assert_eq!(due_after_next_rail_day_start(&pop, service_date), 1);
+        // Rail day 2026-09-30's closed day leaves it out...
+        let (_, closed, _) = rail_day_counts("2026-09-30", &today, &[], at("2026-10-01T00:30:00Z"));
+        assert_eq!(closed.total, 1, "{closed:?}");
+        // ...and rail day 2026-10-01 never sees the 2026-09-30 population:
+        // with nothing of its own, its windows at 04:30 count nothing.
+        let (so_far, _, _) = rail_day_counts("2026-10-01", &[], &[], at("2026-10-01T03:30:00Z"));
+        assert_eq!(so_far.total, 0, "{so_far:?}");
+        // A train due before 02:00 on D + 1 (in D's own population) is D's.
+        let early = line_pop(
+            vec![local_train("EARLY", "2026-10-01", "01:30:00")],
+            Relevance::Full,
+        );
+        assert_eq!(due_after_next_rail_day_start(&early, service_date), 0);
     }
 }

@@ -68,7 +68,7 @@ async fn main() -> std::process::ExitCode {
     reason = "these durations are seconds to hours, far below u64::MAX milliseconds; long but linear; splitting it would scatter its shared state across helpers"
 )]
 async fn run() -> anyhow::Result<()> {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
 
     common::logging::init("trust-consumer");
 
