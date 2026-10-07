@@ -13,8 +13,17 @@ This script does not touch Redis or Postgres itself. It reads the
 `redis-cli --raw XRANGE` output of the stream (taken read-only, by the
 operator) and writes a psql script:
 
-  kubectl ... exec deploy/distant-signal-redis -- \
-      redis-cli --raw XRANGE movement-events - + > stream.txt
+  # PAGE the dump. Never run a single `XRANGE movement-events - +`: on
+  # 2026-10-07 that one command (~1M entries) grew Redis's client output
+  # buffer past the container's 3Gi limit and OOM-killed Redis.
+  start=-; : > stream.txt
+  while :; do
+    page=$(kubectl ... exec deploy/distant-signal-redis -- \
+        redis-cli --raw XRANGE movement-events "$start" + COUNT 10000)
+    [ -z "$page" ] && break
+    printf '%s\n' "$page" >> stream.txt
+    start="($(printf '%s\n' "$page" | grep -E '^[0-9]+-[0-9]+$' | tail -n 1)"
+  done
   uv run scripts/backfill-gbtt-from-movement-stream.py stream.txt > dry.sql
   kubectl ... exec -i distant-signal-postgres-0 -- \
       psql -U distant_signal -d distant_signal -v ON_ERROR_STOP=1 < dry.sql
@@ -295,7 +304,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "stream_dump",
         type=Path,
-        help="`redis-cli --raw XRANGE movement-events - +` output ('-' for stdin)",
+        help=(
+            "concatenated paged `redis-cli --raw XRANGE movement-events "
+            "<start> + COUNT 10000` output ('-' for stdin); see the module "
+            "docstring, and never dump the stream with one XRANGE"
+        ),
     )
     parser.add_argument(
         "--apply",
