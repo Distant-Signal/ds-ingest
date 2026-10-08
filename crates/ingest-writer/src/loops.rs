@@ -17,7 +17,11 @@
 //! api runs it once at startup, under the same lock, and after each
 //! stations or CORPUS POST. With schedule-ingest writing CORPUS directly
 //! (`INGEST_SINK=db`, plan 2d) this loop is the only place the freshness
-//! gauge and the post-load comparison run between api restarts.
+//! gauge and the post-load comparison run between api restarts. With
+//! poller-stations on `INGEST_SINK=db` (plan 2b) there is no stations POST:
+//! this loop is then what gives a new station its crosswalk fills, within
+//! 10 minutes (spec §9.3), so it must be on (`INGEST_WRITER_LOOPS`) before
+//! that flip.
 //!
 //! The `CronJob` sweeps (expired sessions, dead links, personal data) never
 //! come here: they need `DELETE` on user tables the writer role must not
