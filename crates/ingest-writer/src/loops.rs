@@ -6,7 +6,7 @@
 //! | schedule-match | `SCHEDULE_MATCH_SWEEP` | [`ds_store::loops::schedule_match`] | `SCHEDULE_MATCH_INTERVAL_SECS` (300) |
 //! | reconciliation | `RECONCILIATION_SWEEP` | [`ds_store::loops::reconciliation`] | `RECONCILIATION_SWEEP_INTERVAL_SECS` (300), grace `SCHEDULE_ENRICHMENT_GRACE_MINUTES` (30) |
 //! | backlog-match | `BACKLOG_MATCH_SWEEP` | [`ds_store::loops::backlog_match`] | `BACKLOG_MATCH_SWEEP_INTERVAL_SECS` (300) |
-//! | CORPUS crosswalk | `CORPUS_CROSSWALK` | [`ds_store::loops::corpus_crosswalk`] | `INGEST_WRITER_CORPUS_CROSSWALK_INTERVAL_SECS` (600) |
+//! | CORPUS crosswalk | `CORPUS_CROSSWALK` | [`ds_store::loops::corpus_crosswalk_comparing`] (the rebuild check, the freshness gauge, and the CORPUS comparison after each new delivery) | `INGEST_WRITER_CORPUS_CROSSWALK_INTERVAL_SECS` (600) |
 //! | canary | `WRITER_CANARY` | [`canary`] (`SELECT 1`) | `INGEST_WRITER_CANARY_INTERVAL_SECS` (60) |
 //!
 //! The first three are the api's loops (same functions, names and defaults
@@ -15,7 +15,9 @@
 //! while `API_BACKGROUND_LOOPS` is on (plan 1B.7), so each sweep runs in
 //! one process at a time. The CORPUS check runs here every 10 minutes; the
 //! api runs it once at startup, under the same lock, and after each
-//! stations or CORPUS POST.
+//! stations or CORPUS POST. With schedule-ingest writing CORPUS directly
+//! (`INGEST_SINK=db`, plan 2d) this loop is the only place the freshness
+//! gauge and the post-load comparison run between api restarts.
 //!
 //! The `CronJob` sweeps (expired sessions, dead links, personal data) never
 //! come here: they need `DELETE` on user tables the writer role must not
@@ -40,9 +42,9 @@ pub fn register(runner: &mut LoopRunner, config: &Config) -> Result<()> {
     for spec in ds_store::loops::periodic_sweeps(config.train_loop_intervals(), &index) {
         runner.register(spec)?;
     }
-    runner.register(ds_store::loops::corpus_crosswalk(Duration::from_secs(
-        config.corpus_crosswalk_interval_secs,
-    )))?;
+    runner.register(ds_store::loops::corpus_crosswalk_comparing(
+        Duration::from_secs(config.corpus_crosswalk_interval_secs),
+    ))?;
     Ok(())
 }
 
