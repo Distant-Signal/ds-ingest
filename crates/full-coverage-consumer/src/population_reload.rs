@@ -79,6 +79,268 @@ impl CycleOutcome {
     }
 }
 
+/// Where a reload cycle gets each `(line, date)` population
+/// (`POPULATION_SOURCE`, ingest architecture spec §11.1, plan 4.3). The
+/// cycle around it -- the rotation, the abort after
+/// [`ABORT_AFTER_FAILURES`], the carried-over snapshots, the metrics -- is
+/// the same for every source.
+pub(crate) trait PopulationSource: Sync {
+    /// What a source learns once per cycle, before any fetch.
+    type Cycle: Send + Sync;
+
+    /// Called once at the start of every cycle with every key it will
+    /// fetch.
+    fn begin_cycle(
+        &self,
+        line_ids: &[String],
+        dates: &[chrono::NaiveDate],
+    ) -> impl Future<Output = Self::Cycle> + Send;
+
+    /// One `(line, date)`, conditional on `if_none_match`, the validator of
+    /// the population held for it (`None`: fetch it whole).
+    fn fetch(
+        &self,
+        cycle: &Self::Cycle,
+        line_id: &str,
+        date: chrono::NaiveDate,
+        if_none_match: Option<&str>,
+    ) -> impl Future<Output = anyhow::Result<queries::LinePopulationFetch>> + Send;
+
+    /// `http` or `db`, for logs.
+    fn kind(&self) -> &'static str;
+}
+
+/// `POPULATION_SOURCE=http` (the default): one conditional
+/// `GET /private/schedule-line-population` per key.
+pub(crate) struct HttpSource {
+    pub client: reqwest::Client,
+    pub url: String,
+    pub tokens: Arc<common::oauth_client::OAuthTokenCache>,
+}
+
+impl PopulationSource for HttpSource {
+    type Cycle = ();
+
+    async fn begin_cycle(&self, _line_ids: &[String], _dates: &[chrono::NaiveDate]) {}
+
+    async fn fetch(
+        &self,
+        (): &(),
+        line_id: &str,
+        date: chrono::NaiveDate,
+        if_none_match: Option<&str>,
+    ) -> anyhow::Result<queries::LinePopulationFetch> {
+        queries::fetch_line_population(
+            &self.client,
+            &self.url,
+            &self.tokens,
+            line_id,
+            date,
+            if_none_match,
+        )
+        .await
+    }
+
+    fn kind(&self) -> &'static str {
+        "http"
+    }
+}
+
+/// [`HttpSource`] over borrowed parts, for the tests' one-off cycles.
+#[cfg(test)]
+pub(crate) struct HttpSourceRef<'a> {
+    pub client: &'a reqwest::Client,
+    pub url: &'a str,
+    pub tokens: &'a common::oauth_client::OAuthTokenCache,
+}
+
+#[cfg(test)]
+impl PopulationSource for HttpSourceRef<'_> {
+    type Cycle = ();
+
+    async fn begin_cycle(&self, _line_ids: &[String], _dates: &[chrono::NaiveDate]) {}
+
+    async fn fetch(
+        &self,
+        (): &(),
+        line_id: &str,
+        date: chrono::NaiveDate,
+        if_none_match: Option<&str>,
+    ) -> anyhow::Result<queries::LinePopulationFetch> {
+        queries::fetch_line_population(
+            self.client,
+            self.url,
+            self.tokens,
+            line_id,
+            date,
+            if_none_match,
+        )
+        .await
+    }
+
+    fn kind(&self) -> &'static str {
+        "http"
+    }
+}
+
+/// `POPULATION_SOURCE=db` (spec §11.1): once per cycle,
+/// `ds_store::reads::list_population_versions` (one query for every key);
+/// then per key, nothing at all when the version held is still current,
+/// else `get_schedule_line_population_conditional` with the version held,
+/// so a publish between the two queries degrades to "not modified" or a
+/// fresh body. The validator is the api's `ETag`
+/// (`ds_store::reads::population_version_tag`), so a held population reads
+/// the same whichever source fetched it.
+pub(crate) struct DbSource {
+    pub pool: sqlx::PgPool,
+}
+
+/// [`DbSource`]'s per-cycle state: every published key's version, or why
+/// the version query failed (every fetch of the cycle then fails the same
+/// way, so the abort after [`ABORT_AFTER_FAILURES`] still applies).
+pub(crate) type PopulationVersions =
+    Result<HashMap<(String, chrono::NaiveDate), chrono::DateTime<chrono::Utc>>, String>;
+
+impl PopulationSource for DbSource {
+    type Cycle = PopulationVersions;
+
+    async fn begin_cycle(
+        &self,
+        line_ids: &[String],
+        dates: &[chrono::NaiveDate],
+    ) -> PopulationVersions {
+        match ds_store::reads::list_population_versions(&self.pool, line_ids, dates).await {
+            Ok(versions) => Ok(versions
+                .into_iter()
+                .map(|v| ((v.line_id, v.service_date), v.updated_at))
+                .collect()),
+            Err(err) => {
+                tracing::error!(error = ?err, "failed to list the schedule population versions");
+                Err(format!("{err:#}"))
+            }
+        }
+    }
+
+    async fn fetch(
+        &self,
+        versions: &PopulationVersions,
+        line_id: &str,
+        date: chrono::NaiveDate,
+        if_none_match: Option<&str>,
+    ) -> anyhow::Result<queries::LinePopulationFetch> {
+        let known = match db_fetch_plan(versions, line_id, date, if_none_match)? {
+            DbFetchPlan::NothingPublished => {
+                // What the api answers `null`.
+                return Ok(queries::LinePopulationFetch::Fetched {
+                    body: "null".to_string(),
+                    etag: None,
+                });
+            }
+            DbFetchPlan::Unchanged => return Ok(queries::LinePopulationFetch::NotModified),
+            DbFetchPlan::Fetch { known } => known,
+        };
+        Ok(
+            match ds_store::reads::get_schedule_line_population_conditional(
+                &self.pool, line_id, date, false, &known,
+            )
+            .await?
+            {
+                // Deleted since the version query.
+                None => queries::LinePopulationFetch::Fetched {
+                    body: "null".to_string(),
+                    etag: None,
+                },
+                Some(ds_store::reads::ConditionalPopulation::NotModified { .. }) => {
+                    queries::LinePopulationFetch::NotModified
+                }
+                Some(ds_store::reads::ConditionalPopulation::Modified {
+                    updated_at,
+                    population,
+                }) => queries::LinePopulationFetch::Fetched {
+                    body: population,
+                    etag: Some(ds_store::reads::population_version_tag(updated_at)),
+                },
+            },
+        )
+    }
+
+    fn kind(&self) -> &'static str {
+        "db"
+    }
+}
+
+/// What [`DbSource::fetch`] does for one key, decided from the cycle's
+/// version list alone.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DbFetchPlan {
+    /// No row: nothing published yet. No query.
+    NothingPublished,
+    /// The version held is the current one. No query.
+    Unchanged,
+    /// Read the row, conditional on `known` (the version held, if any).
+    Fetch {
+        known: Vec<chrono::DateTime<chrono::Utc>>,
+    },
+}
+
+/// See [`DbFetchPlan`]. `Err` when the cycle's version query failed.
+pub(crate) fn db_fetch_plan(
+    versions: &PopulationVersions,
+    line_id: &str,
+    date: chrono::NaiveDate,
+    if_none_match: Option<&str>,
+) -> anyhow::Result<DbFetchPlan> {
+    let versions = versions
+        .as_ref()
+        .map_err(|err| anyhow::anyhow!("listing the population versions failed: {err}"))?;
+    let held = if_none_match.and_then(ds_store::reads::parse_population_version_tag);
+    Ok(match versions.get(&(line_id.to_string(), date)) {
+        None => DbFetchPlan::NothingPublished,
+        Some(current) if held == Some(*current) => DbFetchPlan::Unchanged,
+        Some(_) => DbFetchPlan::Fetch {
+            known: held.into_iter().collect(),
+        },
+    })
+}
+
+/// A stable checksum of the populations held for `line_ids` x `dates`:
+/// every key and its sorted uids, FNV-1a. Logged after every cycle, so the
+/// two sources can be compared over a day (spec §16 phase 4 exit).
+pub(crate) fn population_checksum(
+    population: &Population,
+    line_ids: &[String],
+    dates: &[chrono::NaiveDate],
+) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0100_0000_01b3;
+    let mut hash = OFFSET;
+    let mut feed = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(PRIME);
+    };
+    let mut lines: Vec<&String> = line_ids.iter().collect();
+    lines.sort();
+    for line_id in lines {
+        for date in dates {
+            if !population.has(line_id, *date) {
+                continue;
+            }
+            feed(line_id.as_bytes());
+            feed(date.to_string().as_bytes());
+            let mut uids = population.uids_for(line_id, *date);
+            uids.sort_unstable();
+            for uid in uids {
+                feed(uid.as_bytes());
+            }
+        }
+    }
+    hash
+}
+
 /// One reload cycle: `service_date`'s and the next day's population for
 /// every line in `line_ids` (Decision 2b -- tomorrow's too, so the rail-day
 /// rollover finds it already loaded), each conditional on the `ETag` held
@@ -89,7 +351,7 @@ impl CycleOutcome {
 /// snapshot and is reported in [`CycleOutcome::failed`]; it never blocks
 /// any other line. Every date older than `service_date` is dropped (only
 /// today's and tomorrow's are ever read). The reloader itself calls
-/// [`reload_cycle_from`], which also rotates the starting line.
+/// [`reload_cycle_with`], which also rotates the starting line.
 #[cfg(test)]
 pub(crate) async fn reload_cycle(
     client: &reqwest::Client,
@@ -113,14 +375,12 @@ pub(crate) async fn reload_cycle(
     .await
 }
 
-/// [`reload_cycle`], starting at `line_ids[start % len]` and wrapping
-/// round. Stops fetching once [`ABORT_AFTER_FAILURES`] fetches in a row
-/// have failed with none succeeding before them; every key not fetched
-/// keeps its previous snapshot and is reported in [`CycleOutcome::failed`].
+/// [`reload_cycle`], starting at `line_ids[start % len]`: see
+/// [`reload_cycle_with`].
+#[cfg(test)]
 #[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "each argument is an independent input from the single caller; a struct would only wrap them. One loop body per fetch outcome, read top to bottom"
+    reason = "each argument is an independent input from the tests; a struct would only wrap them"
 )]
 pub(crate) async fn reload_cycle_from(
     client: &reqwest::Client,
@@ -132,9 +392,42 @@ pub(crate) async fn reload_cycle_from(
     service_date: chrono::NaiveDate,
     start: usize,
 ) -> (Population, CycleOutcome) {
+    reload_cycle_with(
+        &HttpSourceRef {
+            client,
+            url,
+            tokens,
+        },
+        line_ids,
+        geometry,
+        previous,
+        service_date,
+        start,
+    )
+    .await
+}
+
+/// One cycle from `source`, starting at `line_ids[start % len]` and
+/// wrapping round. Stops fetching once [`ABORT_AFTER_FAILURES`] fetches in
+/// a row have failed with none succeeding before them; every key not
+/// fetched keeps its previous snapshot and is reported in
+/// [`CycleOutcome::failed`].
+#[expect(
+    clippy::too_many_lines,
+    reason = "one loop body per fetch outcome, read top to bottom"
+)]
+pub(crate) async fn reload_cycle_with<S: PopulationSource>(
+    source: &S,
+    line_ids: &[String],
+    geometry: &HashMap<String, Arc<LineGeometry>>,
+    previous: &Population,
+    service_date: chrono::NaiveDate,
+    start: usize,
+) -> (Population, CycleOutcome) {
     let mut next = Population::default();
     let mut outcome = CycleOutcome::default();
     let dates = [service_date, service_date + chrono::Duration::days(1)];
+    let cycle = source.begin_cycle(line_ids, &dates).await;
     let start = if line_ids.is_empty() {
         0
     } else {
@@ -167,9 +460,7 @@ pub(crate) async fn reload_cycle_from(
             // was reduced: it must then be downloaded and reduced again.
             let geometry_hash = geometry.get(line_id).map_or(0, |g| g.hash);
             let if_none_match = previous.etag_if_current(line_id, date, geometry_hash);
-            match queries::fetch_line_population(client, url, tokens, line_id, date, if_none_match)
-                .await
-            {
+            match source.fetch(&cycle, line_id, date, if_none_match).await {
                 Ok(queries::LinePopulationFetch::NotModified) => {
                     metrics::counter!(
                         common::metrics::metric_name(
@@ -439,8 +730,23 @@ impl Reloader {
     /// Spawns the reload loop. The returned receiver turns `Some` once, when
     /// the first load is usable; wait on it with [`wait_for_first_load`].
     pub(crate) fn spawn(self) -> tokio::sync::watch::Receiver<Option<FirstLoad>> {
+        let source = HttpSource {
+            client: self.client.clone(),
+            url: self.url.clone(),
+            tokens: Arc::clone(&self.tokens),
+        };
+        self.spawn_with(source)
+    }
+
+    /// [`Reloader::spawn`], fetching from `source` instead of the api
+    /// (`POPULATION_SOURCE=db`: a [`DbSource`]; `client`, `url` and
+    /// `tokens` are then unused).
+    pub(crate) fn spawn_with<S>(self, source: S) -> tokio::sync::watch::Receiver<Option<FirstLoad>>
+    where
+        S: PopulationSource + Send + 'static,
+    {
         let (tx, rx) = tokio::sync::watch::channel(None);
-        tokio::spawn(self.run(tx));
+        tokio::spawn(self.run(source, tx));
         rx
     }
 
@@ -454,7 +760,11 @@ impl Reloader {
         clippy::cast_precision_loss,
         reason = "metric gauges take f64, and these counts and timestamps stay far below 2^52"
     )]
-    async fn run(self, tx: tokio::sync::watch::Sender<Option<FirstLoad>>) {
+    async fn run<S: PopulationSource>(
+        self,
+        source: S,
+        tx: tokio::sync::watch::Sender<Option<FirstLoad>>,
+    ) {
         let started = tokio::time::Instant::now();
         let mut failed_cycles: u32 = 0;
         let mut cycles: usize = 0;
@@ -464,10 +774,8 @@ impl Reloader {
             let geometry = self.geometry.load_full();
             let previous = self.population.load_full();
             let cycle_start = std::time::Instant::now();
-            let (next, outcome) = reload_cycle_from(
-                &self.client,
-                &self.url,
-                &self.tokens,
+            let (next, outcome) = reload_cycle_with(
+                &source,
                 &line_ids,
                 &geometry,
                 &previous,
@@ -477,6 +785,22 @@ impl Reloader {
             .await;
             cycles = cycles.wrapping_add(1);
             drop(previous);
+            // Plan 4.3's comparison of the two sources (spec §16 phase 4
+            // exit): the same checksum from either, cycle by cycle.
+            tracing::info!(
+                source = source.kind(),
+                checksum = %format!(
+                    "{:016x}",
+                    population_checksum(
+                        &next,
+                        &line_ids,
+                        &[service_date, service_date + chrono::Duration::days(1)],
+                    )
+                ),
+                uids = next.total_uids(),
+                failed = outcome.failed.len(),
+                "population reload cycle"
+            );
             metrics::gauge!(common::metrics::metric_name(
                 "full_coverage_consumer_population_uids"
             ))
@@ -1205,5 +1529,193 @@ pub(crate) mod tests {
         .expect("let through after the initial wait")
         .unwrap();
         assert_eq!(first.missing_lines, vec!["broken-line".to_string()]);
+    }
+}
+
+/// `POPULATION_SOURCE=db` (plan 4.3). The plan is unit-tested; the cycles
+/// run against a throwaway database (`#[sqlx::test]`, migrated from
+/// ds-store's migrations), so `DATABASE_URL` must be able to create
+/// databases.
+#[cfg(test)]
+mod db_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    const BODY: &str = r#"[{"uid": "C11052", "calling_points": []}]"#;
+
+    fn day() -> chrono::NaiveDate {
+        "2050-01-10".parse().unwrap()
+    }
+
+    /// Counts the fetches a cycle makes and records which keys came back
+    /// with a body.
+    struct Counting<S> {
+        inner: S,
+        fetches: AtomicUsize,
+        bodies: std::sync::Mutex<Vec<(String, chrono::NaiveDate)>>,
+    }
+
+    impl<S> Counting<S> {
+        fn new(inner: S) -> Self {
+            Self {
+                inner,
+                fetches: AtomicUsize::new(0),
+                bodies: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn take(&self) -> (usize, Vec<(String, chrono::NaiveDate)>) {
+            let mut bodies = std::mem::take(&mut *self.bodies.lock().unwrap());
+            bodies.sort();
+            (self.fetches.swap(0, Ordering::Relaxed), bodies)
+        }
+    }
+
+    impl<S: PopulationSource + Send> PopulationSource for Counting<S> {
+        type Cycle = S::Cycle;
+
+        async fn begin_cycle(&self, line_ids: &[String], dates: &[chrono::NaiveDate]) -> S::Cycle {
+            self.inner.begin_cycle(line_ids, dates).await
+        }
+
+        async fn fetch(
+            &self,
+            cycle: &S::Cycle,
+            line_id: &str,
+            date: chrono::NaiveDate,
+            if_none_match: Option<&str>,
+        ) -> anyhow::Result<queries::LinePopulationFetch> {
+            self.fetches.fetch_add(1, Ordering::Relaxed);
+            let fetched = self.inner.fetch(cycle, line_id, date, if_none_match).await;
+            if let Ok(queries::LinePopulationFetch::Fetched { body, .. }) = &fetched
+                && body != "null"
+            {
+                self.bodies
+                    .lock()
+                    .unwrap()
+                    .push((line_id.to_string(), date));
+            }
+            fetched
+        }
+
+        fn kind(&self) -> &'static str {
+            self.inner.kind()
+        }
+    }
+
+    #[test]
+    fn the_plan_reads_only_a_changed_or_unknown_version() {
+        let at = |micros| chrono::DateTime::from_timestamp_micros(micros).unwrap();
+        let versions: PopulationVersions =
+            Ok(HashMap::from([(("wcml".to_string(), day()), at(5))]));
+        let held = ds_store::reads::population_version_tag(at(5));
+        let stale = ds_store::reads::population_version_tag(at(4));
+        assert_eq!(
+            db_fetch_plan(&versions, "wcml", day(), Some(&held)).unwrap(),
+            DbFetchPlan::Unchanged
+        );
+        assert_eq!(
+            db_fetch_plan(&versions, "wcml", day(), Some(&stale)).unwrap(),
+            DbFetchPlan::Fetch { known: vec![at(4)] }
+        );
+        assert_eq!(
+            db_fetch_plan(&versions, "wcml", day(), None).unwrap(),
+            DbFetchPlan::Fetch { known: vec![] }
+        );
+        assert_eq!(
+            db_fetch_plan(&versions, "anglia", day(), Some(&held)).unwrap(),
+            DbFetchPlan::NothingPublished
+        );
+        assert!(db_fetch_plan(&Err("down".to_string()), "wcml", day(), None).is_err());
+    }
+
+    /// Spec §11.1: the first cycle reads every published pair; an unchanged
+    /// population then reads nothing, and a republished one only its own
+    /// pair.
+    #[sqlx::test(migrations = "../ds-store/migrations")]
+    #[ignore = "needs DATABASE_URL (a role that can create databases)"]
+    async fn a_changed_version_refetches_only_that_pair(pool: sqlx::PgPool) {
+        let next_day = day() + chrono::Duration::days(1);
+        for (line, date) in [("wcml", day()), ("wcml", next_day), ("anglia", day())] {
+            ds_store::schedule::upsert_schedule_line_population(&pool, line, date, BODY)
+                .await
+                .unwrap();
+        }
+        let source = Counting::new(DbSource { pool: pool.clone() });
+        let lines = vec!["wcml".to_string(), "anglia".to_string()];
+        let geometry = HashMap::new();
+
+        let (first, outcome) =
+            reload_cycle_with(&source, &lines, &geometry, &Population::default(), day(), 0).await;
+        assert!(outcome.failed.is_empty(), "{outcome:?}");
+        assert_eq!(
+            outcome.succeeded, 4,
+            "anglia's next day is unpublished, not failed"
+        );
+        let (_, bodies) = source.take();
+        assert_eq!(
+            bodies,
+            vec![
+                ("anglia".to_string(), day()),
+                ("wcml".to_string(), day()),
+                ("wcml".to_string(), next_day)
+            ]
+        );
+        assert_eq!(first.uids_for("wcml", day()), vec!["C11052"]);
+
+        let (second, outcome) =
+            reload_cycle_with(&source, &lines, &geometry, &first, day(), 0).await;
+        assert!(outcome.failed.is_empty());
+        assert!(source.take().1.is_empty(), "nothing changed: no body read");
+        assert_eq!(
+            population_checksum(&second, &lines, &[day(), next_day]),
+            population_checksum(&first, &lines, &[day(), next_day])
+        );
+
+        ds_store::schedule::upsert_schedule_line_population(
+            &pool,
+            "wcml",
+            next_day,
+            r#"[{"uid": "C11053", "calling_points": []}]"#,
+        )
+        .await
+        .unwrap();
+        let (third, _) = reload_cycle_with(&source, &lines, &geometry, &second, day(), 0).await;
+        assert_eq!(source.take().1, vec![("wcml".to_string(), next_day)]);
+        assert_eq!(third.uids_for("wcml", next_day), vec!["C11053"]);
+        assert_eq!(
+            third.uids_for("wcml", day()),
+            vec!["C11052"],
+            "carried over"
+        );
+        assert_ne!(
+            population_checksum(&third, &lines, &[day(), next_day]),
+            population_checksum(&second, &lines, &[day(), next_day])
+        );
+    }
+
+    /// The abort after three failures applies to the database too: with
+    /// the version query failing, three fetches fail and the cycle stops,
+    /// keeping every previous snapshot.
+    #[sqlx::test(migrations = "../ds-store/migrations")]
+    #[ignore = "needs DATABASE_URL (a role that can create databases)"]
+    async fn a_failing_database_stops_the_cycle_after_three_failures(pool: sqlx::PgPool) {
+        let lines: Vec<String> = (0..4).map(|i| format!("line-{i}")).collect();
+        let mut previous = Population::default();
+        previous.insert_uids(
+            "line-3",
+            day(),
+            std::collections::HashSet::from(["C1".to_string()]),
+            None,
+        );
+        pool.close().await;
+        let source = Counting::new(DbSource { pool });
+        let (next, outcome) =
+            reload_cycle_with(&source, &lines, &HashMap::new(), &previous, day(), 0).await;
+        assert_eq!(source.take().0, ABORT_AFTER_FAILURES);
+        assert_eq!(outcome.succeeded, 0);
+        assert_eq!(outcome.failed.len(), 8, "every key reported failed");
+        assert_eq!(next.uids_for("line-3", day()), vec!["C1"], "kept");
     }
 }

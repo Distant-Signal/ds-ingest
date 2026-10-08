@@ -77,6 +77,7 @@ mod feed;
 mod population;
 mod population_reload;
 mod queries;
+mod reads;
 mod replay;
 mod sink;
 mod stanox_tiploc;
@@ -115,6 +116,7 @@ async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     common::logging::init("full-coverage-consumer");
     let config = Config::parse();
+    config.reads.validate()?;
     if config.metrics.metrics_enabled {
         common::metrics::install(config.metrics_port)?;
     }
@@ -130,6 +132,18 @@ async fn run() -> anyhow::Result<()> {
     );
     let http = common::ingest::consumer_http_client()?;
     let internal_oauth = Arc::new(config.internal_oauth.token_cache());
+    // POPULATION_SOURCE / STANOX_CRS_SOURCE=db (ingest plan 4.3): Postgres
+    // and the schema gate before anything is read. None while both are
+    // http (the default): nothing connects to Postgres, as before.
+    let read_pool = config.reads.connect(&progress).await?;
+    let stanox_crs_source = match (&read_pool, config.reads.stanox_crs_source) {
+        (Some(pool), common::ingest::ReadSource::Db) => reads::StanoxCrsSource::Db(pool.clone()),
+        _ => reads::StanoxCrsSource::Http {
+            client: http.clone(),
+            url: config.stanox_crs_url.clone(),
+            tokens: Arc::clone(&internal_oauth),
+        },
+    };
 
     let mut feed = match config.movement_feed_backend {
         MovementFeedBackend::RedisStream => ActiveFeed::RedisStream(
@@ -173,9 +187,8 @@ async fn run() -> anyhow::Result<()> {
         Arc::new(ArcSwap::from_pointee(std::collections::HashMap::default()));
     let stanox_crs_reload_interval = Duration::from_secs(config.stanox_crs_reload_secs);
     load_stanox_crs_until_ok(
-        &http,
+        &stanox_crs_source,
         &config,
-        &internal_oauth,
         &mut lookups,
         &line_ids,
         &geometry,
@@ -194,7 +207,7 @@ async fn run() -> anyhow::Result<()> {
     let population: SharedPopulation =
         Arc::new(ArcSwap::from_pointee(population::Population::default()));
     let population_reload_interval = Duration::from_secs(config.population_reload_secs);
-    let mut first_load = population_reload::Reloader {
+    let reloader = population_reload::Reloader {
         client: http.clone(),
         url: config.schedule_line_population_url.clone(),
         tokens: Arc::clone(&internal_oauth),
@@ -204,8 +217,13 @@ async fn run() -> anyhow::Result<()> {
         interval: population_reload_interval,
         retry: population_reload::RETRY_BACKOFF,
         initial_wait: Duration::from_secs(config.population_initial_wait_secs),
-    }
-    .spawn();
+    };
+    let mut first_load = match (&read_pool, config.reads.population_source) {
+        (Some(pool), common::ingest::ReadSource::Db) => {
+            reloader.spawn_with(population_reload::DbSource { pool: pool.clone() })
+        }
+        _ => reloader.spawn(),
+    };
 
     // Startup step 3: rebuild the rail day in progress, then consume.
     let mut day = start_consuming(
@@ -271,9 +289,8 @@ async fn run() -> anyhow::Result<()> {
         // is a short backoff, not the interval.
         if last_stanox_crs_reload.elapsed() >= stanox_crs_wait {
             match reload_stanox_crs(
-                &http,
+                &stanox_crs_source,
                 &config,
-                &internal_oauth,
                 &mut lookups,
                 &line_ids,
                 &geometry,
@@ -567,14 +584,13 @@ async fn consume_once<F: MovementFeed + DeadLetterSink>(
 /// it: the STANOX table, the TIPLOC -> line index and the shadow line set
 /// (which the population reloader reads).
 async fn reload_stanox_crs(
-    client: &reqwest::Client,
+    source: &reads::StanoxCrsSource,
     config: &Config,
-    tokens: &common::oauth_client::OAuthTokenCache,
     lookups: &mut Lookups,
     line_ids: &SharedLineIds,
     geometry: &SharedGeometry,
 ) -> anyhow::Result<()> {
-    let records = match queries::fetch_stanox_crs(client, &config.stanox_crs_url, tokens).await {
+    let records = match source.fetch().await {
         Ok(records) => records,
         Err(err) => {
             metrics::counter!(
@@ -602,14 +618,9 @@ async fn reload_stanox_crs(
 
 /// Startup step 1: the crosswalk every other step depends on, retried from
 /// 1 s, doubling, capped at the normal failure backoff.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input from the single caller; a struct would only wrap them"
-)]
 async fn load_stanox_crs_until_ok(
-    client: &reqwest::Client,
+    source: &reads::StanoxCrsSource,
     config: &Config,
-    tokens: &common::oauth_client::OAuthTokenCache,
     lookups: &mut Lookups,
     line_ids: &SharedLineIds,
     geometry: &SharedGeometry,
@@ -619,7 +630,7 @@ async fn load_stanox_crs_until_ok(
     let cap = failed_reload_retry_delay(interval).min(Duration::from_secs(30));
     let mut backoff = Duration::from_secs(1).min(cap);
     loop {
-        match reload_stanox_crs(client, config, tokens, lookups, line_ids, geometry).await {
+        match reload_stanox_crs(source, config, lookups, line_ids, geometry).await {
             Ok(()) => return,
             Err(err) => {
                 tracing::error!(error = ?err, retry_in_secs = backoff.as_secs(), "failed to load the stanox/crs table at startup; not consuming until it loads");

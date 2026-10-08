@@ -14,6 +14,7 @@ mod feed;
 mod matching;
 mod process;
 mod queries;
+mod reads;
 mod sink;
 mod stanox_crs;
 
@@ -56,10 +57,10 @@ const API_CALL_OPERATIONS: &[&str] = &[
     "db_write",
 ];
 
-/// `pg_stat_activity.application_name` under `INGEST_SINK=db`.
+/// `pg_stat_activity.application_name` when the sink or a source is `db`.
 const APPLICATION_NAME: &str = "distant-signal-trust-consumer";
-/// Spec §6.6 (D1): pool 2, role limit 3. One batch is written at a time,
-/// in one transaction.
+/// Spec §6.6 (D1): pool 2, role limit 3, shared by the sink and the
+/// readers. One batch is written at a time, in one transaction.
 const DEFAULT_MAX_CONNECTIONS: u32 = 2;
 
 /// Retry backoff for a failed tracked-trains reload: 1s doubling to 60s,
@@ -107,10 +108,22 @@ async fn run() -> anyhow::Result<()> {
     );
     let http = common::ingest::consumer_http_client()?;
     let internal_oauth = config.internal_oauth.token_cache();
+    // INGEST_SINK=db (D1) or TRACKED_TRAINS_SOURCE / STANOX_CRS_SOURCE=db
+    // (ingest plan 4.4): one pool, Postgres and the schema gate before
+    // anything is read from the feed or the reference data, so nothing is
+    // consumed that cannot be written. None when the sink and both sources
+    // are http (the default): nothing connects to Postgres.
+    let pool = connect_database(&config, &progress).await?;
+    let reads = reads::Reads {
+        http: &http,
+        tokens: &internal_oauth,
+        tracked_trains_url: &config.api_tracked_trains_url,
+        stanox_crs_url: &config.stanox_crs_url,
+        pool: pool.as_ref(),
+        tracked_trains_source: config.reads.tracked_trains_source,
+        stanox_crs_source: config.reads.stanox_crs_source,
+    };
 
-    // INGEST_SINK=db (D1): Postgres and the schema gate come before the
-    // first read from the feed, so nothing is consumed that cannot be
-    // written.
     let sink = match config.ingest_sink {
         IngestSink::Http => ActiveSink::Http(HttpSink {
             client: http.clone(),
@@ -119,7 +132,9 @@ async fn run() -> anyhow::Result<()> {
             tokens: config.internal_oauth.token_cache(),
         }),
         IngestSink::Db => {
-            let pool = connect_database(&config, &progress).await?;
+            let pool = pool
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("INGEST_SINK=db needs DATABASE_URL"))?;
             tracing::info!(
                 "INGEST_SINK=db: writing train events and forward signals to Postgres directly"
             );
@@ -172,14 +187,7 @@ async fn run() -> anyhow::Result<()> {
     // train among them -- was lost from the live path. Retried on a short,
     // doubling backoff rather than the 60s reload interval.
     let refs = load_reference_until_ok(
-        async || {
-            queries::fetch_active_tracked_trains(
-                &http,
-                &config.api_tracked_trains_url,
-                &internal_oauth,
-            )
-            .await
-        },
+        async || reads.tracked_trains().await,
         STARTUP_RETRY_MIN,
         STARTUP_RETRY_MAX,
         || progress.beat(),
@@ -198,13 +206,7 @@ async fn run() -> anyhow::Result<()> {
 
     loop {
         if reference_reload.is_due() {
-            match queries::fetch_active_tracked_trains(
-                &http,
-                &config.api_tracked_trains_url,
-                &internal_oauth,
-            )
-            .await
-            {
+            match reads.tracked_trains().await {
                 Ok(refs) => {
                     apply_loaded_reference(refs, &mut reference, &mut state);
                     reference_reload.succeeded();
@@ -230,8 +232,7 @@ async fn run() -> anyhow::Result<()> {
         }
 
         if last_stanox_crs_reload.elapsed() >= stanox_crs_reload_interval {
-            let fetched =
-                queries::fetch_stanox_crs(&http, &config.stanox_crs_url, &internal_oauth).await;
+            let fetched = reads.stanox_crs().await;
             process::apply_stanox_crs_reload(fetched, &stanox_crs);
             last_stanox_crs_reload = tokio::time::Instant::now();
         }
@@ -348,17 +349,25 @@ const fn cycle_backoff(sink: IngestSink) -> common::backoff::Backoff {
     }
 }
 
-/// `INGEST_SINK=db`: waits for Postgres (INF-5), connects the pool (with
-/// the `db_pool_*` metrics) and passes the schema gate as the
-/// `trust_consumer` role (spec §12.2).
+/// When the sink or a read source is `db`: waits for Postgres (INF-5),
+/// connects the one pool (with the `db_pool_*` metrics) and passes the
+/// schema gate as the `trust_consumer` role (spec §12.2). `None` when
+/// nothing needs Postgres.
 async fn connect_database(
     config: &Config,
     progress: &health_http::Progress,
-) -> anyhow::Result<sqlx::PgPool> {
+) -> anyhow::Result<Option<sqlx::PgPool>> {
+    if !config.needs_database() {
+        return Ok(None);
+    }
     let url = config
         .database_url
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("INGEST_SINK=db needs DATABASE_URL"))?;
+        .ok_or_else(|| anyhow::anyhow!("INGEST_SINK=db or a db read source needs DATABASE_URL"))?;
+    if config.reads.any_db() {
+        // `list_stanox_crs` follows the api's CORPUS fallback setting.
+        ds_store::corpus::init_fallback_from_env()?;
+    }
     common::startup::retry_until_ready(
         "Postgres",
         common::startup::CONNECT_BACKOFF,
@@ -382,7 +391,14 @@ async fn connect_database(
         Some(progress),
     )
     .await?;
-    Ok(pool)
+    if config.reads.any_db() {
+        tracing::info!(
+            tracked_trains = ?config.reads.tracked_trains_source,
+            stanox_crs = ?config.reads.stanox_crs_source,
+            "reading reference data from Postgres directly"
+        );
+    }
+    Ok(Some(pool))
 }
 
 /// How long to wait after a cycle, if at all: a committed cycle resets the

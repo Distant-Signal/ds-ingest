@@ -143,6 +143,11 @@ pub(crate) struct Config {
 
     #[command(flatten)]
     pub windowed: WindowedStatsArgs,
+
+    /// `POPULATION_SOURCE`, `STANOX_CRS_SOURCE` and their `DATABASE_URL`
+    /// (ingest architecture plan 4.3): see `reads.rs`.
+    #[command(flatten)]
+    pub reads: crate::reads::InternalReadArgs,
 }
 
 /// Windowed full-coverage stats
@@ -359,6 +364,7 @@ pub(crate) mod tests {
                 full_coverage_feed_stale_secs: 300,
                 line_membership: LineMembershipMode::Legacy,
             },
+            reads: crate::reads::InternalReadArgs::default(),
         }
     }
 

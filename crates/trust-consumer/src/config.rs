@@ -28,14 +28,16 @@ pub(crate) struct Config {
     /// architecture plan 3b.3, decision D1): `http` (the default, today's
     /// behaviour) POSTs them to `API_INGEST_URL` and `FORWARD_SIGNALS_URL`;
     /// `db` writes both to Postgres directly in one transaction, as the
-    /// `trust_consumer` role. The reads (tracked trains, STANOX/CRS) stay on
-    /// the api either way until phase 4. See `sink.rs`.
+    /// `trust_consumer` role. The reads (tracked trains, STANOX/CRS) switch
+    /// separately (`reads`, plan 4.4). See `sink.rs`.
     #[arg(long, env, value_enum, default_value_t = IngestSink::Http)]
     pub ingest_sink: IngestSink,
 
-    /// Postgres, for `INGEST_SINK=db` (required then, unused otherwise).
-    /// Pool size and timeouts come from the shared `DATABASE_*` variables
-    /// (`common::pg`); the default pool is 2 (spec §6.6, role limit 3).
+    /// Postgres, for `INGEST_SINK=db` or a `db` read source (required then,
+    /// unused otherwise): one URL and one pool for both, as the
+    /// `trust_consumer` role. Pool size and timeouts come from the shared
+    /// `DATABASE_*` variables (`common::pg`); the default pool is 2 (spec
+    /// §6.6, role limit 3).
     #[arg(long, env, hide_env_values = true)]
     pub database_url: Option<common::secret::Secret>,
 
@@ -200,6 +202,11 @@ pub(crate) struct Config {
     /// suspect, without a rebuild.
     #[arg(long, env, default_value_t = true)]
     pub trust_timestamp_correction_enabled: bool,
+
+    /// `TRACKED_TRAINS_SOURCE` and `STANOX_CRS_SOURCE` (ingest architecture
+    /// plan 4.4; their database is `database_url`): see `reads.rs`.
+    #[command(flatten)]
+    pub reads: crate::reads::InternalReadArgs,
 }
 
 /// `INGEST_SINK`: see [`Config::ingest_sink`].
@@ -211,12 +218,19 @@ pub(crate) enum IngestSink {
 }
 
 impl Config {
-    /// Cross-field checks clap cannot express: `db` needs a `DATABASE_URL`.
+    /// Whether anything reads or writes Postgres: the sink or a source is
+    /// `db`.
+    pub(crate) fn needs_database(&self) -> bool {
+        self.ingest_sink == IngestSink::Db || self.reads.any_db()
+    }
+
+    /// Cross-field checks clap cannot express: a `db` sink or source needs
+    /// a `DATABASE_URL`.
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
-        if self.ingest_sink == IngestSink::Db
-            && self.database_url.as_ref().is_none_or(|url| url.is_empty())
-        {
-            anyhow::bail!("INGEST_SINK=db needs DATABASE_URL");
+        if self.needs_database() && self.database_url.as_ref().is_none_or(|url| url.is_empty()) {
+            anyhow::bail!(
+                "INGEST_SINK=db, TRACKED_TRAINS_SOURCE=db or STANOX_CRS_SOURCE=db needs DATABASE_URL"
+            );
         }
         Ok(())
     }
