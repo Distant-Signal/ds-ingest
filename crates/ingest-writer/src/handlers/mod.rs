@@ -21,12 +21,13 @@
 //! name with an unknown *version* is [`HandlerError::UnsupportedSchema`] (the
 //! producer is newer: the entry stays pending and alerts, spec §13.3).
 //!
-//! **The product handlers** ([`registry`], plan 3a.6) are the four snapshot
-//! schemas of `ds:ingest:station-samples` and `ds:ingest:full-coverage`, in
-//! [`snapshots`]; 3c adds `TfL`, tocs and the island of Ireland. The writer
-//! refuses to start a stream whose schemas have no handler
-//! (`stream::StreamModes::uncovered`), so a stream turned on early cannot
-//! dead-letter everything as unknown.
+//! **The product handlers** ([`registry`]) are plan 3a.6's four snapshot
+//! schemas of `ds:ingest:station-samples` and `ds:ingest:full-coverage`
+//! ([`snapshots`]) and plan 3c's `tfl-line-status/1` ([`tfl`]), `tocs/1`
+//! ([`tocs`]) and the three island-of-Ireland schemas
+//! ([`island_of_ireland`]). The writer refuses to start a stream whose
+//! schemas have no handler (`stream::StreamModes::uncovered`), so a stream
+//! turned on early cannot dead-letter everything as unknown.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -41,7 +42,10 @@ use sqlx::PgConnection;
 
 use crate::observed::Observed;
 
+pub mod island_of_ireland;
 pub mod snapshots;
+pub mod tfl;
+pub mod tocs;
 
 /// A boxed, sendable future borrowing for `'a`.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -143,22 +147,44 @@ impl Registry {
 }
 
 /// The writer's registry: every product schema it applies. Plan 3a.6:
-/// `station-samples/1` and the three full-coverage schemas; 3c adds
+/// `station-samples/1` and the three full-coverage schemas; plan 3c:
 /// `tfl-line-status/1`, `tocs/1` and the island-of-Ireland schemas. With
 /// the default [`snapshots::Options`] (every switch off).
 pub fn registry() -> Registry {
     registry_with(snapshots::Options::default())
 }
 
-/// [`registry`] with the handlers' `options` (the writer's configuration).
+/// [`registry`] with the snapshot handlers' `options` (the writer's
+/// configuration).
+///
+/// # Panics
+///
+/// If a schema is registered twice or a schema name is invalid: a
+/// programming error the unit tests catch.
+#[expect(
+    clippy::expect_used,
+    reason = "a fixed table of schemas; the unit tests build it"
+)]
 pub fn registry_with(options: snapshots::Options) -> Registry {
+    fn v1(name: &str) -> SchemaId {
+        SchemaId::new(name, 1).expect("a valid schema name")
+    }
     let mut registry = Registry::new();
+    let mut registered = vec![
+        registry.register(&v1("tfl-line-status"), tfl::TflLineStatus),
+        registry.register(&v1("tocs"), tocs::Tocs),
+        registry.register(&v1("ioi-stations"), island_of_ireland::Stations),
+        registry.register(&v1("ioi-lines"), island_of_ireland::Lines),
+        registry.register(
+            &v1("ioi-station-samples"),
+            island_of_ireland::StationSamples,
+        ),
+    ];
     for (schema, handler) in snapshots::handlers(options) {
-        if let Err(err) = registry.register_arc(&schema, handler) {
-            // A schema listed twice in `snapshots::handlers`: a bug the
-            // unit test `the_registry_has_the_four_snapshot_schemas` catches.
-            tracing::error!(error = %err, "ingest handler registry");
-        }
+        registered.push(registry.register_arc(&schema, handler));
+    }
+    for result in registered {
+        result.expect("each schema registered once");
     }
     registry
 }
@@ -187,6 +213,33 @@ pub fn is_data_error(err: &sqlx::Error) -> bool {
             .code()
             .is_some_and(|code| code.starts_with("22") || code.starts_with("23")),
         _ => false,
+    }
+}
+
+/// [`classify`] for a `ds_store` write's `anyhow::Error`:
+///
+/// - a `TfL` line owned by another source
+///   (`ds_store::samples::TflLineOwnedElsewhere`) is the entry's fault:
+///   [`HandlerError::Poison`];
+/// - so is a row-level-security refusal (SQLSTATE 42501 from a policy):
+///   under the writer's role a `TfL` report colliding with an aggregator
+///   line is refused by `line_status`'s policy (plan 3c.3, D10) before the
+///   ownership read can see the row; retrying cannot help;
+/// - any other database error goes through [`classify`];
+/// - anything else (a value that does not serialize) is poison.
+pub fn classify_anyhow(err: &anyhow::Error) -> HandlerError {
+    if let Some(owned) = err.downcast_ref::<ds_store::samples::TflLineOwnedElsewhere>() {
+        return HandlerError::Poison(owned.to_string());
+    }
+    match err.downcast_ref::<sqlx::Error>() {
+        Some(sqlx::Error::Database(db))
+            if db.code().as_deref() == Some("42501")
+                && db.message().contains("row-level security") =>
+        {
+            HandlerError::Poison(format!("refused by a row-level security policy: {db}"))
+        }
+        Some(db_err) => classify(db_err),
+        None => HandlerError::Poison(format!("{err:#}")),
     }
 }
 
@@ -313,15 +366,6 @@ where
     }
 }
 
-/// [`classify`] for an `anyhow` error from a `ds-store` function: its
-/// `sqlx` cause decides; any other error is [`HandlerError::Transient`].
-pub fn classify_anyhow(err: &anyhow::Error) -> HandlerError {
-    match err.downcast_ref::<sqlx::Error>() {
-        Some(err) => classify(err),
-        None => HandlerError::Transient(format!("{err:#}")),
-    }
-}
-
 async fn execute(conn: &mut PgConnection, sql: &'static str) -> Result<(), HandlerError> {
     sqlx::query(sql)
         .execute(&mut *conn)
@@ -381,16 +425,34 @@ mod tests {
     }
 
     #[test]
-    fn the_registry_has_the_four_snapshot_schemas() {
+    fn the_registry_has_every_product_schema() {
         assert_eq!(
             registry().schemas(),
             [
                 "full-coverage-stats/1",
                 "full-coverage-window-stats/1",
+                "ioi-lines/1",
+                "ioi-station-samples/1",
+                "ioi-stations/1",
                 "station-full-coverage-samples/1",
                 "station-samples/1",
+                "tfl-line-status/1",
+                "tocs/1",
             ]
         );
+    }
+
+    #[test]
+    fn an_ownership_refusal_and_a_serialization_fault_are_poison() {
+        let owned = anyhow::Error::from(ds_store::samples::TflLineOwnedElsewhere {
+            line_id: "victoria".into(),
+            owner: Some("aggregator".into()),
+        });
+        assert!(matches!(classify_anyhow(&owned), HandlerError::Poison(_)));
+        let pool = anyhow::Error::from(sqlx::Error::PoolTimedOut);
+        assert!(matches!(classify_anyhow(&pool), HandlerError::Transient(_)));
+        let other = anyhow::anyhow!("not a database error");
+        assert!(matches!(classify_anyhow(&other), HandlerError::Poison(_)));
     }
 
     #[test]

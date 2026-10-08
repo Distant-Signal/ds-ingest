@@ -501,4 +501,18 @@ mod tests {
         let off = StreamModes::default();
         assert!(off.uncovered(&crate::handlers::registry()).is_empty());
     }
+
+    /// Plan 3c.1: the tfl, reference and island-of-Ireland streams have a
+    /// handler for every schema they carry.
+    #[test]
+    fn the_phase_3c_streams_are_covered() {
+        let modes: StreamModes = "tfl:apply,reference:apply,island-of-ireland:shadow"
+            .parse()
+            .unwrap();
+        assert!(
+            modes.uncovered(&crate::handlers::registry()).is_empty(),
+            "{:?}",
+            modes.uncovered(&crate::handlers::registry())
+        );
+    }
 }
