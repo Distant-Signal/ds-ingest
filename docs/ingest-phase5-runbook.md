@@ -197,8 +197,9 @@ kubectl -n distant-signal get deploy -o json | jq -r '
 Every `INGEST_SINK` must be `db` or `stream` (never `http` or
 `http+shadow`), and every `*_SOURCE` must be `db`. The writer's
 `INGEST_WRITER_STREAMS` must be `apply` for `station-samples`,
-`full-coverage`, `tfl` and `reference`. `island-of-ireland` stays `off`
-while those pollers are disabled (D8).
+`full-coverage`, `tfl` and `reference`. `ioi-gtfs`, `ioi-nir` and
+`ioi-live` (the split of the old `island-of-ireland` stream, security
+review H1) stay `off` while those pollers are disabled (D8).
 
 **D. Off the api's Redis.** The api's only Redis use is the `XADD
 incident-text-changed` inside `POST /private/incidents` (§3). The evidence:
