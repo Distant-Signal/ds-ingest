@@ -24,6 +24,9 @@
 //!   its grants first. Logic: `ds_store::incidents::line_backfill`. Runbook:
 //!   docs/incident-affected-lines-backfill.md.
 //!
+//! The first connection is retried for up to
+//! `BACKFILL_CONNECT_DEADLINE_SECS` (default 120), then exits 1.
+//!
 //! Both are idempotent and refuse the api's role. The old api binaries
 //! still work, deprecated, until phase 5 step 5.4b deletes them.
 //!
@@ -110,17 +113,28 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         .filter(|url| !url.trim().is_empty())
         .context("set DATABASE_URL (or --database-url)")?;
     let options: PgConnectOptions = url.parse().context("could not parse DATABASE_URL")?;
+    let options = options
+        .options(common::pg::DEAD_CLIENT_DETECTION_SETTINGS)
+        .application_name(APPLICATION_NAME);
+    let deadline = common::startup::connect_deadline_from_env(
+        common::startup::BACKFILL_CONNECT_DEADLINE_ENV,
+        common::startup::DEFAULT_CONNECT_DEADLINE,
+    )?;
+    // The first connection is retried for up to
+    // BACKFILL_CONNECT_DEADLINE_SECS, as the api image's backfills do.
     let connect = || async {
-        PgPoolOptions::new()
-            .max_connections(2)
-            .connect_with(
-                options
-                    .clone()
-                    .options(common::pg::DEAD_CLIENT_DETECTION_SETTINGS)
-                    .application_name(APPLICATION_NAME),
-            )
-            .await
-            .context("could not connect with DATABASE_URL")
+        common::startup::retry_until_ready_within(
+            "postgres",
+            common::startup::CONNECT_BACKOFF,
+            deadline,
+            || {
+                PgPoolOptions::new()
+                    .max_connections(2)
+                    .connect_with(options.clone())
+            },
+        )
+        .await
+        .context("could not connect with DATABASE_URL")
     };
     match cli.command {
         Command::ReplayUidlessMovements { since } => {
