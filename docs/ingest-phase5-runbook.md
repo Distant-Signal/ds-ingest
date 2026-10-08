@@ -259,6 +259,23 @@ Order: **5.1 → 7-day soak → 5.2 + 5.3 (+ 5.3b) → 5.4 → 5.4b → 5.5 →
 
 ### 5.1 `API_PRIVATE_ROUTES` and the 7-day soak
 
+**Built (2026-10-08, off by default).** `crates/api/src/private_retired.rs`
+reads `API_PRIVATE_ROUTES` (unset or `true`: unchanged). With `false`,
+`/private` nests a fallback that answers `404
+{"error":"private_routes_retired"}`, counts
+`distant_signal_api_private_route_retired_total{route, method}` (each pair
+of the route table, plus `route="other", method="other"`; all registered at
+0) and logs the caller's verified `sub`. The chart value is
+`api.privateRoutes.enabled` (default `true`); the alert
+`DistantSignalApiPrivateRouteRetiredCalled` (`metrics.prometheusRule.apiPrivateRouteRetired`)
+fires on any increase of a known pair (not `route="other"`, which is
+counted but does not alert: decided 2026-10-08, since scanners reach
+`/private/*` through the Ingress) and renders only while the value is
+`false`. The
+counter is named `…_route_retired_total`, not the `…_disabled_total` this
+section first proposed; the soak query below uses the built name. What
+remains for 5.1 is Ranma's flip.
+
 **Code (one commit):**
 
 - `crates/api/src/data/config.rs`: `private_routes: bool`, env
@@ -282,7 +299,7 @@ Order: **5.1 → 7-day soak → 5.2 + 5.3 (+ 5.3b) → 5.4 → 5.4b → 5.5 →
 
 **Checks during the soak:**
 
-- `sum(increase(distant_signal_api_private_disabled_total[1d])) == 0`
+- `sum(increase(distant_signal_api_private_route_retired_total{route!="other"}[1d])) == 0`
   every day;
 - `DistantSignalApiPublic5xx` is silent;
 - the MCP's budget still applies: the api logs "MCP service caller
@@ -490,6 +507,21 @@ Today:
 - `local.env.example` and `dev.env.example` document the internal OAuth
   service accounts.
 
+**Prepared (2026-10-08), opt-in:** `docker-compose.direct.yml` is that
+target as an overlay. Append `:docker-compose.direct.yml` to `COMPOSE_FILE`
+in `local.env` or `dev.env` (both `*.env.example` files and the README's
+"Running it" say how). It adds the `ingest-writer` (loops on, the four
+streams on `apply`), puts every producer on production's `db`/`stream` sink
+and every reader on `*_SOURCE=db` against the local `postgres` and `redis`
+(as the superuser and Redis's default user), and sets the api's
+`API_BACKGROUND_LOOPS=false` and `API_PRIVATE_ROUTES=false`, with an
+`api-maintenance` service running the `maintenance` pass hourly in place of
+production's CronJob. The producers'
+`API_*_URL` and `INTERNAL_OAUTH_*` stay in `docker-compose.yml`, unused: the
+binaries still require the OAuth variables until 5.3. The default compose
+path is unchanged. 5.3b then folds the overlay into `docker-compose.yml`
+and deletes the HTTP wiring as listed below.
+
 **Changes:**
 
 - `docker-compose.yml`:
@@ -569,6 +601,35 @@ The next release drops the `api` alternative. The alert-rules tests
 (`scripts/alert-rules-tests/`) cover both names during the transition and
 only `store_` afterwards.
 
+**Prepared (2026-10-08): the rules already match both prefixes**, so the
+rename itself is a code-only change in `ds-store`. The full inventory of
+`api_`-prefixed names `ds-store` emits (after `common::metrics::metric_name`,
+each is `distant_signal_<name>`), and what reads each one:
+
+| Metric (`ds-store` source) | Emitted from | Read by (`templates/prometheusrule.yaml`) |
+|---|---|---|
+| `api_corpus_last_delivered_at_seconds` (`corpus.rs`, `LAST_DELIVERY_METRIC`) | api; schedule-ingest under `db` | `DistantSignalCorpusStale`: `max` over `(api\|store)` |
+| `api_corpus_comparison_tiplocs`, `api_corpus_comparison_stanoxes` (`corpus/comparison.rs`) | api's `corpus_compare` | no rule |
+| `api_incident_removal_inference_total{outcome}` (`incidents/removal.rs`, `INFERENCE_METRIC`) | api; poller-incidents under `db` | recording rule `distant_signal:incident_removal_inference:increase` (and so `DistantSignalIncidentRemovalStalled`) and `DistantSignalIncidentSnapshotsMissing`: `sum` over `(api\|store)` |
+| `api_incidents_marked_removed_total` (`incidents/removal.rs`, `MARKED_REMOVED_METRIC`) | api; poller-incidents under `db` | no rule |
+| `api_incidents_without_resolved_place` (`incidents/mod.rs`) | api; poller-incidents under `db` | no rule |
+| `api_trust_event_backlog_rejected_rows_total`, `api_trust_event_backlog_shared_movement_errors_total` (`backlog.rs`) | api; trust-backlog-consumer under `db` | no rule |
+| `api_trust_event_backlog_uid_inferred_total` (`backlog.rs`, `UID_INFERRED_METRIC`) | api; trust-backlog-consumer under `db` | no rule |
+| `api_train_reasons_rejected_rows_total` (`backlog/reasons.rs`) | api; trust-backlog-consumer under `db` | no rule |
+| `api_schedule_publish_staged_mismatch_total{product}` (`schedule/publish.rs`) | api only: schedule-reference under `db` already counts `store_schedule_publish_staged_mismatch_total` (2a.5) | `DistantSignalSchedulePublishStagedMismatch`: `sum` over `(api\|store)` (since 2a.5) |
+| `api_schedule_publish_rows_total{product,outcome}` (`schedule/publish.rs`) | api only: schedule-reference under `db` already counts `store_schedule_publish_rows_total` | no rule |
+
+The rename therefore touches the constants and literals in that column,
+their tests' expected strings, the api's own registrations of the same names
+(`data::queries::register_schedule_publish_metrics`,
+`data::incident_removal::register_metrics`,
+`data::trust_event_backlog::register_uid_inference_metrics`, all deleted by
+5.2 anyway), and `docs/alerts.md`'s mentions (`DistantSignalCorpusStale`,
+`…SchedulePublishStagedMismatch`, `…IncidentRemovalStalled`,
+`…IncidentSnapshotsMissing`). `scripts/alert-rules-tests/store-prefix.yaml`
+already exercises the three newly dual-prefixed rules with `store_` series
+alone. The repo has no Grafana dashboards; any panel lives in Ranma-Config.
+
 **Ranma:**
 
 - with `redis.acl` on: drop `api-password` from the
@@ -600,11 +661,34 @@ they write tables the narrowed api role cannot write. Move them before
 | `replay_uidless_movements` | `trust_event_backlog`, `train_movement_events`, `train_current_state` (via `ds_store::backlog`) | writer-role tooling (the writer holds SU on the backlog and SIU on the movements) |
 | `backfill_trains` | `trains` (`data::legacy_backfill`) | `ds-migrate`. Its precondition, `ensure_ready_for_contract_migration`, already lives in `ds_store::migrate`; every environment has passed that contract migration, so it may simply be deleted |
 
+**Prepared (2026-10-08): the new entry points exist; the old binaries
+stay, deprecated.**
+
+| Old api binary | New entry point | Image | Connects as | Logic |
+|---|---|---|---|---|
+| `backfill_trains` | `ds-migrate backfill-trains` | api (ds-migrate ships there) | `MIGRATION_DATABASE_URL` (the schema owner), else `DATABASE_URL` | `ds_store::migrate::legacy_backfill` (moved from `api::data`) |
+| `backfill_line_train_summaries` | `ds-migrate backfill-line-train-summaries [--force] [--lines-dir]` | api | same | `ds_store::schedule::summaries::backfill_all` |
+| `replay_uidless_movements` | `writer-maintenance replay-uidless-movements [--since]` | ingest-writer | `DATABASE_URL`: the writer role | `ds_store::backlog::replay_uidless_backlog` |
+| `backfill_incident_lines` | `writer-maintenance backfill-incident-lines` | ingest-writer | `DATABASE_URL`: the **`incidents` role** (it holds `UPDATE` on `incidents`; the writer does not, and no grant was added) | `ds_store::incidents::line_backfill` (moved from `api::data`) |
+
+Every new entry point refuses to run as `distant_signal_api`
+(`ds_store::maintenance::refuse_api_role`); `backfill-incident-lines` also
+checks `SELECT` on `incidents` and `stations` and `UPDATE (affected_lines)`
+on `incidents` first, naming what is missing. The api binaries log a
+deprecation warning and otherwise behave as before; `api::data::legacy_backfill`
+and `api::data::incident_line_backfill` are `pub use` shims of the moved
+modules. `docs/shared-train-identity-backfill.md`,
+`docs/incident-affected-lines-backfill.md`, the api and ingest-writer
+Dockerfiles and the `db-grants.yaml` comment on `line_train_summaries` point
+at the new commands. What 5.4b still does: delete the four `[[bin]]`
+sources, the two shims and their `SERVICES` entries in
+`gen-rust-dockerfiles.py`, and add the per-role CI line below.
+
 **Code:**
 
 - move each binary's logic into `ds-store` (most already sits there behind
   api shims), and its entry point into `crates/ds-migrate` or
-  `crates/ingest-writer`;
+  `crates/ingest-writer` (done, above);
 - delete the api `[[bin]]` entries and their `data::*` modules;
 - update `docker/` (the Dockerfiles that copy the bins) via
   `gen-rust-dockerfiles.py`, and the docs that say "run it in the api pod"
@@ -634,6 +718,27 @@ The diff against `db-grants.yaml` is in §4.1. Code and chart:
   [S, {privileges: U, columns: […]}]`). Add a unit test in
   `scripts/tests/test_gen_db_grants.py`, and a per-role DB check that the
   enricher can update its columns and nothing else;
+
+  **Prepared (2026-10-08).** The list form already existed: the batch 51
+  security work (M1/L3) added it to `gen-db-grants.py`, `ds-store`'s
+  `build.rs` and the schema gate (`has_column_privilege`), with unit tests.
+  `db-grants.yaml` now states the enricher's target on `incidents` in it:
+  `enricher: [S, {privileges: U, columns: [source_text_hash,
+  extracted_category, extracted_periods, extraction_model_version,
+  extracted_at]}]`, the columns of its only two non-test `UPDATE`s
+  (`write_extraction` and `carry_forward_extraction` in
+  `crates/enricher/src/queries.rs`). The enricher stays `observed`, so
+  `postgres-grants.sql` renders nothing new and it keeps app's table-wide
+  `UPDATE`; its schema gate now checks the five column privileges, which
+  app's grant satisfies. `test_the_enricher_targets_column_update_on_incidents`
+  and `schema::tests::privileges_follow_db_grants` pin the shape. The yaml
+  must stay one line per table: `build.rs` reads one flow mapping per line.
+  **Before narrowing the enricher:** its DB tests write fixtures through its
+  own pool (`UPDATE incidents SET summary/description/first_seen_at` in
+  `queries.rs` and `main.rs` tests, and the `INSERT … ON CONFLICT DO UPDATE`
+  fixtures), which the narrowed role cannot. Move those fixture writes to
+  `MIGRATION_DATABASE_URL` (as poller-incidents' tests do) in 5.5, or the
+  per-service CI step fails;
 - `scripts/db-grants.sql.tpl` and `files/postgres-roles.sql`: stop
   creating `distant_signal_app` and its membership grants; revoke
   membership from every role; then `REASSIGN OWNED`/`DROP OWNED BY

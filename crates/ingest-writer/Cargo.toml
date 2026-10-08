@@ -16,6 +16,11 @@ path = "src/lib.rs"
 name = "ingest-writer"
 path = "src/main.rs"
 
+# One-off ingest data repairs moved out of the api image (phase 5 prep, Q2).
+[[bin]]
+name = "writer-maintenance"
+path = "src/bin/writer_maintenance.rs"
+
 # Every dependency is already in the workspace and Cargo.lock, at the
 # versions and features its other users take. No new crate.
 [dependencies]
