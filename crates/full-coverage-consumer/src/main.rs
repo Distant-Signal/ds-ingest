@@ -78,6 +78,7 @@ mod population;
 mod population_reload;
 mod queries;
 mod replay;
+mod sink;
 mod stanox_tiploc;
 mod station_correlate;
 mod stats;
@@ -118,6 +119,9 @@ async fn run() -> anyhow::Result<()> {
         common::metrics::install(config.metrics_port)?;
     }
     init_metrics();
+    // Plan 3a.8: where each stats write goes (INGEST_SINK; `sink.rs`).
+    let stats_sink = sink::StatsSink::from_config(&config)?;
+    tracing::info!(ingest_sink = %stats_sink.mode(), "full-coverage stats sink");
     let (connection_state, progress) = health_http::spawn_with_progress(
         config.health_bind_url.clone(),
         "connected",
@@ -251,6 +255,7 @@ async fn run() -> anyhow::Result<()> {
                 &geometry,
                 &day,
                 &defaults,
+                &stats_sink,
             )
             .await;
             last_stats_write = tokio::time::Instant::now();
@@ -342,6 +347,7 @@ async fn run() -> anyhow::Result<()> {
                 &geometry,
                 &day,
                 &defaults,
+                &stats_sink,
             )
             .await;
             last_stats_write = tokio::time::Instant::now();
@@ -704,6 +710,7 @@ async fn write_stats(
     geometry: &SharedGeometry,
     day: &DayState,
     defaults: &common::Defaults,
+    sink: &sink::StatsSink,
 ) {
     let now = chrono::Utc::now();
     let service_date = day.service_date;
@@ -784,12 +791,21 @@ async fn write_stats(
         }
         line_rows.push(row);
     }
+    let mut windows_accepted = false;
     if let Some((trains, ctx)) = &windowed {
         metrics::gauge!(common::metrics::metric_name(
             "full_coverage_consumer_parked_messages"
         ))
         .set(trains.parked_count() as f64);
-        post_windows(client, config, internal_oauth, &window_rows, ctx.feed_stale).await;
+        windows_accepted = post_windows(
+            client,
+            config,
+            internal_oauth,
+            &window_rows,
+            ctx.feed_stale,
+            sink,
+        )
+        .await;
     }
     metrics::gauge!(common::metrics::metric_name(
         "full_coverage_consumer_lines_available_total"
@@ -804,42 +820,83 @@ async fn write_stats(
     ))
     .set(partial_count as f64);
 
-    if let Err(err) = queries::post_full_coverage_stats(
-        client,
-        &config.full_coverage_stats_url,
-        internal_oauth,
-        &line_rows,
-    )
-    .await
-    {
-        tracing::error!(error = ?err, "failed to post full-coverage line stats; will retry next cycle");
-        metrics::counter!(
-            common::metrics::metric_name("full_coverage_consumer_errors_total"),
-            "operation" => "post_line_stats"
+    let lines_accepted = sink.posts_http()
+        && match queries::post_full_coverage_stats(
+            client,
+            &config.full_coverage_stats_url,
+            internal_oauth,
+            &line_rows,
         )
-        .increment(1);
-    }
+        .await
+        {
+            Ok(()) => {
+                sink.accepted(sink::LINE_STATS, line_rows.len());
+                true
+            }
+            Err(err) => {
+                tracing::error!(error = ?err, "failed to post full-coverage line stats; will retry next cycle");
+                metrics::counter!(
+                    common::metrics::metric_name("full_coverage_consumer_errors_total"),
+                    "operation" => "post_line_stats"
+                )
+                .increment(1);
+                false
+            }
+        };
 
     let station_rows = station_correlate::build_station_rows(&day.stations, now, defaults);
     metrics::gauge!(common::metrics::metric_name(
         "full_coverage_consumer_stations_available_total"
     ))
     .set(station_rows.len() as f64);
-    if let Err(err) = queries::post_station_full_coverage_samples(
-        client,
-        &config.station_full_coverage_stats_url,
-        internal_oauth,
-        &station_rows,
-    )
-    .await
-    {
-        tracing::error!(error = ?err, "failed to post station full-coverage samples; will retry next cycle");
-        metrics::counter!(
-            common::metrics::metric_name("full_coverage_consumer_errors_total"),
-            "operation" => "post_station_samples"
+    let stations_accepted = sink.posts_http()
+        && match queries::post_station_full_coverage_samples(
+            client,
+            &config.station_full_coverage_stats_url,
+            internal_oauth,
+            &station_rows,
         )
-        .increment(1);
-    }
+        .await
+        {
+            Ok(()) => {
+                sink.accepted(sink::STATION_SAMPLES, station_rows.len());
+                true
+            }
+            Err(err) => {
+                tracing::error!(error = ?err, "failed to post station full-coverage samples; will retry next cycle");
+                metrics::counter!(
+                    common::metrics::metric_name("full_coverage_consumer_errors_total"),
+                    "operation" => "post_station_samples"
+                )
+                .increment(1);
+                false
+            }
+        };
+
+    // Plan 3a.8: the stream copy of what the api accepted (http+shadow),
+    // or the only delivery (stream); nothing under http.
+    let send = |accepted: bool| !sink.posts_http() || accepted;
+    sink.produce(
+        now,
+        &sink::StatsOutputs {
+            lines: if send(lines_accepted) {
+                &line_rows
+            } else {
+                &[]
+            },
+            windows: if send(windows_accepted) {
+                &window_rows
+            } else {
+                &[]
+            },
+            stations: if send(stations_accepted) {
+                &station_rows
+            } else {
+                &[]
+            },
+        },
+    )
+    .await;
 }
 
 /// What every line of one windowed stats write shares.
@@ -907,7 +964,8 @@ async fn post_windows(
     internal_oauth: &common::oauth_client::OAuthTokenCache,
     rows: &[common::FullCoverageWindowStatsRow],
     feed_stale: bool,
-) {
+    sink: &sink::StatsSink,
+) -> bool {
     metrics::gauge!(common::metrics::metric_name(
         "full_coverage_consumer_window_feed_stale"
     ))
@@ -929,6 +987,10 @@ async fn post_windows(
         "full_coverage_consumer_window_presumed_cancelled"
     ))
     .set(presumed as f64);
+    // INGEST_SINK=stream: no POST (the stream delivers them, `sink.rs`).
+    if !sink.posts_http() {
+        return false;
+    }
     match queries::post_full_coverage_window_stats(
         client,
         &config.windowed.full_coverage_window_stats_url,
@@ -942,6 +1004,8 @@ async fn post_windows(
                 "full_coverage_consumer_window_rows_posted_total"
             ))
             .increment(rows.len() as u64);
+            sink.accepted(sink::WINDOW_STATS, rows.len());
+            true
         }
         Err(err) => {
             metrics::counter!(
@@ -955,6 +1019,7 @@ async fn post_windows(
                 LAST_WINDOW_POST_WARNING.store(now, std::sync::atomic::Ordering::Relaxed);
                 tracing::warn!(error = ?err, "failed to post full-coverage window stats (an api without /full-coverage-window-stats answers 404); will retry next cycle, next warning in 10 minutes at the earliest");
             }
+            false
         }
     }
 }
@@ -1943,6 +2008,13 @@ mod tests {
     // --- 2026-09-27: windowed stats end to end through write_stats ---
 
     async fn capture_write(windowed: bool) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+        capture_write_to(windowed, &sink::StatsSink::http()).await
+    }
+
+    async fn capture_write_to(
+        windowed: bool,
+        sink: &sink::StatsSink,
+    ) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1992,6 +2064,7 @@ mod tests {
             &geometry,
             &day,
             &common::Defaults::default(),
+            sink,
         )
         .await;
 
@@ -2027,6 +2100,40 @@ mod tests {
                           "avg_delay_minutes": 0.0},
                 "partial": false
             }])
+        );
+    }
+
+    /// Plan 3a.8: under `INGEST_SINK=stream` a stats write POSTs nothing
+    /// (here Redis is unreachable: the snapshot stays queued, and the write
+    /// does not wait for it).
+    #[tokio::test]
+    async fn with_the_stream_sink_nothing_is_posted() {
+        let stream = sink::StatsSink::on_stream(
+            ingest_stream::snapshot::SinkMode::Stream,
+            "redis://127.0.0.1:1",
+            "test:ds:ingest:full-coverage",
+        );
+        let (line_posts, window_posts) = capture_write_to(true, &stream).await;
+        assert!(line_posts.is_empty());
+        assert!(window_posts.is_empty());
+    }
+
+    /// `http+shadow` POSTs exactly what `http` does.
+    #[tokio::test]
+    async fn with_the_shadow_sink_the_posts_are_unchanged() {
+        let shadow = sink::StatsSink::on_stream(
+            ingest_stream::snapshot::SinkMode::HttpShadow,
+            "redis://127.0.0.1:1",
+            "test:ds:ingest:full-coverage",
+        );
+        let (line_posts, window_posts) = capture_write_to(true, &shadow).await;
+        let (http_lines, http_windows) = capture_write(true).await;
+        assert_eq!(line_posts.len(), 1);
+        assert_eq!(window_posts.len(), 1);
+        assert_eq!(line_posts[0][0]["line_id"], http_lines[0][0]["line_id"]);
+        assert_eq!(
+            window_posts[0].as_array().unwrap().len(),
+            http_windows[0].as_array().unwrap().len()
         );
     }
 

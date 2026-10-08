@@ -487,11 +487,17 @@ mod tests {
 
     #[test]
     fn a_stream_with_no_handler_is_uncovered() {
-        let modes: StreamModes = "station-samples:shadow".parse().unwrap();
+        // TfL's handler is plan 3c.
+        let modes: StreamModes = "tfl:shadow".parse().unwrap();
         assert_eq!(
             modes.uncovered(&crate::handlers::registry()),
-            ["station-samples: station-samples"]
+            ["tfl: tfl-line-status"]
         );
+        // Plan 3a.6: both 3a streams are covered.
+        let modes: StreamModes = "station-samples:apply,full-coverage:shadow"
+            .parse()
+            .unwrap();
+        assert!(modes.uncovered(&crate::handlers::registry()).is_empty());
         let off = StreamModes::default();
         assert!(off.uncovered(&crate::handlers::registry()).is_empty());
     }

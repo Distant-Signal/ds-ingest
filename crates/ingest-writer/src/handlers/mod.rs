@@ -21,10 +21,12 @@
 //! name with an unknown *version* is [`HandlerError::UnsupportedSchema`] (the
 //! producer is newer: the entry stays pending and alerts, spec §13.3).
 //!
-//! **No product handler is registered yet** ([`registry`] is empty): the
-//! snapshot handlers are plan 3a.6 and later. The writer refuses to start a
-//! stream whose schemas have no handler (`stream::StreamModes::uncovered`),
-//! so a stream turned on early cannot dead-letter everything as unknown.
+//! **The product handlers** ([`registry`], plan 3a.6) are the four snapshot
+//! schemas of `ds:ingest:station-samples` and `ds:ingest:full-coverage`, in
+//! [`snapshots`]; 3c adds `TfL`, tocs and the island of Ireland. The writer
+//! refuses to start a stream whose schemas have no handler
+//! (`stream::StreamModes::uncovered`), so a stream turned on early cannot
+//! dead-letter everything as unknown.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -38,6 +40,8 @@ use serde_json::value::RawValue;
 use sqlx::PgConnection;
 
 use crate::observed::Observed;
+
+pub mod snapshots;
 
 /// A boxed, sendable future borrowing for `'a`.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -87,11 +91,20 @@ impl Registry {
         schema: &SchemaId,
         handler: impl SchemaHandler + 'static,
     ) -> anyhow::Result<()> {
+        self.register_arc(schema, Arc::new(handler))
+    }
+
+    /// [`Registry::register`] for a handler already behind an `Arc`.
+    pub fn register_arc(
+        &mut self,
+        schema: &SchemaId,
+        handler: Arc<dyn SchemaHandler>,
+    ) -> anyhow::Result<()> {
         let versions = self.by_name.entry(schema.name().to_owned()).or_default();
         if versions.contains_key(&schema.version()) {
             bail!("ingest handler for {schema} registered twice");
         }
-        versions.insert(schema.version(), Arc::new(handler));
+        versions.insert(schema.version(), handler);
         Ok(())
     }
 
@@ -129,11 +142,19 @@ impl Registry {
     }
 }
 
-/// The writer's registry: every product schema it applies. Empty until
-/// plan 3a.6 (`station-samples/1`, the three full-coverage schemas), then
-/// 3c (`tfl-line-status/1`, `tocs/1`, the island-of-Ireland schemas).
+/// The writer's registry: every product schema it applies. Plan 3a.6:
+/// `station-samples/1` and the three full-coverage schemas; 3c adds
+/// `tfl-line-status/1`, `tocs/1` and the island-of-Ireland schemas.
 pub fn registry() -> Registry {
-    Registry::new()
+    let mut registry = Registry::new();
+    for (schema, handler) in snapshots::handlers() {
+        if let Err(err) = registry.register_arc(&schema, handler) {
+            // A schema listed twice in `snapshots::handlers`: a bug the
+            // unit test `the_registry_has_the_four_snapshot_schemas` catches.
+            tracing::error!(error = %err, "ingest handler registry");
+        }
+    }
+    registry
 }
 
 /// Maps a database error to the runtime's outcome (spec §7.3):
@@ -250,6 +271,51 @@ where
     Ok(outcome)
 }
 
+/// [`apply_rows`] for a handler with a batched statement: `write` runs once
+/// for all `rows` inside a savepoint; only if the database refuses that for
+/// a data error (class 22/23) is it rolled back and retried a row at a time
+/// (`write` with a one-row slice), so the refused rows are isolated and the
+/// rest commit. Any other error aborts the entry ([`classify`]).
+pub async fn apply_batch<T, F>(
+    conn: &mut PgConnection,
+    rows: Vec<T>,
+    mut write: F,
+) -> Result<RowOutcome<T>, HandlerError>
+where
+    T: Send + Sync,
+    F: for<'c> FnMut(&'c mut PgConnection, &'c [T]) -> BoxFuture<'c, sqlx::Result<()>>,
+{
+    execute(conn, "SAVEPOINT ingest_batch").await?;
+    match write(&mut *conn, &rows).await {
+        Ok(()) => {
+            execute(conn, "RELEASE SAVEPOINT ingest_batch").await?;
+            Ok(RowOutcome {
+                applied: rows.len(),
+                rejected: Vec::new(),
+            })
+        }
+        Err(err) if is_data_error(&err) => {
+            execute(conn, "ROLLBACK TO SAVEPOINT ingest_batch").await?;
+            execute(conn, "RELEASE SAVEPOINT ingest_batch").await?;
+            tracing::warn!(error = %err, rows = rows.len(), "a batch was refused for a data error; isolating its rows");
+            apply_rows(conn, rows, |conn, row| {
+                write(conn, std::slice::from_ref(row))
+            })
+            .await
+        }
+        Err(err) => Err(classify(&err)),
+    }
+}
+
+/// [`classify`] for an `anyhow` error from a `ds-store` function: its
+/// `sqlx` cause decides; any other error is [`HandlerError::Transient`].
+pub fn classify_anyhow(err: &anyhow::Error) -> HandlerError {
+    match err.downcast_ref::<sqlx::Error>() {
+        Some(err) => classify(err),
+        None => HandlerError::Transient(format!("{err:#}")),
+    }
+}
+
 async fn execute(conn: &mut PgConnection, sql: &'static str) -> Result<(), HandlerError> {
     sqlx::query(sql)
         .execute(&mut *conn)
@@ -309,9 +375,16 @@ mod tests {
     }
 
     #[test]
-    fn no_product_handler_yet() {
-        // Plan 3a.6 registers the first ones.
-        assert!(registry().schemas().is_empty());
+    fn the_registry_has_the_four_snapshot_schemas() {
+        assert_eq!(
+            registry().schemas(),
+            [
+                "full-coverage-stats/1",
+                "full-coverage-window-stats/1",
+                "station-full-coverage-samples/1",
+                "station-samples/1",
+            ]
+        );
     }
 
     #[test]

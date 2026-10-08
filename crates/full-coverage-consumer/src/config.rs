@@ -123,6 +123,14 @@ pub(crate) struct Config {
     #[arg(long, env)]
     pub redis_username: Option<String>,
 
+    /// Where each stats write goes (ingest architecture plan 3a.8; see
+    /// `sink.rs`): `http` (the default) POSTs the three outputs to the api;
+    /// `http+shadow` also XADDs what the api accepted to
+    /// `ds:ingest:full-coverage`, on this Redis as this user; `stream`
+    /// XADDs only.
+    #[arg(long, env, default_value_t = ingest_stream::snapshot::SinkMode::Http)]
+    pub ingest_sink: ingest_stream::snapshot::SinkMode,
+
     /// See `trust-consumer/src/config.rs`'s identical field.
     #[arg(long, env, default_value_t = 30)]
     pub redis_autoclaim_min_idle_secs: u64,
@@ -339,6 +347,7 @@ pub(crate) mod tests {
             redis_url: String::new(),
             redis_password: None,
             redis_username: None,
+            ingest_sink: ingest_stream::snapshot::SinkMode::Http,
             redis_autoclaim_min_idle_secs: 30,
             redis_gap_check_secs: 60,
             windowed: WindowedStatsArgs {
