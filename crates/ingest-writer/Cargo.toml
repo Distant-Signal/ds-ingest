@@ -16,21 +16,34 @@ path = "src/lib.rs"
 name = "ingest-writer"
 path = "src/main.rs"
 
-# Every dependency is already in the workspace, at the versions and features
-# the notifier uses (without its push stack). No new crate.
+# Every dependency is already in the workspace and Cargo.lock, at the
+# versions and features its other users take. No new crate.
 [dependencies]
 anyhow = "1.0.102"
 # The reconciliation sweep's grace period (`chrono::Duration`).
 chrono = "0.4.44"
 clap = { version = "4.6.1", features = ["derive", "env"] }
-common = { path = "../common", features = ["postgres"] }
+# `redis`: the bounded Redis connection and the ACL-user URL for the stream
+# consumers (plan 3a.3).
+common = { path = "../common", features = ["postgres", "redis"] }
 # The schema gate (`ds_store::schema::wait_for_schema`, plan 1B.2), the
 # loop runner and the train-domain loops (`ds_store::loops`).
 ds-store = { path = "../ds-store" }
 health-http = { path = "../health-http" }
+# The stream consumer runtime (plan 3a.3's Redis half, spec §7.7).
+ingest-stream = { path = "../ingest-stream" }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+serde = { version = "1.0.228", features = ["derive"] }
+# `raw_value`: the payload of rejected rows for the dead-letter stream.
+serde_json = { version = "1.0.149", features = ["raw_value"] }
 sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio", "tls-native-tls"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
 tracing = "0.1.44"
+
+[dev-dependencies]
+# The clamp counter's unit test reads a local recorder.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 [lints]
 workspace = true

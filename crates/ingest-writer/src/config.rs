@@ -6,6 +6,8 @@ use clap::Parser;
 use common::config::{LineCatalogue, parse_lines};
 use common::secret::Secret;
 
+use crate::stream::StreamModes;
+
 /// `Debug` is safe to log: the one credential is a [`Secret`] (SVC-12).
 #[derive(Debug, Parser)]
 #[command(name = "ingest-writer")]
@@ -70,6 +72,35 @@ pub struct Config {
     )]
     pub corpus_crosswalk_interval_secs: u64,
 
+    /// Each ingest stream's mode (spec §10, plan 3a.3;
+    /// `ingestWriter.streams.<name>`): comma-separated `<stream>:<mode>`,
+    /// mode `off`, `shadow` or `apply`, e.g.
+    /// `station-samples:apply,full-coverage:shadow`. A stream not listed is
+    /// `off`; the default (empty) reads no stream and needs no Redis.
+    #[arg(long, env = "INGEST_WRITER_STREAMS", default_value = "")]
+    pub streams: StreamModes,
+
+    /// The Redis holding the ingest streams. Required once any stream is not
+    /// `off`; never carries a credential (those are `REDIS_USERNAME` and
+    /// `REDIS_PASSWORD`).
+    #[arg(long, env)]
+    pub redis_url: Option<String>,
+
+    /// Redis AUTH password (chart `redis.auth`, or the `ingest-writer` ACL
+    /// user's under `redis.acl`). Never logged.
+    #[arg(long, env, hide_env_values = true)]
+    pub redis_password: Option<Secret>,
+
+    /// Redis ACL user (`ingest-writer` under `redis.acl.clients.ingestWriter`).
+    /// Unset: the `default` user.
+    #[arg(long, env)]
+    pub redis_username: Option<String>,
+
+    /// This writer's consumer name in each stream's group: the pod name
+    /// (`POD_NAME`, else `HOSTNAME`, which Kubernetes sets to it).
+    #[arg(long, env = "POD_NAME")]
+    pub pod_name: Option<String>,
+
     /// Port for the Prometheus `/metrics` listener (the workers' default;
     /// the chart sets it from `metrics.port`).
     #[arg(long, env, default_value_t = 9091)]
@@ -112,7 +143,28 @@ impl Config {
         ] {
             anyhow::ensure!(value > 0, "{name} must be greater than zero");
         }
+        if self.streams.any_active() {
+            anyhow::ensure!(
+                self.redis_url.as_deref().is_some_and(|url| !url.is_empty()),
+                "INGEST_WRITER_STREAMS turns on {} but REDIS_URL is not set",
+                self.streams
+            );
+        }
         Ok(())
+    }
+
+    /// The consumer name: `POD_NAME`, else `HOSTNAME`, else
+    /// `ingest-writer`.
+    pub fn consumer_name(&self) -> String {
+        self.pod_name
+            .clone()
+            .filter(|name| !name.is_empty())
+            .or_else(|| {
+                std::env::var("HOSTNAME")
+                    .ok()
+                    .filter(|name| !name.is_empty())
+            })
+            .unwrap_or_else(|| "ingest-writer".to_owned())
     }
 
     /// The three periodic sweeps' intervals, as `ds_store::loops` takes
@@ -150,6 +202,7 @@ mod tests {
     fn defaults_leave_the_loops_off() {
         let config = Config::try_parse_from(args(&[])).unwrap();
         assert!(!config.loops_enabled);
+        assert!(!config.streams.any_active(), "every stream off by default");
         assert_eq!(config.canary_interval_secs, 60);
         // The api's defaults (crates/api/src/data/config.rs).
         assert_eq!(config.schedule_match_interval_secs, 300);
@@ -222,6 +275,36 @@ mod tests {
             Some("INGEST_WRITER_CORPUS_CROSSWALK_INTERVAL_SECS")
         );
         assert_eq!(env("metrics_port").as_deref(), Some("METRICS_PORT"));
+        assert_eq!(env("streams").as_deref(), Some("INGEST_WRITER_STREAMS"));
+        assert_eq!(env("redis_url").as_deref(), Some("REDIS_URL"));
+        assert_eq!(env("redis_username").as_deref(), Some("REDIS_USERNAME"));
+        assert_eq!(env("redis_password").as_deref(), Some("REDIS_PASSWORD"));
+        assert_eq!(env("pod_name").as_deref(), Some("POD_NAME"));
+    }
+
+    #[test]
+    fn a_stream_on_needs_redis() {
+        // An empty REDIS_URL, so a REDIS_URL in the environment cannot pass.
+        let config = Config::try_parse_from(args(&[
+            "--streams",
+            "station-samples:shadow",
+            "--redis-url",
+            "",
+        ]))
+        .unwrap();
+        assert!(config.validate().is_err());
+        let config = Config::try_parse_from(args(&[
+            "--streams",
+            "station-samples:shadow",
+            "--redis-url",
+            "redis://redis:6379",
+            "--pod-name",
+            "writer-0",
+        ]))
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.consumer_name(), "writer-0");
+        assert!(Config::try_parse_from(args(&["--streams", "nope:apply"])).is_err());
     }
 
     #[test]
