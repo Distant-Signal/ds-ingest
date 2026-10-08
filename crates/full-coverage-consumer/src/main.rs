@@ -841,7 +841,7 @@ async fn write_stats(
         .await
         {
             Ok(()) => {
-                sink.accepted(sink::LINE_STATS, line_rows.len());
+                sink::StatsSink::accepted(sink::LINE_STATS, line_rows.len());
                 true
             }
             Err(err) => {
@@ -870,7 +870,7 @@ async fn write_stats(
         .await
         {
             Ok(()) => {
-                sink.accepted(sink::STATION_SAMPLES, station_rows.len());
+                sink::StatsSink::accepted(sink::STATION_SAMPLES, station_rows.len());
                 true
             }
             Err(err) => {
@@ -1015,7 +1015,7 @@ async fn post_windows(
                 "full_coverage_consumer_window_rows_posted_total"
             ))
             .increment(rows.len() as u64);
-            sink.accepted(sink::WINDOW_STATS, rows.len());
+            sink::StatsSink::accepted(sink::WINDOW_STATS, rows.len());
             true
         }
         Err(err) => {

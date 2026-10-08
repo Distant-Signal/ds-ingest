@@ -227,7 +227,12 @@ impl Config {
     /// Cross-field checks clap cannot express: a `db` sink or source needs
     /// a `DATABASE_URL`.
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
-        if self.needs_database() && self.database_url.as_ref().is_none_or(|url| url.is_empty()) {
+        if self.needs_database()
+            && self
+                .database_url
+                .as_ref()
+                .is_none_or(common::secret::Secret::is_empty)
+        {
             anyhow::bail!(
                 "INGEST_SINK=db, TRACKED_TRAINS_SOURCE=db or STANOX_CRS_SOURCE=db needs DATABASE_URL"
             );

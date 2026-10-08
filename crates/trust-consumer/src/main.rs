@@ -125,12 +125,12 @@ async fn run() -> anyhow::Result<()> {
     };
 
     let sink = match config.ingest_sink {
-        IngestSink::Http => ActiveSink::Http(HttpSink {
+        IngestSink::Http => ActiveSink::Http(Box::new(HttpSink {
             client: http.clone(),
             ingest_url: config.api_ingest_url.clone(),
             forward_signals_url: config.forward_signals_url.clone(),
             tokens: config.internal_oauth.token_cache(),
-        }),
+        })),
         IngestSink::Db => {
             let pool = pool
                 .clone()

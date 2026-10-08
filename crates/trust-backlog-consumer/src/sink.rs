@@ -184,6 +184,10 @@ mod db_tests {
         "2099-04-04".parse().unwrap()
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the fixtures' timestamp fields are Options"
+    )]
     fn at(time: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         Some(format!("2099-04-04T{time}:00Z").parse().unwrap())
     }

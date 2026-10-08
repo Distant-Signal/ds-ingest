@@ -153,7 +153,10 @@ impl Config {
     /// Cross-field checks clap cannot express: `db` needs a `DATABASE_URL`.
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.ingest_sink == IngestSink::Db
-            && self.database_url.as_ref().is_none_or(|url| url.is_empty())
+            && self
+                .database_url
+                .as_ref()
+                .is_none_or(common::secret::Secret::is_empty)
         {
             anyhow::bail!("INGEST_SINK=db needs DATABASE_URL");
         }

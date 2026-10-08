@@ -53,7 +53,12 @@ impl InternalReadArgs {
 
     /// A `db` source needs a `DATABASE_URL`.
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
-        if self.any_db() && self.database_url.as_ref().is_none_or(|url| url.is_empty()) {
+        if self.any_db()
+            && self
+                .database_url
+                .as_ref()
+                .is_none_or(common::secret::Secret::is_empty)
+        {
             anyhow::bail!("POPULATION_SOURCE=db or STANOX_CRS_SOURCE=db needs DATABASE_URL");
         }
         Ok(())

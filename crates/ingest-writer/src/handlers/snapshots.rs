@@ -174,6 +174,10 @@ where
     }
 }
 
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the handlers' validate fn-pointer type returns a Result"
+)]
 fn no_validation<T>(_: &[T]) -> Result<(), String> {
     Ok(())
 }

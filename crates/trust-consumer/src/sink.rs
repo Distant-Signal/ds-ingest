@@ -72,7 +72,9 @@ pub(crate) trait TrainEventSink {
 
 /// The sink `INGEST_SINK` chose, for the main loop.
 pub(crate) enum ActiveSink {
-    Http(HttpSink),
+    /// Boxed: the HTTP sink (a client, URLs and a token cache) is much
+    /// larger than the pool.
+    Http(Box<HttpSink>),
     Db(DbSink),
 }
 
@@ -439,6 +441,10 @@ mod db_tests {
     /// `post_train_forward_signals` do.
     #[tokio::test]
     #[ignore = "requires a live database; run with DATABASE_URL set and --ignored"]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one fixture batch through both sinks, then every table compared"
+    )]
     async fn both_sinks_write_the_same_rows_for_a_fixture_batch() {
         let fixtures = fixture_pool().await;
         let via_http = Fixture::new(&fixtures, "h").await;
@@ -811,7 +817,7 @@ mod db_tests {
                 .expect_err("no UPDATE on train_subscriptions");
         assert_eq!(
             err.as_database_error()
-                .and_then(|err| err.code())
+                .and_then(sqlx::error::DatabaseError::code)
                 .as_deref(),
             Some("42501"),
             "{err}"
@@ -853,8 +859,8 @@ mod db_tests {
                 result
                     .expect_err("no INSERT or UPDATE on trains")
                     .as_database_error()
-                    .and_then(|err| err.code())
-                    .map(|code| code.into_owned())
+                    .and_then(sqlx::error::DatabaseError::code)
+                    .map(std::borrow::Cow::into_owned)
             }))
         } else {
             eprintln!("running as {user}, not the trust_consumer role: refusals not checked");

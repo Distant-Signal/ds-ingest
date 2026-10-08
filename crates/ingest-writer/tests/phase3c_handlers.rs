@@ -310,7 +310,7 @@ async fn tfl_a_line_owned_by_the_aggregator_is_poison() {
     if let Err(err) = seeded {
         let code = err
             .as_database_error()
-            .and_then(|db_err| db_err.code().map(|c| c.into_owned()));
+            .and_then(|db_err| db_err.code().map(std::borrow::Cow::into_owned));
         assert_eq!(
             code.as_deref(),
             Some("42501"),

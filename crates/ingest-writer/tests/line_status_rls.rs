@@ -17,7 +17,6 @@
 
 #![expect(
     clippy::unwrap_used,
-    clippy::expect_used,
     reason = "test code: a panic is the right failure in a test"
 )]
 
@@ -40,7 +39,7 @@ fn sqlstate<T>(result: &Result<T, sqlx::Error>) -> Option<String> {
         Ok(_) => None,
         Err(err) => Some(
             err.as_database_error()
-                .and_then(|db| db.code().map(|code| code.into_owned()))
+                .and_then(|db| db.code().map(std::borrow::Cow::into_owned))
                 .unwrap_or_else(|| format!("not a database error: {err}")),
         ),
     }
@@ -70,6 +69,10 @@ const CLEANUP: &str = "DELETE FROM line_status WHERE line_id LIKE 'TEST-RLS-%'";
 
 #[tokio::test]
 #[ignore = "requires the per-service roles: run under scripts/test-postgres-roles.py --mode per-service"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one fixture, then each role's reads and writes checked in turn"
+)]
 async fn the_writer_is_pinned_to_tfl_rows_and_every_other_role_is_unchanged() {
     let (Some(writer), Some(aggregator), Some(api)) = (
         pool("DATABASE_URL_WRITER").await,

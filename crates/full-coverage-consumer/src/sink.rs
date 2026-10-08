@@ -4,7 +4,7 @@
 //! | Sink | Each stats write |
 //! |---|---|
 //! | `http` (default) | today's three POSTs (`/private/full-coverage-stats`, `/private/full-coverage-window-stats` when windowed, `/private/station-full-coverage-samples`) |
-//! | `http+shadow` | the same POSTs, then the outputs the api accepted XADDed to `ds:ingest:full-coverage`, best effort |
+//! | `http+shadow` | the same POSTs, then the outputs the api accepted `XADD`ed to `ds:ingest:full-coverage`, best effort |
 //! | `stream` | XADD only |
 //!
 //! **One snapshot per stats write**: the three outputs
@@ -109,14 +109,14 @@ impl StatsSink {
         self.mode
     }
 
-    /// Whether the api is POSTed (`http`, `http+shadow`).
+    /// Whether the api gets the `POST`s (`http`, `http+shadow`).
     pub(crate) fn posts_http(&self) -> bool {
         self.mode.posts_http()
     }
 
     /// Counts rows the api accepted (`ingest_stream_sink_rows_total`,
     /// `sink="http"`), for the rollout's compare step.
-    pub(crate) fn accepted(&self, schema: &'static str, rows: usize) {
+    pub(crate) fn accepted(schema: &'static str, rows: usize) {
         if rows > 0 {
             ingest_stream::metrics::sink_rows(
                 ingest_stream::streams::FULL_COVERAGE,
