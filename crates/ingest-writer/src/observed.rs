@@ -124,9 +124,43 @@ pub fn guard(table: &str, column: &str) -> String {
         is_identifier(column),
         "guard: bad column identifier {column:?}"
     );
+    guard_against(&format!("{table}.{column}"), column)
+}
+
+/// [`guard`] against the derived time of a changed-rows-only table (plan
+/// 3a.9, spec §7.8): `GREATEST(table.column, the feed's observed time)`
+/// (`ds_store::samples::feed_observed_at_sql` for `source`). An unchanged
+/// row the writer skipped keeps its own older time, so comparing against
+/// the row's time alone would let an older snapshot, redelivered after that
+/// skipped newer one, overwrite it. The feed's time is read in the entry's
+/// transaction before this entry records its own, so the entry being
+/// applied compares against the previous snapshot. The same healing arm
+/// applies to the derived time.
+///
+/// # Panics
+///
+/// As [`guard`], or if `source` is not a [`ds_store::samples::sources`]
+/// shaped name.
+pub fn derived_guard(table: &str, column: &str, source: &str) -> String {
+    assert!(
+        is_identifier(table),
+        "guard: bad table identifier {table:?}"
+    );
+    assert!(
+        is_identifier(column),
+        "guard: bad column identifier {column:?}"
+    );
+    guard_against(
+        &ds_store::samples::feed_observed_at_sql(&format!("{table}.{column}"), source),
+        column,
+    )
+}
+
+/// `stored IS NULL OR EXCLUDED.column >= stored OR stored > now() + 2 min`.
+fn guard_against(stored: &str, column: &str) -> String {
     format!(
-        "({table}.{column} IS NULL OR EXCLUDED.{column} >= {table}.{column} \
-         OR {table}.{column} > now() + {MAX_AHEAD_SQL})"
+        "({stored} IS NULL OR EXCLUDED.{column} >= {stored} \
+         OR {stored} > now() + {MAX_AHEAD_SQL})"
     )
 }
 
@@ -204,6 +238,18 @@ mod tests {
             guard("station_samples", "polled_at"),
             "(station_samples.polled_at IS NULL OR EXCLUDED.polled_at >= station_samples.polled_at \
              OR station_samples.polled_at > now() + interval '2 min')"
+        );
+    }
+
+    #[test]
+    fn the_derived_guard_compares_against_the_greatest_of_row_and_feed_time() {
+        let derived = "GREATEST(t.c, (SELECT fetched_at FROM ingest_freshness WHERE source = 'f'))";
+        assert_eq!(
+            derived_guard("t", "c", "f"),
+            format!(
+                "({derived} IS NULL OR EXCLUDED.c >= {derived} \
+                 OR {derived} > now() + interval '2 min')"
+            )
         );
     }
 

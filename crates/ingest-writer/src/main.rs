@@ -123,7 +123,15 @@ fn start_streams(
     if !config.streams.any_active() {
         return Ok(None);
     }
-    let registry = ingest_writer::handlers::registry();
+    let registry =
+        ingest_writer::handlers::registry_with(ingest_writer::handlers::snapshots::Options {
+            changed_rows_only: config.changed_rows_only,
+        });
+    if config.changed_rows_only {
+        tracing::info!(
+            "INGEST_WRITER_CHANGED_ROWS_ONLY: station-full-coverage-samples writes changed rows only"
+        );
+    }
     let uncovered = config.streams.uncovered(&registry);
     anyhow::ensure!(
         uncovered.is_empty(),

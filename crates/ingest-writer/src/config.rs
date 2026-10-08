@@ -80,6 +80,16 @@ pub struct Config {
     #[arg(long, env = "INGEST_WRITER_STREAMS", default_value = "")]
     pub streams: StreamModes,
 
+    /// Changed rows only (plan 3a.9, spec §7.8;
+    /// `ingestWriter.changedRowsOnly`): the `station-full-coverage-samples/1`
+    /// handler stops advancing `resolved_at` on rows whose stats are
+    /// unchanged, and its readers derive the age from the feed's observed
+    /// time instead. **Off by default** (every row written as today). Turn
+    /// it on only once `full-coverage` is on `apply` and soaked, and after
+    /// the api with the derived readers is deployed.
+    #[arg(long, env = "INGEST_WRITER_CHANGED_ROWS_ONLY", default_value_t = false)]
+    pub changed_rows_only: bool,
+
     /// The Redis holding the ingest streams. Required once any stream is not
     /// `off`; never carries a credential (those are `REDIS_USERNAME` and
     /// `REDIS_PASSWORD`).
@@ -215,6 +225,7 @@ mod tests {
         let config = Config::try_parse_from(args(&[])).unwrap();
         assert!(!config.loops_enabled);
         assert!(!config.streams.any_active(), "every stream off by default");
+        assert!(!config.changed_rows_only, "plan 3a.9 off by default");
         assert_eq!(config.canary_interval_secs, 60);
         // The api's defaults (crates/api/src/data/config.rs).
         assert_eq!(config.schedule_match_interval_secs, 300);
@@ -293,6 +304,10 @@ mod tests {
         );
         assert_eq!(env("metrics_port").as_deref(), Some("METRICS_PORT"));
         assert_eq!(env("streams").as_deref(), Some("INGEST_WRITER_STREAMS"));
+        assert_eq!(
+            env("changed_rows_only").as_deref(),
+            Some("INGEST_WRITER_CHANGED_ROWS_ONLY")
+        );
         assert_eq!(env("redis_url").as_deref(), Some("REDIS_URL"));
         assert_eq!(env("redis_username").as_deref(), Some("REDIS_USERNAME"));
         assert_eq!(env("redis_password").as_deref(), Some("REDIS_PASSWORD"));

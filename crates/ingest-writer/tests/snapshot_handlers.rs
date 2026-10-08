@@ -619,3 +619,309 @@ async fn full_coverage_window_stats_apply_once_in_order_clamped_with_freshness()
     )
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// Plan 3a.9: changed rows only (INGEST_WRITER_CHANGED_ROWS_ONLY).
+
+fn changed_rows_only() -> ingest_writer::handlers::snapshots::Options {
+    ingest_writer::handlers::snapshots::Options {
+        changed_rows_only: true,
+    }
+}
+
+impl Db {
+    async fn apply_with(
+        &self,
+        options: ingest_writer::handlers::snapshots::Options,
+        entry: &StreamEntry,
+    ) -> Result<Handled, HandlerError> {
+        WriterHandler::new(
+            self.pool.clone(),
+            Arc::new(ingest_writer::handlers::registry_with(options)),
+            Mode::Apply,
+        )
+        .handle(entry)
+        .await
+    }
+}
+
+fn fc_row(
+    crs: &str,
+    operator: &str,
+    resolved_at: DateTime<Utc>,
+    total: usize,
+) -> StationFullCoverageSample {
+    StationFullCoverageSample {
+        crs: crs.to_owned(),
+        ..fc_sample(operator, resolved_at, total)
+    }
+}
+
+type FcState = (String, String, DateTime<Utc>, DateTime<Utc>, i64);
+
+/// `(operator, xmin, resolved_at, derived resolved_at, total)` for `crs`'s
+/// rows of this run, the derived time as every reader reads it.
+async fn fc_state(pool: &PgPool, crs: &str, run: &str) -> Vec<FcState> {
+    sqlx::query_as(&format!(
+        "SELECT operator, xmin::text, resolved_at, {}, (stats->>'total')::int8 \
+         FROM station_full_coverage_samples WHERE crs = $1 AND operator LIKE '_' || $2 \
+         ORDER BY operator",
+        ds_store::samples::STATION_FULL_COVERAGE_RESOLVED_AT_SQL
+    ))
+    .bind(crs)
+    .bind(run)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// Rows the writer counted as `outcome` for station-full-coverage-samples.
+fn row_writes(rendered: &str, outcome: &str) -> u64 {
+    rendered
+        .lines()
+        .filter(|line| {
+            line.starts_with("distant_signal_ingest_stream_row_writes_total{")
+                && line.contains("schema=\"station-full-coverage-samples\"")
+                && line.contains(&format!("outcome=\"{outcome}\""))
+        })
+        .filter_map(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum()
+}
+
+/// With the switch on: an identical snapshot writes nothing (`xmin`
+/// unchanged) while the readers' derived `resolved_at` follows the feed; a
+/// changed row is still written; an older snapshot redelivered after a
+/// skipped newer one changes nothing; the skipped and written rows are
+/// counted.
+#[tokio::test]
+#[ignore = "requires a live database; run with DATABASE_URL set and --ignored"]
+async fn changed_rows_only_skips_unchanged_station_full_coverage_rows() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics = recorder.handle();
+    let installed = metrics::set_global_recorder(recorder).is_ok();
+
+    let db = Db::new().await;
+    let source = "station-full-coverage-samples";
+    db.reset_freshness(source).await;
+    let crs = "ZQE";
+    let (a, b) = (format!("A{}", db.run), format!("B{}", db.run));
+    let on = changed_rows_only();
+
+    // Old row times: what a row the writer keeps skipping looks like.
+    let t1 = now_ms() - TimeDelta::minutes(30);
+    let first = db.entry(
+        FULL_COVERAGE,
+        source,
+        "t1",
+        t1,
+        &[fc_row(crs, &a, t1, 5), fc_row(crs, &b, t1, 7)],
+    );
+    assert!(matches!(
+        db.apply_with(on, &first).await,
+        Ok(Handled::Applied)
+    ));
+    let inserted = fc_state(&db.pool, crs, &db.run).await;
+    assert_eq!(inserted.len(), 2);
+
+    // The same stats, recent feed time: zero rows written, the row time
+    // stays old, and the readers report the feed's time.
+    let t2 = now_ms() - TimeDelta::seconds(5);
+    let same = db.entry(
+        FULL_COVERAGE,
+        source,
+        "t2",
+        t2,
+        &[fc_row(crs, &a, t2, 5), fc_row(crs, &b, t2, 7)],
+    );
+    assert!(matches!(
+        db.apply_with(on, &same).await,
+        Ok(Handled::Applied)
+    ));
+    let unchanged = fc_state(&db.pool, crs, &db.run).await;
+    for (before, after) in inserted.iter().zip(&unchanged) {
+        assert_eq!(after.1, before.1, "xmin: {} was rewritten", after.0);
+        assert_eq!(after.2, t1, "the row's own time is not bumped");
+        assert_eq!(after.3, t2, "the derived time is the feed's");
+    }
+    assert_eq!(db.freshness(source).await, Some(t2));
+    let fetched = ds_store::freshness::last_station_full_coverage_samples_fetch(&db.pool)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        fetched >= t2,
+        "the freshness read follows the feed: {fetched}"
+    );
+
+    // One changed row: written, the other still skipped.
+    let t3 = now_ms();
+    let changed = db.entry(
+        FULL_COVERAGE,
+        source,
+        "t3",
+        t3,
+        &[fc_row(crs, &a, t3, 6), fc_row(crs, &b, t3, 7)],
+    );
+    assert!(matches!(
+        db.apply_with(on, &changed).await,
+        Ok(Handled::Applied)
+    ));
+    let after_change = fc_state(&db.pool, crs, &db.run).await;
+    assert_ne!(after_change[0].1, unchanged[0].1, "A changed: written");
+    assert_eq!((after_change[0].2, after_change[0].4), (t3, 6));
+    assert_eq!(after_change[1].1, unchanged[1].1, "B unchanged: skipped");
+    assert_eq!((after_change[1].2, after_change[1].3), (t1, t3));
+
+    // An older snapshot redelivered after the skipped newer ones: B's own
+    // time (t1) is older than it, but the derived time (t3) is not, so
+    // nothing changes.
+    let older_at = t2 + TimeDelta::milliseconds(1);
+    let older = db.entry(
+        FULL_COVERAGE,
+        source,
+        "t2b",
+        older_at,
+        &[fc_row(crs, &a, older_at, 99), fc_row(crs, &b, older_at, 99)],
+    );
+    assert!(matches!(
+        db.apply_with(on, &older).await,
+        Ok(Handled::Applied)
+    ));
+    assert_eq!(fc_state(&db.pool, crs, &db.run).await, after_change);
+    assert_eq!(db.freshness(source).await, Some(t3));
+
+    if installed {
+        let rendered = metrics.render();
+        // t1: 2 written; t2: 2 skipped; t3: 1 and 1; t2b: 2 skipped.
+        assert_eq!(row_writes(&rendered, "written"), 3, "{rendered}");
+        assert_eq!(row_writes(&rendered, "skipped"), 5, "{rendered}");
+    }
+
+    db.cleanup(
+        "DELETE FROM station_full_coverage_samples WHERE crs = 'ZQE' AND operator LIKE '_' || $1",
+        &db.run,
+    )
+    .await;
+}
+
+/// With the switch off (the default), the writer is today's: an identical
+/// snapshot still advances every row's `resolved_at`, as the api route
+/// does, and the derived time equals the row's own.
+#[tokio::test]
+#[ignore = "requires a live database; run with DATABASE_URL set and --ignored"]
+async fn changed_rows_only_off_keeps_the_per_row_bump() {
+    let db = Db::new().await;
+    let source = "station-full-coverage-samples";
+    db.reset_freshness(source).await;
+    let crs = "ZQF";
+    let (writer_op, route_op) = (format!("W{}", db.run), format!("R{}", db.run));
+    let off = ingest_writer::handlers::snapshots::Options::default();
+
+    let t1 = now_ms() - TimeDelta::minutes(30);
+    let t2 = now_ms();
+    for (key, at) in [("t1", t1), ("t2", t2)] {
+        let entry = db.entry(
+            FULL_COVERAGE,
+            source,
+            key,
+            at,
+            &[fc_row(crs, &writer_op, at, 5)],
+        );
+        assert!(matches!(
+            db.apply_with(off, &entry).await,
+            Ok(Handled::Applied)
+        ));
+        ds_store::samples::upsert_station_full_coverage_samples(
+            &db.pool,
+            &[fc_row(crs, &route_op, at, 5)],
+        )
+        .await
+        .unwrap();
+    }
+    let rows = fc_state(&db.pool, crs, &db.run).await;
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        assert_eq!((row.2, row.3, row.4), (t2, t2, 5), "{}", row.0);
+    }
+
+    db.cleanup(
+        "DELETE FROM station_full_coverage_samples WHERE crs = 'ZQF' AND operator LIKE '_' || $1",
+        &db.run,
+    )
+    .await;
+}
+
+/// The tables that fail plan 3a.9's every-key check keep their per-row
+/// time with the switch on: an identical snapshot still advances
+/// `station_samples.polled_at`, `full_coverage_line_window_stats.computed_at`
+/// and `full_coverage_line_stats.source_updated_at`.
+#[tokio::test]
+#[ignore = "requires a live database; run with DATABASE_URL set and --ignored"]
+async fn changed_rows_only_leaves_the_other_tables_per_row() {
+    let db = Db::new().await;
+    for source in [
+        "station-samples",
+        "full-coverage-window-stats",
+        "full-coverage-stats",
+    ] {
+        db.reset_freshness(source).await;
+    }
+    let on = changed_rows_only();
+    let line = format!("test-3a9-{}", db.run);
+    sqlx::query("UPDATE station_samples SET polled_at = '2000-01-01Z' WHERE crs = 'ZQG'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let bucket =
+        ds_store::samples::full_coverage_window::bucket_start(now_ms() - TimeDelta::hours(1));
+    let t1 = bucket + TimeDelta::minutes(2);
+    let t2 = bucket + TimeDelta::minutes(3);
+    for (key, at) in [("t1", t1), ("t2", t2)] {
+        let samples = db.entry(
+            SAMPLES,
+            "station-samples",
+            &format!("s{key}"),
+            at,
+            &[station_sample("ZQG", at, "1")],
+        );
+        // The same counts; window_end moves with computed_at, as it does
+        // in production.
+        let windows = db.entry(
+            FULL_COVERAGE,
+            "full-coverage-window-stats",
+            &format!("w{key}"),
+            at,
+            &[window_row(&line, at, 5)],
+        );
+        let stats = db.entry(
+            FULL_COVERAGE,
+            "full-coverage-stats",
+            &format!("l{key}"),
+            at,
+            &[line_row(&line, 5)],
+        );
+        for entry in [&samples, &windows, &stats] {
+            assert!(matches!(
+                db.apply_with(on, entry).await,
+                Ok(Handled::Applied)
+            ));
+        }
+    }
+    assert_eq!(station_sample_rows(&db.pool, &["ZQG"]).await[0].1, t2);
+    assert_eq!(window_rows(&db.pool, &line).await, [(t2, 5, bucket)]);
+    assert_eq!(line_rows(&db.pool, &line).await[0].5, Some(t2));
+
+    db.cleanup("DELETE FROM station_samples WHERE crs::text = $1", "ZQG")
+        .await;
+    db.cleanup(
+        "DELETE FROM full_coverage_line_window_stats WHERE line_id LIKE '%' || $1",
+        &db.run,
+    )
+    .await;
+    db.cleanup(
+        "DELETE FROM full_coverage_line_stats WHERE line_id LIKE '%' || $1",
+        &db.run,
+    )
+    .await;
+}

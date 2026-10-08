@@ -24,28 +24,65 @@
 //!
 //! Rows are counted in `ingest_stream_rows_total{mode}` (`shadow` from
 //! [`SchemaHandler::check`], `apply` from [`SchemaHandler::apply`]) for the
-//! rollout's compare step.
+//! rollout's compare step, and applied rows again in
+//! `ingest_stream_row_writes_total{outcome}`: `written` (inserted or
+//! updated) or `skipped` (unchanged, or refused by the guard as older).
+//!
+//! **Changed rows only** ([`Options::changed_rows_only`],
+//! `INGEST_WRITER_CHANGED_ROWS_ONLY`, plan 3a.9, D12/D13, spec §7.8): only
+//! `station-full-coverage-samples/1` changes. A row whose `stats` are
+//! unchanged is not written (its `resolved_at` stays at the snapshot that
+//! last changed it), its readers derive its age as
+//! `GREATEST(resolved_at, the feed's observed time)`
+//! (`ds_store::samples::STATION_FULL_COVERAGE_RESOLVED_AT_SQL`), and the
+//! guard compares against the same derivation
+//! ([`crate::observed::derived_guard`]). The other three keep their per-row
+//! time, because the derivation needs every snapshot to carry every live
+//! key and theirs do not (plan 3a.9's check):
+//!
+//! - `station_samples`: LDBWS visits about 255 of 560 stations a cycle;
+//! - `full_coverage_line_window_stats`: a line with no population for the
+//!   day gets no window rows, and the aggregator's 30-minute look-back would
+//!   then read its last row as fresh; and `window_start`/`window_end` move
+//!   on every write, so no write is a timestamp-only bump;
+//! - `full_coverage_line_stats`: a snapshot carries only the current rail
+//!   day, so after the rollover a reordered entry with the previous day's
+//!   closing row would be refused against the new day's feed time.
 
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use chrono::{DateTime, Utc};
 use common::{
     FullCoverageLineStatsRow, FullCoverageWindowStatsRow, StationFullCoverageSample, StationSample,
 };
-use ds_store::samples::{self, SourceOrdering, full_coverage_window, sources};
+use ds_store::samples::{self, RowWrites, SourceOrdering, full_coverage_window, sources};
 use ingest_stream::{HandlerError, SchemaId, StreamEntry};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sqlx::PgConnection;
 
 use super::{Applied, BoxFuture, SchemaHandler, apply_batch, classify_anyhow, decode};
-use crate::observed::{Observed, guard};
+use crate::observed::{Observed, derived_guard, guard};
+
+/// The handlers' settings, from the writer's configuration.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Options {
+    /// `INGEST_WRITER_CHANGED_ROWS_ONLY` (plan 3a.9). **Off by default**:
+    /// every handler writes as the api route does.
+    pub changed_rows_only: bool,
+}
 
 /// Writes a batch of rows (already given their observed times) on the
-/// writer's transaction; `produced_at` is the entry's clamped `produced_at`.
-type WriteFn<T> =
-    for<'c> fn(&'c mut PgConnection, &'c [T], DateTime<Utc>) -> BoxFuture<'c, sqlx::Result<()>>;
+/// writer's transaction, returning the rows written; `produced_at` is the
+/// entry's clamped `produced_at`.
+type WriteFn<T> = for<'c> fn(
+    &'c mut PgConnection,
+    &'c [T],
+    DateTime<Utc>,
+    Options,
+) -> BoxFuture<'c, sqlx::Result<u64>>;
 
 /// One snapshot schema's handler. See the module docs.
 pub struct Snapshot<T> {
@@ -56,6 +93,7 @@ pub struct Snapshot<T> {
     /// Refuses a body the api route would refuse (a 400): poison.
     validate: fn(&[T]) -> Result<(), String>,
     write: WriteFn<T>,
+    options: Options,
     rows: PhantomData<fn() -> T>,
 }
 
@@ -99,9 +137,18 @@ where
                 (self.observe)(row, observed);
             }
             let produced_at = observed.produced_at();
-            let write = self.write;
-            let outcome =
-                apply_batch(conn, rows, move |conn, rows| write(conn, rows, produced_at)).await?;
+            let (write, options) = (self.write, self.options);
+            let written = Arc::new(AtomicU64::new(0));
+            let counter = Arc::clone(&written);
+            let outcome = apply_batch(conn, rows, move |conn, rows| {
+                let counter = Arc::clone(&counter);
+                Box::pin(async move {
+                    let count = write(conn, rows, produced_at, options).await?;
+                    counter.fetch_add(count, Ordering::Relaxed);
+                    Ok(())
+                })
+            })
+            .await?;
             if outcome.applied > 0 {
                 ds_store::freshness::record_ingest(conn, self.source, Some(produced_at))
                     .await
@@ -112,6 +159,15 @@ where
                 entry.envelope.schema.name(),
                 "apply",
                 outcome.applied,
+            );
+            let written = written.load(Ordering::Relaxed);
+            ingest_stream::metrics::row_writes(
+                &entry.stream,
+                entry.envelope.schema.name(),
+                written,
+                u64::try_from(outcome.applied)
+                    .unwrap_or(u64::MAX)
+                    .saturating_sub(written),
             );
             outcome.into_applied(|rows| rows)
         })
@@ -131,7 +187,7 @@ fn schema(name: &str) -> SchemaId {
 }
 
 /// Every snapshot schema and its handler, for `handlers::registry`.
-pub fn handlers() -> Vec<(SchemaId, Arc<dyn SchemaHandler>)> {
+pub fn handlers(options: Options) -> Vec<(SchemaId, Arc<dyn SchemaHandler>)> {
     vec![
         (schema("station-samples"), Arc::new(station_samples())),
         (
@@ -144,7 +200,7 @@ pub fn handlers() -> Vec<(SchemaId, Arc<dyn SchemaHandler>)> {
         ),
         (
             schema("station-full-coverage-samples"),
-            Arc::new(station_full_coverage_samples()),
+            Arc::new(station_full_coverage_samples(options)),
         ),
     ]
 }
@@ -161,13 +217,12 @@ pub fn station_samples() -> Snapshot<StationSample> {
         source: sources::STATION_SAMPLES,
         observe: |row, observed| row.polled_at = observed.observed_at(Some(row.polled_at)),
         validate: no_validation,
-        write: |conn, rows, _| {
+        write: |conn, rows, _, _| {
             Box::pin(async move {
-                samples::upsert_station_samples_on(conn, rows, Some(&STATION_SAMPLES_GUARD))
-                    .await
-                    .map(drop)
+                samples::upsert_station_samples_on(conn, rows, Some(&STATION_SAMPLES_GUARD)).await
             })
         },
+        options: Options::default(),
         rows: PhantomData,
     }
 }
@@ -179,23 +234,36 @@ pub fn station_samples() -> Snapshot<StationSample> {
 static STATION_FULL_COVERAGE_GUARD: LazyLock<String> =
     LazyLock::new(|| guard("station_full_coverage_samples", "resolved_at"));
 
-/// `station-full-coverage-samples/1`.
-pub fn station_full_coverage_samples() -> Snapshot<StationFullCoverageSample> {
+/// The changed-rows-only guard (plan 3a.9): against
+/// `GREATEST(resolved_at, the feed's observed time)`, the readers'
+/// derivation.
+static STATION_FULL_COVERAGE_DERIVED_GUARD: LazyLock<String> = LazyLock::new(|| {
+    derived_guard(
+        "station_full_coverage_samples",
+        "resolved_at",
+        sources::STATION_FULL_COVERAGE_SAMPLES,
+    )
+});
+
+/// `station-full-coverage-samples/1`; with
+/// [`Options::changed_rows_only`], an unchanged row is not written (see the
+/// module docs).
+pub fn station_full_coverage_samples(options: Options) -> Snapshot<StationFullCoverageSample> {
     Snapshot {
         source: sources::STATION_FULL_COVERAGE_SAMPLES,
         observe: |row, observed| row.resolved_at = observed.observed_at(Some(row.resolved_at)),
         validate: no_validation,
-        write: |conn, rows, _| {
+        write: |conn, rows, _, options| {
             Box::pin(async move {
-                samples::upsert_station_full_coverage_samples_on(
-                    conn,
-                    rows,
-                    Some(&STATION_FULL_COVERAGE_GUARD),
-                )
-                .await
-                .map(drop)
+                let writes = if options.changed_rows_only {
+                    RowWrites::ChangedOnly(&STATION_FULL_COVERAGE_DERIVED_GUARD)
+                } else {
+                    RowWrites::EveryRow(Some(&STATION_FULL_COVERAGE_GUARD))
+                };
+                samples::upsert_station_full_coverage_samples_on(conn, rows, writes).await
             })
         },
+        options,
         rows: PhantomData,
     }
 }
@@ -213,7 +281,7 @@ pub fn full_coverage_stats() -> Snapshot<FullCoverageLineStatsRow> {
         source: sources::FULL_COVERAGE_STATS,
         observe: |_, _| {},
         validate: no_validation,
-        write: |conn, rows, produced_at| {
+        write: |conn, rows, produced_at, _| {
             Box::pin(async move {
                 samples::upsert_full_coverage_line_stats_on(
                     conn,
@@ -224,9 +292,9 @@ pub fn full_coverage_stats() -> Snapshot<FullCoverageLineStatsRow> {
                     }),
                 )
                 .await
-                .map(drop)
             })
         },
+        options: Options::default(),
         rows: PhantomData,
     }
 }
@@ -244,7 +312,7 @@ pub fn full_coverage_window_stats() -> Snapshot<FullCoverageWindowStatsRow> {
         source: sources::FULL_COVERAGE_WINDOW_STATS,
         observe: |row, observed| row.computed_at = observed.observed_at(Some(row.computed_at)),
         validate: |rows| full_coverage_window::validate(rows).map_err(|err| err.to_string()),
-        write: |conn, rows, _| {
+        write: |conn, rows, _, _| {
             Box::pin(async move {
                 full_coverage_window::upsert_full_coverage_window_stats_on(
                     conn,
@@ -252,9 +320,9 @@ pub fn full_coverage_window_stats() -> Snapshot<FullCoverageWindowStatsRow> {
                     Some(&FULL_COVERAGE_WINDOW_GUARD),
                 )
                 .await
-                .map(drop)
             })
         },
+        options: Options::default(),
         rows: PhantomData,
     }
 }
@@ -265,7 +333,7 @@ mod tests {
 
     #[test]
     fn every_snapshot_schema_is_a_stream_schema() {
-        for (schema, _) in handlers() {
+        for (schema, _) in handlers(Options::default()) {
             assert_eq!(schema.version(), 1);
             assert!(
                 crate::stream::STREAMS
@@ -282,5 +350,9 @@ mod tests {
         assert!(STATION_FULL_COVERAGE_GUARD.contains("station_full_coverage_samples.resolved_at"));
         assert!(FULL_COVERAGE_STATS_GUARD.contains("full_coverage_line_stats.source_updated_at"));
         assert!(FULL_COVERAGE_WINDOW_GUARD.contains("full_coverage_line_window_stats.computed_at"));
+        assert!(
+            STATION_FULL_COVERAGE_DERIVED_GUARD
+                .contains(samples::STATION_FULL_COVERAGE_RESOLVED_AT_SQL)
+        );
     }
 }

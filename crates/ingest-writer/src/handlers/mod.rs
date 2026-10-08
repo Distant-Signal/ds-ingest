@@ -144,10 +144,16 @@ impl Registry {
 
 /// The writer's registry: every product schema it applies. Plan 3a.6:
 /// `station-samples/1` and the three full-coverage schemas; 3c adds
-/// `tfl-line-status/1`, `tocs/1` and the island-of-Ireland schemas.
+/// `tfl-line-status/1`, `tocs/1` and the island-of-Ireland schemas. With
+/// the default [`snapshots::Options`] (every switch off).
 pub fn registry() -> Registry {
+    registry_with(snapshots::Options::default())
+}
+
+/// [`registry`] with the handlers' `options` (the writer's configuration).
+pub fn registry_with(options: snapshots::Options) -> Registry {
     let mut registry = Registry::new();
-    for (schema, handler) in snapshots::handlers() {
+    for (schema, handler) in snapshots::handlers(options) {
         if let Err(err) = registry.register_arc(&schema, handler) {
             // A schema listed twice in `snapshots::handlers`: a bug the
             // unit test `the_registry_has_the_four_snapshot_schemas` catches.
