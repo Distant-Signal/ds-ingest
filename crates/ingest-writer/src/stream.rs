@@ -375,10 +375,10 @@ async fn trim_task(
             {
                 Ok(0) => {}
                 Ok(removed) => {
-                    tracing::info!(%dead_letter_stream, removed, "trimmed dead-letter entries older than 7 days")
+                    tracing::info!(%dead_letter_stream, removed, "trimmed dead-letter entries older than 7 days");
                 }
                 Err(err) => {
-                    tracing::warn!(%dead_letter_stream, error = %err, "dead-letter MINID trim failed; will retry next hour")
+                    tracing::warn!(%dead_letter_stream, error = %err, "dead-letter MINID trim failed; will retry next hour");
                 }
             }
         }

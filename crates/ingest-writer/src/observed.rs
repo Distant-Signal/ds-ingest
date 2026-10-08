@@ -76,7 +76,7 @@ impl Observed {
     }
 
     /// The envelope's `produced_at`, clamped (and counted): the observed
-    /// time of a row with no time of its own (`source_updated_at`, TfL's
+    /// time of a row with no time of its own (`source_updated_at`, `TfL`'s
     /// `computed_at`, freshness).
     pub fn produced_at(&self) -> DateTime<Utc> {
         self.observed_at(None)
