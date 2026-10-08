@@ -22,11 +22,18 @@ pub const RETENTION: Duration = Duration::from_secs(48 * 3600);
 pub const PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Inserts `key` for `stream`. `true` if this transaction claimed it,
-/// `false` if it was already applied.
+/// `false` if it was already applied on `stream`.
+///
+/// A key is scoped to its stream (security review L2, migration
+/// `20261009160100_ingest_dedup_stream_key_index.sql`): one stream's
+/// producer cannot mark another stream's entry applied by sending its key.
+/// Until the contract step drops the old primary key on `key` alone, a key
+/// already claimed on another stream is a unique violation (a data error:
+/// the entry is dead-lettered, not acked as a duplicate).
 pub async fn claim(conn: &mut PgConnection, key: &str, stream: &str) -> sqlx::Result<bool> {
     let claimed: Option<i32> = sqlx::query_scalar(
         "INSERT INTO ingest_dedup (key, stream, applied_at) VALUES ($1, $2, now()) \
-         ON CONFLICT (key) DO NOTHING RETURNING 1",
+         ON CONFLICT (stream, key) DO NOTHING RETURNING 1",
     )
     .bind(key)
     .bind(stream)

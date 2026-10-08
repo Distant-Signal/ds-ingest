@@ -34,7 +34,7 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::dedup;
-use crate::handlers::{Applied, Registry, classify};
+use crate::handlers::{Applied, Registry, SchemaHandler, classify};
 use crate::observed::Observed;
 
 /// A stream's mode.
@@ -78,8 +78,24 @@ pub struct StreamSpec {
     pub schemas: &'static [&'static str],
 }
 
-/// The ingest streams (spec §7.1; D1: no `train-events`).
-pub const STREAMS: [StreamSpec; 5] = [
+impl StreamSpec {
+    /// The spec whose key is `stream`, if it is one of [`STREAMS`].
+    pub fn by_stream(stream: &str) -> Option<Self> {
+        STREAMS.iter().copied().find(|spec| spec.stream == stream)
+    }
+
+    /// Whether this stream carries schema `name` (spec §7.1). The writer
+    /// applies nothing else from it, so a producer can only write the
+    /// schemas of the streams its Redis ACL user may `XADD` to.
+    pub fn carries(&self, name: &str) -> bool {
+        self.schemas.contains(&name)
+    }
+}
+
+/// The ingest streams (spec §7.1; D1: no `train-events`). Each
+/// island-of-Ireland poller has its own stream, so its ACL user can produce
+/// only its own schemas (2026-10-08 security review, H1).
+pub const STREAMS: [StreamSpec; 7] = [
     StreamSpec {
         name: "station-samples",
         stream: streams::STATION_SAMPLES,
@@ -105,9 +121,19 @@ pub const STREAMS: [StreamSpec; 5] = [
         schemas: &["tocs"],
     },
     StreamSpec {
-        name: "island-of-ireland",
-        stream: streams::ISLAND_OF_IRELAND,
-        schemas: &["ioi-stations", "ioi-lines", "ioi-station-samples"],
+        name: "ioi-gtfs",
+        stream: streams::IOI_GTFS,
+        schemas: &["ioi-stations", "ioi-lines"],
+    },
+    StreamSpec {
+        name: "ioi-nir",
+        stream: streams::IOI_NIR,
+        schemas: &["ioi-stations", "ioi-lines"],
+    },
+    StreamSpec {
+        name: "ioi-live",
+        stream: streams::IOI_LIVE,
+        schemas: &["ioi-station-samples"],
     },
 ];
 
@@ -191,24 +217,65 @@ impl fmt::Display for StreamModes {
     }
 }
 
+/// The dead-letter reason of an entry whose schema its stream does not
+/// carry ([`StreamSpec::schemas`]).
+pub const SCHEMA_NOT_ALLOWED_ON_STREAM: &str = "schema_not_allowed_on_stream";
+
+/// The dead-letter reason of an entry whose idempotency key does not start
+/// with `<schema name>:` ([`ingest_stream::Envelope::snapshot_key`]).
+pub const KEY_NOT_FOR_SCHEMA: &str = "key_not_for_schema";
+
 /// The writer's [`Handler`] for one stream in `shadow` or `apply`.
 pub struct WriterHandler {
     pool: PgPool,
     registry: Arc<Registry>,
+    spec: StreamSpec,
     mode: Mode,
 }
 
 impl WriterHandler {
-    pub fn new(pool: PgPool, registry: Arc<Registry>, mode: Mode) -> Self {
+    pub fn new(pool: PgPool, registry: Arc<Registry>, spec: StreamSpec, mode: Mode) -> Self {
         Self {
             pool,
             registry,
+            spec,
             mode,
         }
     }
 
+    /// The entry's handler, once the entry may be applied from this stream
+    /// at all. Checked in both modes, before anything is written:
+    ///
+    /// - its schema must be one this stream carries, so a producer that may
+    ///   `XADD` to one stream cannot write another stream's tables
+    ///   ([`SCHEMA_NOT_ALLOWED_ON_STREAM`]);
+    /// - its key must start with `<schema name>:`, as every producer's does
+    ///   ([`ingest_stream::Envelope::snapshot_key`]), so one schema's entry
+    ///   can never claim (and so suppress) another schema's dedup key
+    ///   ([`KEY_NOT_FOR_SCHEMA`]).
+    ///
+    /// Either is [`HandlerError::Poison`]: dead-lettered with the reason.
+    fn admit(&self, entry: &StreamEntry) -> Result<&dyn SchemaHandler, HandlerError> {
+        let name = entry.envelope.schema.name();
+        if !self.spec.carries(name) {
+            return Err(HandlerError::Poison(format!(
+                "{SCHEMA_NOT_ALLOWED_ON_STREAM}: {} does not carry schema {name:?} (only {})",
+                self.spec.stream,
+                self.spec.schemas.join(", ")
+            )));
+        }
+        let key_schema = entry.envelope.key.split_once(':').map(|(prefix, _)| prefix);
+        if key_schema != Some(name) {
+            return Err(HandlerError::Poison(format!(
+                "{KEY_NOT_FOR_SCHEMA}: key {:?} does not start with \"{name}:\"",
+                entry.envelope.key
+            )));
+        }
+        self.registry.lookup(&entry.envelope.schema)
+    }
+
     async fn apply(&self, entry: &StreamEntry) -> Result<Handled, HandlerError> {
-        let handler = self.registry.lookup(&entry.envelope.schema)?;
+        let handler = self.admit(entry)?;
         let mut tx = self.pool.begin().await.map_err(|err| classify(&err))?;
         let claimed = dedup::claim(&mut tx, &entry.envelope.key, &entry.stream)
             .await
@@ -235,7 +302,7 @@ impl Handler for WriterHandler {
             Mode::Apply => self.apply(entry).await,
             // `Off` streams get no consumer; treat a stray one as shadow.
             Mode::Shadow | Mode::Off => {
-                self.registry.lookup(&entry.envelope.schema)?.check(entry)?;
+                self.admit(entry)?.check(entry)?;
                 Ok(Handled::Skipped)
             }
         }
@@ -298,8 +365,12 @@ pub fn spawn(runtime: &StreamRuntime, modes: &StreamModes) -> RunningStreams {
     for (spec, mode) in &active {
         let task_progress = Progress::new(runtime.stall_after);
         progress.push((spec.name, task_progress.clone()));
-        let handler =
-            WriterHandler::new(runtime.pool.clone(), Arc::clone(&runtime.registry), *mode);
+        let handler = WriterHandler::new(
+            runtime.pool.clone(),
+            Arc::clone(&runtime.registry),
+            *spec,
+            *mode,
+        );
         // Every stream is declared (`every_stream_is_declared_in_the_budget`);
         // the fallback is the spec's original dead-letter cap.
         let dead_letter_maxlen =
@@ -436,7 +507,7 @@ mod tests {
         assert_eq!(modes, StreamModes::default());
         assert_eq!(
             modes.to_string(),
-            "station-samples:off,full-coverage:off,tfl:off,reference:off,island-of-ireland:off"
+            "station-samples:off,full-coverage:off,tfl:off,reference:off,ioi-gtfs:off,ioi-nir:off,ioi-live:off"
         );
 
         let modes: StreamModes = " station-samples:apply, full-coverage : shadow,tfl:off"
@@ -492,7 +563,7 @@ mod tests {
         let modes: StreamModes = "tfl:shadow".parse().unwrap();
         assert_eq!(modes.uncovered(&Registry::new()), ["tfl: tfl-line-status"]);
         // Plans 3a.6 and 3c.1: every stream is covered.
-        let modes: StreamModes = "station-samples:apply,full-coverage:shadow,tfl:apply,reference:apply,island-of-ireland:shadow"
+        let modes: StreamModes = "station-samples:apply,full-coverage:shadow,tfl:apply,reference:apply,ioi-gtfs:shadow,ioi-nir:shadow,ioi-live:shadow"
             .parse()
             .unwrap();
         assert!(modes.uncovered(&crate::handlers::registry()).is_empty());
@@ -504,13 +575,92 @@ mod tests {
     /// handler for every schema they carry.
     #[test]
     fn the_phase_3c_streams_are_covered() {
-        let modes: StreamModes = "tfl:apply,reference:apply,island-of-ireland:shadow"
-            .parse()
-            .unwrap();
+        let modes: StreamModes =
+            "tfl:apply,reference:apply,ioi-gtfs:shadow,ioi-nir:apply,ioi-live:shadow"
+                .parse()
+                .unwrap();
         assert!(
             modes.uncovered(&crate::handlers::registry()).is_empty(),
             "{:?}",
             modes.uncovered(&crate::handlers::registry())
         );
+    }
+
+    /// Every stream key is a [`STREAMS`] entry's, and each schema the
+    /// writer has a handler for is carried by some stream.
+    #[test]
+    fn streams_are_found_by_key() {
+        for spec in STREAMS {
+            assert_eq!(StreamSpec::by_stream(spec.stream), Some(spec));
+        }
+        assert_eq!(StreamSpec::by_stream("ds:ingest:island-of-ireland"), None);
+        let live = StreamSpec::by_stream(streams::IOI_LIVE).unwrap();
+        assert!(live.carries("ioi-station-samples"));
+        assert!(!live.carries("ioi-stations"));
+    }
+
+    /// Security review H1 (2026-10-08): an entry whose schema its stream
+    /// does not carry, or whose key is not `<schema name>:...`, is poison
+    /// in shadow and in apply, before any database work (this pool never
+    /// connects).
+    #[tokio::test]
+    async fn an_entry_off_its_stream_or_its_key_is_poison_in_both_modes() {
+        use chrono::Utc;
+        use ingest_stream::{Envelope, SchemaId};
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://nobody@localhost/none")
+            .unwrap();
+        let registry = Arc::new(crate::handlers::registry());
+        let live = StreamSpec::by_stream(streams::IOI_LIVE).unwrap();
+        let entry = |schema: &str, key: &str| StreamEntry {
+            stream: live.stream.to_owned(),
+            id: "1-0".to_owned(),
+            envelope: Envelope::new(
+                SchemaId::new(schema, 1).unwrap(),
+                "test/pod",
+                key,
+                Utc::now(),
+                &Vec::<u8>::new(),
+            )
+            .unwrap(),
+        };
+        let poison = |result: Result<Handled, HandlerError>, reason: &str| match result {
+            Err(HandlerError::Poison(got)) => assert!(got.starts_with(reason), "{got}"),
+            other => panic!("expected poison {reason}, got {other:?}"),
+        };
+        for mode in [Mode::Shadow, Mode::Apply] {
+            let handler = WriterHandler::new(pool.clone(), Arc::clone(&registry), live, mode);
+            // Another poller's schema on this poller's stream.
+            poison(
+                handler
+                    .handle(&entry("ioi-stations", "ioi-stations:b:1/1"))
+                    .await,
+                SCHEMA_NOT_ALLOWED_ON_STREAM,
+            );
+            // A schema of another stream altogether.
+            poison(
+                handler.handle(&entry("tocs", "tocs:b:1/1")).await,
+                SCHEMA_NOT_ALLOWED_ON_STREAM,
+            );
+            // This stream's schema with another schema's key, or none.
+            for key in [
+                "tocs:b:1/1",
+                "ioi-station-samples",
+                "ioi-station-samples-x:b",
+            ] {
+                poison(
+                    handler.handle(&entry("ioi-station-samples", key)).await,
+                    KEY_NOT_FOR_SCHEMA,
+                );
+            }
+        }
+        let shadow = WriterHandler::new(pool, registry, live, Mode::Shadow);
+        assert!(matches!(
+            shadow
+                .handle(&entry("ioi-station-samples", "ioi-station-samples:b:1/1"))
+                .await,
+            Ok(Handled::Skipped)
+        ));
     }
 }

@@ -39,13 +39,7 @@ async fn run() -> anyhow::Result<()> {
         ds_store::pool::register_metrics();
         // Every outcome at 0, so DistantSignalTrainEventOutboxRejected's
         // increase() sees the first rejection.
-        for outcome in ["applied", "rejected"] {
-            metrics::counter!(
-                common::metrics::metric_name(ds_store::tracking::outbox::OUTBOX_METRIC),
-                "outcome" => outcome
-            )
-            .increment(0);
-        }
+        ds_store::tracking::outbox::register_metrics();
     }
     ingest_writer::telemetry::export_stream_modes(&config.streams);
 

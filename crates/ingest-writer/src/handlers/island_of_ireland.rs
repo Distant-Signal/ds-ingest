@@ -1,4 +1,5 @@
-//! The island-of-Ireland schemas (stream `ds:ingest:island-of-ireland`,
+//! The island-of-Ireland schemas (streams `ds:ingest:ioi-gtfs` and
+//! `ds:ingest:ioi-nir`: stations and lines; `ds:ingest:ioi-live`: samples;
 //! plan 3c.1, decision D8; the pollers are disabled by default):
 //!
 //! | Schema | Body (today's api route body) | Writer |

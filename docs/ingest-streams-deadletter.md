@@ -124,7 +124,8 @@ locally as `ingest-reinject.lua`:
 -- KEYS[2] = its source stream (ds:ingest:<domain>)
 -- ARGV[1] = first id, ARGV[2] = last id (inclusive; "-" / "+" for all)
 -- ARGV[3] = the source stream's MAXLEN (budget.rs: station-samples 720,
---           full-coverage 360, tfl 288, reference 30, island-of-ireland 2000)
+--           full-coverage 360, tfl 288, reference 30, ioi-gtfs 500,
+--           ioi-nir 500, ioi-live 1000)
 -- ARGV[4] = reason filter ("*" for poison and rejected_rows)
 -- Returns {reinjected, skipped_by_reason, skipped_other_source}.
 local drop = {error = true, reason = true, failed_at = true, deliveries = true,

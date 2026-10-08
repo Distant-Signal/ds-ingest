@@ -846,12 +846,17 @@ mod db_tests {
             Some("42501"),
             "{err}"
         );
-        let can_read: bool =
-            sqlx::query_scalar("SELECT has_table_privilege('train_subscriptions', 'SELECT')")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(can_read);
+        // Security review M2 (2026-10-08): it reads only the columns of its
+        // one lookup (`SELECT trains_id ... WHERE id`), not the users' pins.
+        let (table, trains_id, user_id): (bool, bool, bool) = sqlx::query_as(
+            "SELECT has_table_privilege('train_subscriptions', 'SELECT'), \
+                    has_column_privilege('train_subscriptions', 'trains_id', 'SELECT'), \
+                    has_column_privilege('train_subscriptions', 'user_id', 'SELECT')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((table, trains_id, user_id), (false, true, false));
     }
 
     /// Decided 2026-10-08: the `trust_consumer` role only reads `trains`

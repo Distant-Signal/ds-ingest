@@ -119,6 +119,21 @@ pub struct Config {
     )]
     pub train_event_outbox_interval_secs: u64,
 
+    /// A train-event outbox row whose apply fails with an error that is not
+    /// a data error on this many ticks is marked rejected (security review
+    /// L1), so it cannot hold up the rows behind it forever.
+    #[arg(long, env = "INGEST_WRITER_OUTBOX_MAX_ATTEMPTS", default_value_t = 5)]
+    pub outbox_max_attempts: u32,
+
+    /// Rejected train-event outbox rows are deleted this many days after
+    /// they were rejected (security review L1).
+    #[arg(
+        long,
+        env = "INGEST_WRITER_OUTBOX_REJECTED_RETENTION_DAYS",
+        default_value_t = 14
+    )]
+    pub outbox_rejected_retention_days: u64,
+
     /// Port for the Prometheus `/metrics` listener (the workers' default;
     /// the chart sets it from `metrics.port`).
     #[arg(long, env, default_value_t = 9091)]
@@ -134,6 +149,17 @@ pub struct Config {
 }
 
 impl Config {
+    /// The train-event outbox loop's handling of rows it cannot apply.
+    pub fn outbox_policy(&self) -> ds_store::tracking::outbox::OutboxPolicy {
+        ds_store::tracking::outbox::OutboxPolicy {
+            max_attempts: self.outbox_max_attempts,
+            rejected_retention: Duration::from_secs(
+                self.outbox_rejected_retention_days
+                    .saturating_mul(24 * 3600),
+            ),
+        }
+    }
+
     /// Refuses a zero interval, which `tokio::time::interval` would panic
     /// on with no hint of the setting behind it.
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -161,6 +187,14 @@ impl Config {
             (
                 self.train_event_outbox_interval_secs,
                 "INGEST_WRITER_TRAIN_EVENT_OUTBOX_INTERVAL_SECS",
+            ),
+            (
+                u64::from(self.outbox_max_attempts),
+                "INGEST_WRITER_OUTBOX_MAX_ATTEMPTS",
+            ),
+            (
+                self.outbox_rejected_retention_days,
+                "INGEST_WRITER_OUTBOX_REJECTED_RETENTION_DAYS",
             ),
         ] {
             anyhow::ensure!(value > 0, "{name} must be greater than zero");
@@ -225,6 +259,11 @@ mod tests {
         let config = Config::try_parse_from(args(&[])).unwrap();
         assert!(!config.loops_enabled);
         assert!(!config.streams.any_active(), "every stream off by default");
+        // Security review L1: 5 attempts, 14 days.
+        assert_eq!(
+            config.outbox_policy(),
+            ds_store::tracking::outbox::OutboxPolicy::default()
+        );
         assert!(!config.changed_rows_only, "plan 3a.9 off by default");
         assert_eq!(config.canary_interval_secs, 60);
         // The api's defaults (crates/api/src/data/config.rs).
@@ -301,6 +340,14 @@ mod tests {
         assert_eq!(
             env("train_event_outbox_interval_secs").as_deref(),
             Some("INGEST_WRITER_TRAIN_EVENT_OUTBOX_INTERVAL_SECS")
+        );
+        assert_eq!(
+            env("outbox_max_attempts").as_deref(),
+            Some("INGEST_WRITER_OUTBOX_MAX_ATTEMPTS")
+        );
+        assert_eq!(
+            env("outbox_rejected_retention_days").as_deref(),
+            Some("INGEST_WRITER_OUTBOX_REJECTED_RETENTION_DAYS")
         );
         assert_eq!(env("metrics_port").as_deref(), Some("METRICS_PORT"));
         assert_eq!(env("streams").as_deref(), Some("INGEST_WRITER_STREAMS"));

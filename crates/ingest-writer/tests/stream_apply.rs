@@ -23,7 +23,7 @@ use ingest_stream::{
 };
 use ingest_writer::handlers::{Applied, BoxFuture, Registry, SchemaHandler, apply_rows, decode};
 use ingest_writer::observed::{Observed, guard};
-use ingest_writer::stream::{Mode, WriterHandler};
+use ingest_writer::stream::{Mode, StreamSpec, WriterHandler};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, PgPool};
 
@@ -121,6 +121,13 @@ fn snapshot_schema() -> SchemaId {
     SchemaId::new("writer-test-snapshot", 1).unwrap()
 }
 
+/// The test stream: it carries the two test schemas and nothing else.
+const TEST_STREAM: StreamSpec = StreamSpec {
+    name: "writer-test",
+    stream: "ds:ingest:writer-test",
+    schemas: &["writer-test-rows", "writer-test-snapshot"],
+};
+
 fn registry() -> Arc<Registry> {
     let mut registry = Registry::new();
     registry.register(&rows_schema(), AppendRows).unwrap();
@@ -172,10 +179,13 @@ impl Db {
         }
     }
 
+    /// The dedup key of the `writer-test-rows` entry named `name`.
     fn key(&self, name: &str) -> String {
-        format!("{}{name}", self.prefix)
+        format!("{}:{}{name}", rows_schema().name(), self.prefix)
     }
 
+    /// An entry of `schema` on [`TEST_STREAM`], keyed `<schema name>:...`
+    /// as every producer keys its entries (security review H1).
     fn entry<T: Serialize>(
         &self,
         schema: SchemaId,
@@ -183,11 +193,11 @@ impl Db {
         produced_at: DateTime<Utc>,
         payload: &T,
     ) -> StreamEntry {
+        let key = format!("{}:{}{key}", schema.name(), self.prefix);
         StreamEntry {
-            stream: "ds:ingest:writer-test".to_owned(),
+            stream: TEST_STREAM.stream.to_owned(),
             id: "1-0".to_owned(),
-            envelope: Envelope::new(schema, "test/pod", self.key(key), produced_at, payload)
-                .unwrap(),
+            envelope: Envelope::new(schema, "test/pod", key, produced_at, payload).unwrap(),
         }
     }
 
@@ -207,15 +217,17 @@ impl Db {
     }
 
     async fn dedup_keys(&self) -> Vec<String> {
-        sqlx::query_scalar("SELECT key FROM ingest_dedup WHERE key LIKE $1 || '%' ORDER BY key")
-            .bind(&self.prefix)
-            .fetch_all(&self.pool)
-            .await
-            .unwrap()
+        sqlx::query_scalar(
+            "SELECT key FROM ingest_dedup WHERE key LIKE '%:' || $1 || '%' ORDER BY key",
+        )
+        .bind(&self.prefix)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap()
     }
 
     async fn cleanup(&self) {
-        sqlx::query("DELETE FROM ingest_dedup WHERE key LIKE $1 || '%'")
+        sqlx::query("DELETE FROM ingest_dedup WHERE key LIKE '%:' || $1 || '%'")
             .bind(&self.prefix)
             .execute(&self.pool)
             .await
@@ -223,7 +235,7 @@ impl Db {
     }
 
     fn handler(&self, mode: Mode) -> WriterHandler {
-        WriterHandler::new(self.pool.clone(), registry(), mode)
+        WriterHandler::new(self.pool.clone(), registry(), TEST_STREAM, mode)
     }
 }
 
@@ -274,9 +286,15 @@ async fn an_entry_is_applied_once_with_dedup() {
         0
     );
     assert_eq!(db.dedup_keys().await.len(), 2);
+    // Aged through the owner when there is one: the writer role has no
+    // UPDATE on ingest_dedup.
+    let admin = match std::env::var("MIGRATION_DATABASE_URL") {
+        Ok(url) => PgPool::connect(&url).await.unwrap(),
+        Err(_) => db.pool.clone(),
+    };
     sqlx::query("UPDATE ingest_dedup SET applied_at = now() - interval '49 hours' WHERE key = $1")
         .bind(db.key("k1"))
-        .execute(&db.pool)
+        .execute(&admin)
         .await
         .unwrap();
     assert!(
@@ -336,6 +354,40 @@ async fn a_data_error_rejects_its_row_and_the_rest_commit() {
         Err(HandlerError::UnsupportedSchema(_))
     ));
     assert_eq!(db.dedup_keys().await, [db.key("k1")]);
+    db.cleanup().await;
+}
+
+/// Security review L2: a key is claimed per stream, so the same key on
+/// another stream is never acked as an applied duplicate. (Until the
+/// contract step drops the old primary key on `key`, it is a unique
+/// violation: poison, dead-lettered.)
+#[tokio::test]
+#[ignore = "requires a live database; run with DATABASE_URL set and --ignored"]
+async fn a_key_claimed_on_one_stream_is_no_duplicate_on_another() {
+    let db = Db::new().await;
+    let handler = db.handler(Mode::Apply);
+    let entry = db.entry(rows_schema(), "k1", Utc::now(), &[row("a", 1)]);
+    assert!(matches!(handler.handle(&entry).await, Ok(Handled::Applied)));
+    let elsewhere = StreamEntry {
+        stream: "ds:ingest:writer-test-other".to_owned(),
+        ..entry
+    };
+    let result = handler.handle(&elsewhere).await;
+    assert!(
+        matches!(&result, Ok(Handled::Applied))
+            || matches!(&result, Err(HandlerError::Poison(reason)) if reason.contains("duplicate key")),
+        "{result:?}"
+    );
+    let claims: Vec<(String, String)> =
+        sqlx::query_as("SELECT stream, key FROM ingest_dedup WHERE key = $1 ORDER BY stream")
+            .bind(db.key("k1"))
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        claims.first().map(|(stream, _)| stream.as_str()),
+        Some("ds:ingest:writer-test")
+    );
     db.cleanup().await;
 }
 

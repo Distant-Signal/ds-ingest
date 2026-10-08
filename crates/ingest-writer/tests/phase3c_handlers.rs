@@ -30,7 +30,7 @@ use common::island_of_ireland::{
 use common::{LineStatus, LineStatusReport, TocReference};
 use ingest_stream::{Envelope, Handled, Handler, HandlerError, SchemaId, StreamEntry};
 use ingest_writer::handlers::registry;
-use ingest_writer::stream::{Mode, WriterHandler};
+use ingest_writer::stream::{Mode, StreamSpec, WriterHandler};
 use serde::Serialize;
 use sqlx::PgPool;
 
@@ -48,8 +48,11 @@ fn rand_suffix() -> String {
 
 struct Db {
     pool: PgPool,
+    /// Fixture cleanup: `MIGRATION_DATABASE_URL` (the owner, under
+    /// scripts/test-postgres-roles.py) when set, since the narrow writer
+    /// role may not delete what its handlers write; else `DATABASE_URL`.
+    admin: PgPool,
     prefix: String,
-    handler: WriterHandler,
 }
 
 impl Db {
@@ -60,11 +63,18 @@ impl Db {
             .connect(&url)
             .await
             .expect("connect");
-        let handler = WriterHandler::new(pool.clone(), Arc::new(registry()), Mode::Apply);
+        let admin = match std::env::var("MIGRATION_DATABASE_URL") {
+            Ok(admin_url) => sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&admin_url)
+                .await
+                .expect("connect MIGRATION_DATABASE_URL"),
+            Err(_) => pool.clone(),
+        };
         Self {
             pool,
+            admin,
             prefix: format!("p3c-test-{}:", rand_suffix()),
-            handler,
         }
     }
 
@@ -82,7 +92,7 @@ impl Db {
             envelope: Envelope::new(
                 SchemaId::new(schema, 1).unwrap(),
                 "test/pod",
-                format!("{}{key}", self.prefix),
+                format!("{schema}:{}{key}", self.prefix),
                 produced_at,
                 payload,
             )
@@ -91,7 +101,12 @@ impl Db {
     }
 
     async fn apply(&self, entry: &StreamEntry) -> Result<Handled, HandlerError> {
-        self.handler.handle(entry).await
+        // The entry's own stream's handler, as the writer runs one per
+        // stream (security review H1: a stream applies only its schemas).
+        let spec = StreamSpec::by_stream(&entry.stream).expect("a writer stream");
+        WriterHandler::new(self.pool.clone(), Arc::new(registry()), spec, Mode::Apply)
+            .handle(entry)
+            .await
     }
 
     /// Applies `entry`, which must be [`Handled::Applied`].
@@ -126,7 +141,7 @@ impl Db {
 
     async fn cleanup(&self) {
         for sql in [
-            "DELETE FROM ingest_dedup WHERE key LIKE $1 || '%'",
+            "DELETE FROM ingest_dedup WHERE key LIKE '%:' || $1 || '%'",
             "DELETE FROM line_status_history WHERE line_id LIKE 'TEST-3C-%' AND $1 <> ''",
             "DELETE FROM line_status WHERE line_id LIKE 'TEST-3C-%' AND $1 <> ''",
             "DELETE FROM tocs WHERE atoc_code = '9Z' AND $1 <> ''",
@@ -136,7 +151,7 @@ impl Db {
         ] {
             sqlx::query(sql)
                 .bind(&self.prefix)
-                .execute(&self.pool)
+                .execute(&self.admin)
                 .await
                 .unwrap_or_else(|err| panic!("{sql}: {err}"));
         }
@@ -437,7 +452,10 @@ async fn island_of_ireland_schemas_are_applied_under_the_guard() {
     let db = Db::new().await;
     db.cleanup().await;
     db.age_freshness("island_of_ireland_stations").await;
-    let stream = "ds:ingest:island-of-ireland";
+    // Stations and lines on poller-nir-stations' stream, samples on
+    // poller-irish-rail-live's (security review H1: one stream per poller).
+    let stream = "ds:ingest:ioi-nir";
+    let live = "ds:ingest:ioi-live";
     let t0 = at_millis(Utc::now() - TimeDelta::minutes(20));
     let station = |name: &str| IslandOfIrelandStation {
         id: "TEST-3C-STN".into(),
@@ -493,10 +511,10 @@ async fn island_of_ireland_schemas_are_applied_under_the_guard() {
         polled_at,
         departures: vec![],
     };
-    let newer = db.entry(stream, "ioi-station-samples", "s-new", t0, &[sample(t0)]);
+    let newer = db.entry(live, "ioi-station-samples", "s-new", t0, &[sample(t0)]);
     db.applied(&newer).await;
     let older = db.entry(
-        stream,
+        live,
         "ioi-station-samples",
         "s-old",
         t0,
@@ -505,7 +523,7 @@ async fn island_of_ireland_schemas_are_applied_under_the_guard() {
     db.applied(&older).await;
     // A sample stamped an hour ahead is clamped to the writer's now + 2 min.
     let ahead = db.entry(
-        stream,
+        live,
         "ioi-station-samples",
         "s-ahead",
         t0,

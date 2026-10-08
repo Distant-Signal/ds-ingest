@@ -52,9 +52,12 @@ pub fn register(runner: &mut LoopRunner, config: &Config) -> Result<()> {
     ))?;
     // Plan 3b.3: trust-consumer's deferred train events (INGEST_SINK=db).
     // Always registered: an empty outbox costs one read per tick.
-    runner.register(ds_store::loops::train_event_outbox(Duration::from_secs(
-        config.train_event_outbox_interval_secs,
-    )))?;
+    // Security review L1: a row failing every tick is rejected after
+    // INGEST_WRITER_OUTBOX_MAX_ATTEMPTS, and rejected rows are pruned.
+    runner.register(ds_store::loops::train_event_outbox(
+        Duration::from_secs(config.train_event_outbox_interval_secs),
+        config.outbox_policy(),
+    ))?;
     Ok(())
 }
 
