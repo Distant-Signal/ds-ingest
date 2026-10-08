@@ -255,6 +255,35 @@ impl KafkaRawSource {
     /// `max.poll.interval.ms` in particular -- are unit-testable without a
     /// broker: `ClientConfig::set`/`get` only ever touch an in-memory map,
     /// and only `create_with_context` below actually talks to librdkafka.
+    ///
+    /// `auto.offset.reset` is `config.kafka_auto_offset_reset`, `earliest`
+    /// by default (user decision, 2026-10-08), not librdkafka's `latest`:
+    /// if the group's committed offset is ever lost, the relay replays from
+    /// the oldest message Kafka retains instead of silently skipping to new
+    /// ones. Replaying republishes messages already in `movement-events`,
+    /// and that is safe because every consumer of the stream absorbs a
+    /// duplicate by its dedup key:
+    /// - trust-consumer and trust-backlog-consumer derive the same
+    ///   `trust_schema::dedup::dedup_key` from a message's own bytes on every
+    ///   delivery (its date comes from the message, not the processing day),
+    ///   and api stores their events with
+    ///   `ON CONFLICT (trains_id, dedup_key) DO NOTHING` into
+    ///   `train_movement_events` (`ds_store::tracking::upsert_train_movement`)
+    ///   and `ON CONFLICT (dedup_key) DO NOTHING` into `trust_event_backlog`
+    ///   (`ds_store::backlog`). `train_current_state` only moves forward
+    ///   (`event_time >=` guard in the same upsert). A replayed event may
+    ///   append a `notifier_forward_queue` row, but that is only a "look at
+    ///   this train again" signal: the notifier re-reads the train's current
+    ///   state and only notifies when its severity rank rose above the last
+    ///   one notified (`notifier::decision::decide_train_notification`);
+    /// - full-coverage-consumer's per-train state is last-write-wins per
+    ///   event, not additive (its `main.rs` module docs), so a replayed
+    ///   message re-derives the same state.
+    ///
+    /// The cost is volume: a replay can be up to Kafka's retention of
+    /// messages at once, which can exceed `movement-events`' MAXLEN and so
+    /// show up downstream as a detected stream gap. That is still strictly
+    /// better than `latest`, which loses the same messages undetected.
     fn client_config(config: &Config) -> ClientConfig {
         let mut client_config = ClientConfig::new();
         client_config
@@ -266,7 +295,9 @@ impl KafkaRawSource {
             .set("sasl.password", &config.kafka.kafka_sasl_password)
             .set("enable.auto.commit", "false")
             .set("enable.auto.offset.store", "false")
-            .set("max.poll.interval.ms", MAX_POLL_INTERVAL_MS);
+            .set("max.poll.interval.ms", MAX_POLL_INTERVAL_MS)
+            // A lost group offset replays rather than skips; see above.
+            .set("auto.offset.reset", &config.kafka_auto_offset_reset);
         client_config
     }
 
@@ -553,6 +584,7 @@ fn test_config() -> Config {
             kafka_sasl_mechanism: "PLAIN".to_string(),
         },
         kafka_consumer_group: "test-group".to_string(),
+        kafka_auto_offset_reset: "earliest".to_string(),
         redis_url: "redis://localhost:6379".to_string(),
         redis_password: None,
         redis_username: None,
@@ -565,6 +597,22 @@ fn test_config() -> Config {
         movement_consumer_groups: Vec::new(),
         deadletter_max_age_secs: crate::deadletter::MAX_DEADLETTER_AGE_SECS,
     }
+}
+
+/// A lost group offset must replay from the earliest retained message, not
+/// skip to librdkafka's default `latest`; the override reaches librdkafka.
+#[test]
+fn auto_offset_reset_is_set_explicitly_from_the_config() {
+    let mut config = test_config();
+    assert_eq!(
+        KafkaRawSource::client_config(&config).get("auto.offset.reset"),
+        Some("earliest")
+    );
+    config.kafka_auto_offset_reset = "latest".to_string();
+    assert_eq!(
+        KafkaRawSource::client_config(&config).get("auto.offset.reset"),
+        Some("latest")
+    );
 }
 
 /// Regression test for the Signal Box Audit's "no poll-interval override"

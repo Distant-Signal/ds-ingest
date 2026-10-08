@@ -22,6 +22,22 @@ pub(crate) struct Config {
     #[arg(long, env)]
     pub kafka_consumer_group: String,
 
+    /// librdkafka's `auto.offset.reset`: where the relay starts reading a
+    /// partition for which `kafka_consumer_group` has no committed offset
+    /// (the broker expired the group's offsets, or they were deleted).
+    /// `earliest` (the oldest message Kafka still retains) rather than
+    /// librdkafka's default `latest`, which would silently skip everything
+    /// published while the offset was missing. Why replaying is safe: see
+    /// `kafka_source::KafkaRawSource::client_config`. `latest` is accepted
+    /// only as an operator override (e.g. to skip a very long backlog).
+    #[arg(
+        long,
+        env,
+        default_value = "earliest",
+        value_parser = clap::builder::PossibleValuesParser::new(["earliest", "latest"])
+    )]
+    pub kafka_auto_offset_reset: String,
+
     #[arg(long, env, default_value = "redis://redis:6379")]
     pub redis_url: String,
 
@@ -201,6 +217,24 @@ mod tests {
     fn stream_maxlen_is_overridable_from_the_cli() {
         let config = parse(&["--movement-stream-maxlen", "250000"]).unwrap();
         assert_eq!(config.movement_stream_maxlen, 250_000);
+    }
+
+    #[test]
+    fn auto_offset_reset_defaults_to_earliest() {
+        // Same posture as `stream_maxlen_defaults_when_unset`.
+        if std::env::var_os("KAFKA_AUTO_OFFSET_RESET").is_some() {
+            return;
+        }
+        let config = parse(&[]).expect("required args only");
+        assert_eq!(config.kafka_auto_offset_reset, "earliest");
+    }
+
+    #[test]
+    fn auto_offset_reset_is_overridable_but_only_to_earliest_or_latest() {
+        let config = parse(&["--kafka-auto-offset-reset", "latest"]).unwrap();
+        assert_eq!(config.kafka_auto_offset_reset, "latest");
+        assert!(parse(&["--kafka-auto-offset-reset", "error"]).is_err());
+        assert!(parse(&["--kafka-auto-offset-reset", ""]).is_err());
     }
 
     #[test]
