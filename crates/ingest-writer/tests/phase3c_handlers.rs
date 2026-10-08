@@ -451,7 +451,8 @@ async fn tocs_rows_are_counted_written_then_skipped() {
 async fn island_of_ireland_schemas_are_applied_under_the_guard() {
     let db = Db::new().await;
     db.cleanup().await;
-    db.age_freshness("island_of_ireland_stations").await;
+    db.age_freshness("island_of_ireland_stations_nir").await;
+    db.age_freshness("island_of_ireland_lines_nir").await;
     // Stations and lines on poller-nir-stations' stream, samples on
     // poller-irish-rail-live's (security review H1: one stream per poller).
     let stream = "ds:ingest:ioi-nir";
@@ -487,7 +488,15 @@ async fn island_of_ireland_schemas_are_applied_under_the_guard() {
     .await
     .unwrap();
     assert_eq!((name.as_str(), fetched_at), ("New", t0));
-    assert_eq!(db.freshness("island_of_ireland_stations").await, Some(t0));
+    // Its own network's marker (poller-nir-stations' feed), not GTFS's.
+    assert_eq!(
+        db.freshness("island_of_ireland_stations_nir").await,
+        Some(t0)
+    );
+    assert_ne!(
+        db.freshness("island_of_ireland_stations_gtfs").await,
+        Some(t0)
+    );
 
     let lines = [IslandOfIrelandLineDefinition {
         id: "TEST-3C-LINE".into(),
@@ -504,6 +513,7 @@ async fn island_of_ireland_schemas_are_applied_under_the_guard() {
     .await
     .unwrap();
     assert_eq!(line_fetched, t0);
+    assert_eq!(db.freshness("island_of_ireland_lines_nir").await, Some(t0));
 
     let sample = |polled_at: DateTime<Utc>| IslandOfIrelandStationSample {
         station_id: "TEST-3C-STN".into(),
@@ -544,5 +554,115 @@ async fn island_of_ireland_schemas_are_applied_under_the_guard() {
     assert_eq!(polled_at(&db).await, t0, "the older sample changed nothing");
     db.applied(&ahead).await;
     assert!(polled_at(&db).await <= Utc::now() + TimeDelta::minutes(2));
+    db.cleanup().await;
+}
+
+/// Network pinning (security review, 2026-10-08): each catalogue stream
+/// writes only its own network. An entry with a row of the other network
+/// is poison and writes nothing; a row id the other network already holds
+/// is left alone (skipped), not moved over.
+#[tokio::test]
+#[ignore = "requires a live database (DATABASE_URL)"]
+async fn island_of_ireland_catalogues_are_pinned_to_their_streams_network() {
+    let db = Db::new().await;
+    db.cleanup().await;
+    let t0 = at_millis(Utc::now() - TimeDelta::minutes(20));
+    let station = |id: &str, name: &str, network| IslandOfIrelandStation {
+        id: id.into(),
+        name: name.into(),
+        network,
+        latitude: None,
+        longitude: None,
+    };
+    let row = |db: &Db, id: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT name, network FROM island_of_ireland_stations WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let poison = |result: Result<Handled, HandlerError>| {
+        assert!(
+            matches!(&result, Err(HandlerError::Poison(reason)) if reason.starts_with("network_not_for_stream")),
+            "{result:?}"
+        );
+    };
+
+    // NIR's stream: its own row applies.
+    let nir = db.entry(
+        "ds:ingest:ioi-nir",
+        "ioi-stations",
+        "pin-nir",
+        t0,
+        &[station(
+            "TEST-3C-PIN-NI",
+            "Belfast",
+            IslandOfIrelandNetwork::NorthernIreland,
+        )],
+    );
+    db.applied(&nir).await;
+    // GTFS's stream sending a northern-ireland row: poison, nothing written
+    // (not even its own-network row in the same entry).
+    let forged = db.entry(
+        "ds:ingest:ioi-gtfs",
+        "ioi-stations",
+        "pin-forged",
+        t0,
+        &[
+            station(
+                "TEST-3C-PIN-ROI",
+                "Dublin",
+                IslandOfIrelandNetwork::RepublicOfIreland,
+            ),
+            station(
+                "TEST-3C-PIN-NI",
+                "Forged",
+                IslandOfIrelandNetwork::NorthernIreland,
+            ),
+        ],
+    );
+    poison(db.apply(&forged).await);
+    assert_eq!(row(&db, "TEST-3C-PIN-ROI").await, None);
+    // Lines on NIR's stream tagged republic-of-ireland: poison.
+    let lines = db.entry(
+        "ds:ingest:ioi-nir",
+        "ioi-lines",
+        "pin-lines",
+        t0,
+        &[IslandOfIrelandLineDefinition {
+            id: "TEST-3C-PIN-LINE".into(),
+            name: "Forged line".into(),
+            network: IslandOfIrelandNetwork::RepublicOfIreland,
+            stations: vec![],
+        }],
+    );
+    poison(db.apply(&lines).await);
+    // GTFS's stream sending its own network with NIR's id: applied, but
+    // the northern-ireland row is not taken over.
+    let takeover = db.entry(
+        "ds:ingest:ioi-gtfs",
+        "ioi-stations",
+        "pin-takeover",
+        t0 + TimeDelta::minutes(1),
+        &[station(
+            "TEST-3C-PIN-NI",
+            "Taken",
+            IslandOfIrelandNetwork::RepublicOfIreland,
+        )],
+    );
+    db.applied(&takeover).await;
+    assert_eq!(
+        row(&db, "TEST-3C-PIN-NI").await,
+        Some(("Belfast".to_owned(), "northern-ireland".to_owned()))
+    );
+    sqlx::query("DELETE FROM island_of_ireland_stations WHERE id LIKE 'TEST-3C-PIN-%'")
+        .execute(&db.admin)
+        .await
+        .unwrap();
     db.cleanup().await;
 }

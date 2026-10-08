@@ -344,6 +344,9 @@ pub struct StreamRuntime {
     /// This consumer's name in each group: the pod name.
     pub consumer: String,
     pub stall_after: Duration,
+    /// [`ConsumerConfig::unsupported_deadline`] for every stream
+    /// (`INGEST_WRITER_UNSUPPORTED_DEADLINE_SECS`).
+    pub unsupported_deadline: Option<Duration>,
 }
 
 /// The spawned stream tasks.
@@ -375,7 +378,8 @@ pub fn spawn(runtime: &StreamRuntime, modes: &StreamModes) -> RunningStreams {
         // the fallback is the spec's original dead-letter cap.
         let dead_letter_maxlen =
             budget::decl(spec.stream).map_or(10_000, budget::StreamDecl::dead_letter_maxlen);
-        let config = ConsumerConfig::new(spec.stream, &runtime.consumer, dead_letter_maxlen);
+        let mut config = ConsumerConfig::new(spec.stream, &runtime.consumer, dead_letter_maxlen);
+        config.unsupported_deadline = runtime.unsupported_deadline;
         let client = runtime.client.clone();
         let stop = stopped(shutdown.subscribe());
         let mode = *mode;

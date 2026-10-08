@@ -110,9 +110,10 @@ mod tests {
     }
 
     /// Database-gated: `DATABASE_URL`, a migrated database. The fixture row
-    /// is deleted through `MIGRATION_DATABASE_URL` (the owner, under
-    /// scripts/test-postgres-roles.py) when set: the narrow writer role may
-    /// insert and update `ingest_freshness` but not delete from it.
+    /// is written and deleted through `MIGRATION_DATABASE_URL` (the owner,
+    /// under scripts/test-postgres-roles.py) when set: the narrow writer
+    /// role may not delete from `ingest_freshness`, and may write only its
+    /// own sources (security review L4), but reads every row.
     #[tokio::test]
     #[ignore = "needs DATABASE_URL (a migrated database)"]
     async fn the_freshness_gauge_follows_the_table() {
@@ -129,7 +130,7 @@ mod tests {
              ON CONFLICT (source) DO UPDATE SET fetched_at = EXCLUDED.fetched_at",
         )
         .bind(&source)
-        .execute(&pool)
+        .execute(&admin)
         .await
         .unwrap();
         let recorder = PrometheusBuilder::new().build_recorder();

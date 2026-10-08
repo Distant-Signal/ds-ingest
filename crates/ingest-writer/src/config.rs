@@ -90,6 +90,19 @@ pub struct Config {
     #[arg(long, env = "INGEST_WRITER_CHANGED_ROWS_ONLY", default_value_t = false)]
     pub changed_rows_only: bool,
 
+    /// An entry left pending because this writer does not know its schema
+    /// version or envelope version (the producer is newer) is
+    /// dead-lettered, reason `unsupported_expired`, once it is this many
+    /// seconds old, so it cannot block its stream forever (security review
+    /// L6). 0: never (it stays pending until the writer is rolled forward).
+    /// `ingestWriter.unsupportedDeadlineSecs`.
+    #[arg(
+        long,
+        env = "INGEST_WRITER_UNSUPPORTED_DEADLINE_SECS",
+        default_value_t = 3600
+    )]
+    pub unsupported_deadline_secs: u64,
+
     /// The Redis holding the ingest streams. Required once any stream is not
     /// `off`; never carries a credential (those are `REDIS_USERNAME` and
     /// `REDIS_PASSWORD`).
@@ -149,6 +162,12 @@ pub struct Config {
 }
 
 impl Config {
+    /// [`Config::unsupported_deadline_secs`], `None` for 0 (never).
+    pub fn unsupported_deadline(&self) -> Option<Duration> {
+        (self.unsupported_deadline_secs > 0)
+            .then(|| Duration::from_secs(self.unsupported_deadline_secs))
+    }
+
     /// The train-event outbox loop's handling of rows it cannot apply.
     pub fn outbox_policy(&self) -> ds_store::tracking::outbox::OutboxPolicy {
         ds_store::tracking::outbox::OutboxPolicy {

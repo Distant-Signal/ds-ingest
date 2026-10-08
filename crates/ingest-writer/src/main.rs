@@ -161,6 +161,7 @@ fn start_streams(
         registry: Arc::new(registry),
         consumer: config.consumer_name(),
         stall_after: config.health.stall_after(),
+        unsupported_deadline: config.unsupported_deadline(),
     };
     let streams = ingest_writer::stream::spawn(&runtime, &config.streams);
     tracing::info!(
