@@ -109,13 +109,20 @@ mod tests {
         assert!((unix_seconds(at) - 1_791_460_800.25).abs() < 1e-6);
     }
 
-    /// Database-gated: `DATABASE_URL`, a migrated database.
+    /// Database-gated: `DATABASE_URL`, a migrated database. The fixture row
+    /// is deleted through `MIGRATION_DATABASE_URL` (the owner, under
+    /// scripts/test-postgres-roles.py) when set: the narrow writer role may
+    /// insert and update `ingest_freshness` but not delete from it.
     #[tokio::test]
     #[ignore = "needs DATABASE_URL (a migrated database)"]
     async fn the_freshness_gauge_follows_the_table() {
         let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
             .await
             .unwrap();
+        let admin = match std::env::var("MIGRATION_DATABASE_URL") {
+            Ok(url) => PgPool::connect(&url).await.unwrap(),
+            Err(_) => pool.clone(),
+        };
         let source = format!("telemetry-test-{}", std::process::id());
         sqlx::query(
             "INSERT INTO ingest_freshness (source, fetched_at) VALUES ($1, '2026-10-08T12:00:00Z') \
@@ -133,7 +140,7 @@ mod tests {
         };
         sqlx::query("DELETE FROM ingest_freshness WHERE source = $1")
             .bind(&source)
-            .execute(&pool)
+            .execute(&admin)
             .await
             .unwrap();
         assert!(read >= 1);
