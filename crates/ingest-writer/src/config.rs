@@ -100,6 +100,14 @@ pub struct Config {
     /// (`POD_NAME`, else `HOSTNAME`, which Kubernetes sets to it).
     #[arg(long, env = "POD_NAME")]
     pub pod_name: Option<String>,
+    /// The train-event outbox loop's interval (plan 3b.3; see
+    /// `ds_store::loops::TRAIN_EVENT_OUTBOX_DEFAULT_INTERVAL` for the 5 s).
+    #[arg(
+        long,
+        env = "INGEST_WRITER_TRAIN_EVENT_OUTBOX_INTERVAL_SECS",
+        default_value_t = 5
+    )]
+    pub train_event_outbox_interval_secs: u64,
 
     /// Port for the Prometheus `/metrics` listener (the workers' default;
     /// the chart sets it from `metrics.port`).
@@ -139,6 +147,10 @@ impl Config {
             (
                 self.corpus_crosswalk_interval_secs,
                 "INGEST_WRITER_CORPUS_CROSSWALK_INTERVAL_SECS",
+            ),
+            (
+                self.train_event_outbox_interval_secs,
+                "INGEST_WRITER_TRAIN_EVENT_OUTBOX_INTERVAL_SECS",
             ),
         ] {
             anyhow::ensure!(value > 0, "{name} must be greater than zero");
@@ -210,6 +222,7 @@ mod tests {
         assert_eq!(config.schedule_enrichment_grace_minutes, 30);
         assert_eq!(config.backlog_match_sweep_interval_secs, 300);
         assert_eq!(config.corpus_crosswalk_interval_secs, 600);
+        assert_eq!(config.train_event_outbox_interval_secs, 5);
         assert_eq!(config.metrics_port, 9091);
         assert!(config.metrics.metrics_enabled);
         assert_eq!(config.health.health_bind_url, "0.0.0.0:8090");
@@ -273,6 +286,10 @@ mod tests {
         assert_eq!(
             env("corpus_crosswalk_interval_secs").as_deref(),
             Some("INGEST_WRITER_CORPUS_CROSSWALK_INTERVAL_SECS")
+        );
+        assert_eq!(
+            env("train_event_outbox_interval_secs").as_deref(),
+            Some("INGEST_WRITER_TRAIN_EVENT_OUTBOX_INTERVAL_SECS")
         );
         assert_eq!(env("metrics_port").as_deref(), Some("METRICS_PORT"));
         assert_eq!(env("streams").as_deref(), Some("INGEST_WRITER_STREAMS"));

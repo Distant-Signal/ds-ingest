@@ -816,13 +816,20 @@ pub(crate) fn apply_stanox_crs_reload(
 /// produce duplicate notifications -- this keeps them out of the queue
 /// table in the first place, where they would otherwise scale with a
 /// popular train's subscriber count.
-pub(crate) fn build_forward_signals(
-    events: &[common::TrainMovementEventMessage],
+///
+/// Each signal carries `<trains_id>:<dedup_key>` of the event it came from
+/// (ingest architecture plan 3b.3), so the queue skips it when the same
+/// `movement-events` entry is redelivered after its write landed (a crash
+/// or a failed XACK). A redelivery batched differently may pick another
+/// event of the same train first and queue a second signal: harmless, as
+/// above.
+pub(crate) fn build_forward_signals<'a>(
+    events: impl IntoIterator<Item = &'a common::TrainMovementEventMessage>,
     trains_id_by_tracked_train_id: &HashMap<i64, i64>,
 ) -> Vec<common::TrainForwardSignalMessage> {
     let mut seen: HashSet<i64> = HashSet::new();
     events
-        .iter()
+        .into_iter()
         .filter_map(|event| {
             let trains_id = *trains_id_by_tracked_train_id.get(&event.tracked_train_id)?;
             if !seen.insert(trains_id) {
@@ -838,6 +845,7 @@ pub(crate) fn build_forward_signals(
                         .as_deref()
                         .unwrap_or("an unknown location")
                 ),
+                dedup_key: Some(format!("{trains_id}:{}", event.dedup_key)),
             })
         })
         .collect()
@@ -4116,6 +4124,8 @@ mod tests {
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].trains_id, 42);
         assert!(signals[0].event_summary.contains("WAT"));
+        // Plan 3b.3: keyed by its movement, so a redelivery queues it once.
+        assert_eq!(signals[0].dedup_key.as_deref(), Some("42:d1"));
     }
 
     /// `apply_reference_reload` must seed `trains_id_by_tracked_train_id`

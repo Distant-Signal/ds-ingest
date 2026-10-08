@@ -14,15 +14,17 @@ mod feed;
 mod matching;
 mod process;
 mod queries;
+mod sink;
 mod stanox_crs;
 
 use std::time::Duration;
 
 use clap::Parser;
-use config::{Config, MovementFeedBackend};
+use config::{Config, IngestSink, MovementFeedBackend};
 use feed::MovementFeed;
 use movement_feed::ActiveFeed;
 use movement_feed::redis_stream::RedisStreamMovementFeed;
+use sink::{ActiveSink, DbSink, HttpSink, TrainEventSink};
 
 /// Registers `trust_consumer_errors_total{operation="parse_envelope",msg_type}`
 /// at 0 for every `msg_type` a dropped envelope can carry, so the
@@ -40,17 +42,25 @@ fn register_parse_envelope_counters() {
 }
 
 /// Every `trust_consumer_errors_total` operation that is a failed call to
-/// api (not a data rejection, which is `post_rejected`), registered at 0
-/// and summed by the chart's `DistantSignalConsumerApiCallsFailing` alert
-/// (2026-10-01: ~23.6k failed tracked-trains reloads raised nothing). The
-/// chart's template lists the same operations; a test below keeps the two
-/// in step.
+/// api or a failed DB write (not a data rejection, which is
+/// `post_rejected`), registered at 0 and summed by the chart's
+/// `DistantSignalConsumerApiCallsFailing` alert (2026-10-01: ~23.6k failed
+/// tracked-trains reloads raised nothing). `db_write` is the DB sink's
+/// (ingest architecture plan 3b.4; `sink::Operations`). The chart's
+/// template lists the same operations; a test below keeps the two in step.
 const API_CALL_OPERATIONS: &[&str] = &[
     "reload_tracked_trains",
     "post_train_events",
     "reload_stanox_crs",
     "startup_reference_load",
+    "db_write",
 ];
+
+/// `pg_stat_activity.application_name` under `INGEST_SINK=db`.
+const APPLICATION_NAME: &str = "distant-signal-trust-consumer";
+/// Spec §6.6 (D1): pool 2, role limit 3. One batch is written at a time,
+/// in one transaction.
+const DEFAULT_MAX_CONNECTIONS: u32 = 2;
 
 /// Retry backoff for a failed tracked-trains reload: 1s doubling to 60s,
 /// jittered, and never longer than the reload interval itself.
@@ -73,6 +83,7 @@ async fn run() -> anyhow::Result<()> {
     common::logging::init("trust-consumer");
 
     let config = Config::parse();
+    config.validate()?;
     if config.metrics.metrics_enabled {
         common::metrics::install(config.metrics_port)?;
     }
@@ -96,6 +107,26 @@ async fn run() -> anyhow::Result<()> {
     );
     let http = common::ingest::consumer_http_client()?;
     let internal_oauth = config.internal_oauth.token_cache();
+
+    // INGEST_SINK=db (D1): Postgres and the schema gate come before the
+    // first read from the feed, so nothing is consumed that cannot be
+    // written.
+    let sink = match config.ingest_sink {
+        IngestSink::Http => ActiveSink::Http(HttpSink {
+            client: http.clone(),
+            ingest_url: config.api_ingest_url.clone(),
+            forward_signals_url: config.forward_signals_url.clone(),
+            tokens: config.internal_oauth.token_cache(),
+        }),
+        IngestSink::Db => {
+            let pool = connect_database(&config, &progress).await?;
+            tracing::info!(
+                "INGEST_SINK=db: writing train events and forward signals to Postgres directly"
+            );
+            ActiveSink::Db(DbSink { pool })
+        }
+    };
+    let operations = sink.operations();
 
     let mut feed = match config.movement_feed_backend {
         MovementFeedBackend::RedisStream => ActiveFeed::RedisStream(
@@ -163,7 +194,7 @@ async fn run() -> anyhow::Result<()> {
         common::backoff::RetrySchedule::new(reload_interval, TRACKED_TRAINS_RETRY);
     reference_reload.succeeded();
     // Consecutive failed cycles; see `CYCLE_RETRY_BACKOFF`.
-    let mut cycle_failures = common::backoff::FailureStreak::new(CYCLE_RETRY_BACKOFF);
+    let mut cycle_failures = common::backoff::FailureStreak::new(cycle_backoff(config.ingest_sink));
 
     loop {
         if reference_reload.is_due() {
@@ -227,46 +258,18 @@ async fn run() -> anyhow::Result<()> {
         }
 
         // api's Retry-After when the POST got a 503 (its database is
-        // unavailable).
+        // unavailable). Always `None` for the DB sink.
         let mut retry_after = None;
         let outcome = run_cycle(
             &mut feed,
             &reference,
             &mut state,
             &stanox_crs,
+            &operations,
             async |events| {
-                let response = queries::post_train_events(
-                    &http,
-                    &config.api_ingest_url,
-                    &internal_oauth,
-                    events,
-                )
-                .await
-                .inspect_err(|err| retry_after = common::ingest::retry_after(err))?;
-                // Forward signals only for events api actually wrote.
-                let rejected: std::collections::HashSet<usize> =
-                    response.rejected.iter().map(|row| row.index).collect();
-                let written: Vec<common::TrainMovementEventMessage> = events
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| !rejected.contains(index))
-                    .map(|(_, event)| event.clone())
-                    .collect();
-                let signals = process::build_forward_signals(
-                    &written,
-                    &reference.trains_id_by_tracked_train_id,
-                );
-                if let Err(err) = queries::post_train_forward_signals(
-                    &http,
-                    &config.forward_signals_url,
-                    &internal_oauth,
-                    &signals,
-                )
-                .await
-                {
-                    tracing::warn!(error = ?err, "failed to post train forward signals");
-                }
-                Ok(response.rejected)
+                sink.write(events, &reference.trains_id_by_tracked_train_id)
+                    .await
+                    .inspect_err(|err| retry_after = common::ingest::retry_after(err))
             },
         )
         .await;
@@ -330,6 +333,57 @@ async fn connect_redis_feed(
 /// through the six-hour 2026-10-01 Postgres outage was a POST every 2s.
 const CYCLE_RETRY_BACKOFF: common::backoff::Backoff =
     common::backoff::Backoff::new(Duration::from_secs(2), Duration::from_secs(60));
+
+/// The same wait for the DB sink: 1s doubling to 60s, jittered (spec R1,
+/// D1, plan 3b.3). A transient DB failure pauses reading; the batch stays
+/// pending in `movement-events`.
+const DB_CYCLE_RETRY_BACKOFF: common::backoff::Backoff =
+    common::backoff::Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
+
+/// The cycle backoff for `sink`.
+const fn cycle_backoff(sink: IngestSink) -> common::backoff::Backoff {
+    match sink {
+        IngestSink::Http => CYCLE_RETRY_BACKOFF,
+        IngestSink::Db => DB_CYCLE_RETRY_BACKOFF,
+    }
+}
+
+/// `INGEST_SINK=db`: waits for Postgres (INF-5), connects the pool (with
+/// the `db_pool_*` metrics) and passes the schema gate as the
+/// `trust_consumer` role (spec §12.2).
+async fn connect_database(
+    config: &Config,
+    progress: &health_http::Progress,
+) -> anyhow::Result<sqlx::PgPool> {
+    let url = config
+        .database_url
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("INGEST_SINK=db needs DATABASE_URL"))?;
+    common::startup::retry_until_ready(
+        "Postgres",
+        common::startup::CONNECT_BACKOFF,
+        Some(progress),
+        || async {
+            use sqlx::Connection;
+            sqlx::PgConnection::connect(url.expose())
+                .await?
+                .close()
+                .await
+        },
+    )
+    .await;
+    ds_store::pool::register_metrics();
+    let pool = ds_store::pool::PoolSettings::from_env(APPLICATION_NAME, DEFAULT_MAX_CONNECTIONS)?
+        .connect(url.expose())
+        .await?;
+    ds_store::schema::wait_for_schema(
+        &pool,
+        ds_store::schema::DbRole::TrustConsumer,
+        Some(progress),
+    )
+    .await?;
+    Ok(pool)
+}
 
 /// How long to wait after a cycle, if at all: a committed cycle resets the
 /// streak, a failed one waits its next backoff (honouring `retry_after`).
@@ -469,6 +523,7 @@ async fn run_cycle<F, P>(
     reference: &process::Reference,
     state: &mut process::ProcessorState,
     stanox_crs: &std::sync::RwLock<stanox_crs::StanoxCrsTable>,
+    operations: &sink::Operations,
     post: P,
 ) -> Cycle
 where
@@ -498,7 +553,7 @@ where
 
     let rejected = match post(&events).await {
         Ok(rejected) => rejected,
-        Err(err) => return post_failed(feed, state, err).await,
+        Err(err) => return post_failed(feed, state, operations, err).await,
     };
 
     // DB2-2: `api` wrote every event except these, which it refused for a
@@ -512,7 +567,7 @@ where
         let records: Vec<movement_feed::DeadLetter> = rejected
             .iter()
             .map(|row| movement_feed::DeadLetter {
-                reason: "rejected_by_api",
+                reason: operations.rejected,
                 source_id: None,
                 delivery_count: None,
                 payload: events
@@ -549,7 +604,7 @@ where
         );
         metrics::counter!(
             common::metrics::metric_name("trust_consumer_deadlettered_total"),
-            "reason" => "rejected_by_api"
+            "reason" => operations.rejected
         )
         .increment(records.len() as u64);
     }
@@ -585,6 +640,7 @@ where
 async fn post_failed<F>(
     feed: &mut F,
     state: &mut process::ProcessorState,
+    operations: &sink::Operations,
     err: anyhow::Error,
 ) -> Cycle
 where
@@ -603,10 +659,10 @@ where
         }
         return Cycle::Failed;
     }
-    tracing::error!(error = ?err, "failed to post train events; not committing this batch's offsets");
+    tracing::error!(error = ?err, "failed to write train events; not committing this batch's offsets");
     metrics::counter!(
         common::metrics::metric_name("trust_consumer_errors_total"),
-        "operation" => "post_train_events"
+        "operation" => operations.write
     )
     .increment(1);
     Cycle::Failed
@@ -675,6 +731,7 @@ mod tests {
             &reference,
             &mut state,
             &TEST_STANOX_CRS,
+            &sink::HTTP_OPERATIONS,
             async |_| Err(anyhow::anyhow!("api is down")),
         )
         .await;
@@ -699,6 +756,7 @@ mod tests {
             &reference,
             &mut state,
             &TEST_STANOX_CRS,
+            &sink::HTTP_OPERATIONS,
             async |events| {
                 assert_eq!(events.len(), 1, "the pinned train's origin departure");
                 Ok(Vec::new())
@@ -708,6 +766,46 @@ mod tests {
 
         assert_eq!(outcome, Cycle::Committed);
         assert_eq!(feed.committed_count, 1);
+    }
+
+    /// Plan 3b.3: with the DB sink the batch is `XACKed` only after the
+    /// commit, so a failed write (here Postgres unreachable) commits
+    /// nothing, dead-letters nothing, and backs off from 1 s. The
+    /// rollback of a write that failed part-way is
+    /// `sink::db_tests::a_db_failure_rolls_the_whole_batch_back`.
+    #[tokio::test]
+    async fn a_db_sink_failure_does_not_commit_the_batch() {
+        let mut feed = FakeMovementFeed::new(vec![vec![ORIGIN_DEPARTURE.to_string()]]);
+        let reference = one_pending_pin();
+        let mut state = process::ProcessorState::default();
+        let sink = DbSink {
+            pool: sqlx::postgres::PgPoolOptions::new()
+                .acquire_timeout(Duration::from_millis(500))
+                .connect_lazy("postgres://nobody:nothing@127.0.0.1:1/none")
+                .unwrap(),
+        };
+
+        let outcome = run_cycle(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            &sink.operations(),
+            async |events| {
+                assert_eq!(events.len(), 1, "the pinned train's origin departure");
+                sink.write(events, &reference.trains_id_by_tracked_train_id)
+                    .await
+            },
+        )
+        .await;
+
+        assert_eq!(outcome, Cycle::Failed);
+        assert_eq!(feed.committed_count, 0, "nothing XACKed");
+        assert!(feed.dead_lettered.is_empty());
+        assert!(feed.rejected_batches.is_empty());
+        let mut failures = common::backoff::FailureStreak::new(cycle_backoff(IngestSink::Db));
+        let wait = cycle_wait(&outcome, &mut failures, None).unwrap();
+        assert!(wait <= Duration::from_secs(1), "{wait:?}");
     }
 
     /// A cycle that saw nothing has no offset to advance, so it must not
@@ -724,6 +822,7 @@ mod tests {
             &reference,
             &mut state,
             &TEST_STANOX_CRS,
+            &sink::HTTP_OPERATIONS,
             async |_| Ok(Vec::new()),
         )
         .await;
@@ -752,6 +851,7 @@ mod tests {
                 &reference,
                 &mut state,
                 &TEST_STANOX_CRS,
+                &sink::HTTP_OPERATIONS,
                 async |_| Err(anyhow::anyhow!("api is down")),
             )
             .await;
@@ -785,6 +885,7 @@ mod tests {
             &reference,
             &mut state,
             &TEST_STANOX_CRS,
+            &sink::HTTP_OPERATIONS,
             async |events| {
                 assert!(events.is_empty(), "nothing parseable to post");
                 Ok(Vec::new())
@@ -820,6 +921,7 @@ mod tests {
             &reference,
             &mut state,
             &TEST_STANOX_CRS,
+            &sink::HTTP_OPERATIONS,
             async |_| Ok(Vec::new()),
         )
         .await;
@@ -884,6 +986,7 @@ mod tests {
                 &reference,
                 &mut state,
                 &TEST_STANOX_CRS,
+                &sink::HTTP_OPERATIONS,
                 async |_| Err(status_error(status)),
             )
             .await;
@@ -907,6 +1010,7 @@ mod tests {
             &reference,
             &mut state,
             &TEST_STANOX_CRS,
+            &sink::HTTP_OPERATIONS,
             async |_| Err(status_error(422)),
         )
         .await;
@@ -946,6 +1050,7 @@ mod tests {
             &reference,
             &mut state,
             &TEST_STANOX_CRS,
+            &sink::HTTP_OPERATIONS,
             async |_| Err(status_error(500)),
         )
         .await;
@@ -960,6 +1065,7 @@ mod tests {
             &reference,
             &mut state,
             &TEST_STANOX_CRS,
+            &sink::HTTP_OPERATIONS,
             async |events| {
                 assert_eq!(
                     events[0].resolved_train_id,
@@ -988,6 +1094,7 @@ mod tests {
             &reference,
             &mut state,
             &TEST_STANOX_CRS,
+            &sink::HTTP_OPERATIONS,
             async |events| {
                 assert_eq!(events.len(), 1);
                 Ok(vec![rejected_row(0)])
@@ -1027,6 +1134,7 @@ mod tests {
             &reference,
             &mut state,
             &TEST_STANOX_CRS,
+            &sink::HTTP_OPERATIONS,
             async |_| Ok(vec![rejected_row(0)]),
         )
         .await;
@@ -1098,6 +1206,7 @@ mod tests {
             &reference,
             &mut state,
             &TEST_STANOX_CRS,
+            &sink::HTTP_OPERATIONS,
             async |events| {
                 assert_eq!(
                     events.len(),
@@ -1143,6 +1252,7 @@ mod tests {
             &reference,
             &mut state,
             &TEST_STANOX_CRS,
+            &sink::HTTP_OPERATIONS,
             async |_| Err(anyhow::anyhow!("api is down")),
         )
         .await;
@@ -1157,6 +1267,7 @@ mod tests {
             &reference,
             &mut state,
             &TEST_STANOX_CRS,
+            &sink::HTTP_OPERATIONS,
             async |events| {
                 assert_eq!(events.len(), 1);
                 assert_eq!(
@@ -1199,6 +1310,7 @@ mod tests {
                 &reference,
                 &mut state,
                 &TEST_STANOX_CRS,
+                &sink::HTTP_OPERATIONS,
                 async |_| Ok(Vec::new())
             )
             .await,
@@ -1210,6 +1322,7 @@ mod tests {
             &reference,
             &mut state,
             &TEST_STANOX_CRS,
+            &sink::HTTP_OPERATIONS,
             async |events| {
                 assert_eq!(events.len(), 1);
                 assert_eq!(

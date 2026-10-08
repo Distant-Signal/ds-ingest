@@ -7,6 +7,7 @@
 //! | reconciliation | `RECONCILIATION_SWEEP` | [`ds_store::loops::reconciliation`] | `RECONCILIATION_SWEEP_INTERVAL_SECS` (300), grace `SCHEDULE_ENRICHMENT_GRACE_MINUTES` (30) |
 //! | backlog-match | `BACKLOG_MATCH_SWEEP` | [`ds_store::loops::backlog_match`] | `BACKLOG_MATCH_SWEEP_INTERVAL_SECS` (300) |
 //! | CORPUS crosswalk | `CORPUS_CROSSWALK` | [`ds_store::loops::corpus_crosswalk_comparing`] (the rebuild check, the freshness gauge, and the CORPUS comparison after each new delivery) | `INGEST_WRITER_CORPUS_CROSSWALK_INTERVAL_SECS` (600) |
+//! | train-event outbox | `TRAIN_EVENT_OUTBOX` | [`ds_store::loops::train_event_outbox`] | `INGEST_WRITER_TRAIN_EVENT_OUTBOX_INTERVAL_SECS` (5) |
 //! | canary | `WRITER_CANARY` | [`canary`] (`SELECT 1`) | `INGEST_WRITER_CANARY_INTERVAL_SECS` (60) |
 //!
 //! The first three are the api's loops (same functions, names and defaults
@@ -49,6 +50,11 @@ pub fn register(runner: &mut LoopRunner, config: &Config) -> Result<()> {
     runner.register(ds_store::loops::corpus_crosswalk_comparing(
         Duration::from_secs(config.corpus_crosswalk_interval_secs),
     ))?;
+    // Plan 3b.3: trust-consumer's deferred train events (INGEST_SINK=db).
+    // Always registered: an empty outbox costs one read per tick.
+    runner.register(ds_store::loops::train_event_outbox(Duration::from_secs(
+        config.train_event_outbox_interval_secs,
+    )))?;
     Ok(())
 }
 
@@ -72,7 +78,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn registers_the_canary_and_the_four_train_loops() {
+    async fn registers_the_canary_and_the_five_train_loops() {
         let lines = common::manifest_dir!().join("../../lines");
         let config = Config::try_parse_from([
             "ingest-writer",
@@ -100,6 +106,7 @@ mod tests {
                 (advisory_locks::RECONCILIATION_SWEEP, 300),
                 (advisory_locks::BACKLOG_MATCH_SWEEP, 300),
                 (advisory_locks::CORPUS_CROSSWALK, 600),
+                (advisory_locks::TRAIN_EVENT_OUTBOX, 5),
             ]
         );
     }

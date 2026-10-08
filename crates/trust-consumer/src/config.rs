@@ -20,8 +20,24 @@ pub(crate) use movement_feed::MovementFeedBackend;
 #[derive(Debug, Parser)]
 pub(crate) struct Config {
     /// The `api` crate's ingestion endpoint for train movement events.
+    /// Used only with `INGEST_SINK=http`.
     #[arg(long, env, default_value = "http://api:8080/private/train-events")]
     pub api_ingest_url: String,
+
+    /// Where each batch's train events and forward signals go (ingest
+    /// architecture plan 3b.3, decision D1): `http` (the default, today's
+    /// behaviour) POSTs them to `API_INGEST_URL` and `FORWARD_SIGNALS_URL`;
+    /// `db` writes both to Postgres directly in one transaction, as the
+    /// `trust_consumer` role. The reads (tracked trains, STANOX/CRS) stay on
+    /// the api either way until phase 4. See `sink.rs`.
+    #[arg(long, env, value_enum, default_value_t = IngestSink::Http)]
+    pub ingest_sink: IngestSink,
+
+    /// Postgres, for `INGEST_SINK=db` (required then, unused otherwise).
+    /// Pool size and timeouts come from the shared `DATABASE_*` variables
+    /// (`common::pg`); the default pool is 2 (spec §6.6, role limit 3).
+    #[arg(long, env, hide_env_values = true)]
+    pub database_url: Option<common::secret::Secret>,
 
     /// The `api` crate's endpoint listing active tracked trains.
     #[arg(long, env, default_value = "http://api:8080/private/tracked-trains")]
@@ -186,6 +202,26 @@ pub(crate) struct Config {
     pub trust_timestamp_correction_enabled: bool,
 }
 
+/// `INGEST_SINK`: see [`Config::ingest_sink`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum IngestSink {
+    #[default]
+    Http,
+    Db,
+}
+
+impl Config {
+    /// Cross-field checks clap cannot express: `db` needs a `DATABASE_URL`.
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        if self.ingest_sink == IngestSink::Db
+            && self.database_url.as_ref().is_none_or(|url| url.is_empty())
+        {
+            anyhow::bail!("INGEST_SINK=db needs DATABASE_URL");
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +293,69 @@ mod tests {
             parse("redis-stream").unwrap().movement_feed_backend,
             MovementFeedBackend::RedisStream
         );
+    }
+
+    fn parse(extra: &[&str]) -> Result<Config, clap::Error> {
+        let stanox_crs_file = common::manifest_dir!().join("../../reference-data/stanox-crs.csv");
+        let base = [
+            "trust-consumer".to_owned(),
+            "--internal-oauth-token-url".to_owned(),
+            "http://auth.example.com/token".to_owned(),
+            "--internal-oauth-client-id".to_owned(),
+            "client-id".to_owned(),
+            "--internal-oauth-username".to_owned(),
+            "svc-user".to_owned(),
+            "--internal-oauth-password".to_owned(),
+            "svc-pass".to_owned(),
+            "--stanox-crs-file".to_owned(),
+            stanox_crs_file.display().to_string(),
+        ];
+        Config::try_parse_from(
+            base.into_iter()
+                .chain(extra.iter().map(|s| (*s).to_owned())),
+        )
+    }
+
+    /// Plan 3b.3: the default is today's behaviour, POSTs to the api.
+    #[test]
+    fn the_sink_defaults_to_http_and_db_needs_a_database_url() {
+        // `--database-url ""`: the test environment may set DATABASE_URL.
+        let config = parse(&["--database-url", ""]).unwrap();
+        assert_eq!(config.ingest_sink, IngestSink::Http);
+        config.validate().unwrap();
+
+        let db = parse(&["--ingest-sink", "db", "--database-url", ""]).unwrap();
+        assert!(db.validate().is_err(), "db without DATABASE_URL");
+
+        let db = parse(&[
+            "--ingest-sink",
+            "db",
+            "--database-url",
+            "postgres://distant_signal_trust_consumer:pw@postgres/ds",
+        ])
+        .unwrap();
+        assert_eq!(db.ingest_sink, IngestSink::Db);
+        db.validate().unwrap();
+        assert!(
+            !format!("{db:?}").contains(":pw@"),
+            "the database URL must not appear in Debug output"
+        );
+        assert!(parse(&["--ingest-sink", "stream"]).is_err());
+    }
+
+    /// The chart sets these names (templates/trust-consumer-deployment.yaml).
+    #[test]
+    fn the_new_settings_read_the_chart_s_env_names() {
+        use clap::CommandFactory;
+        let command = Config::command();
+        let env = |id: &str| {
+            command
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .and_then(|arg| arg.get_env())
+                .map(|env| env.to_string_lossy().into_owned())
+        };
+        assert_eq!(env("ingest_sink").as_deref(), Some("INGEST_SINK"));
+        assert_eq!(env("database_url").as_deref(), Some("DATABASE_URL"));
     }
 }
