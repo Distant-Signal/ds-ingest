@@ -7,8 +7,13 @@ This runbook prepares phase 5 of
 `dc2b4405`. File and line references are to that commit.
 
 **Phase 5 code starts only once every producer runs off `/private` in
-production** (user decision). Nothing in this document is built yet. It
-lists, for each step:
+production** (user decision). The phase 5 steps themselves are not built.
+The prep that changes no default is (batch 53, 2026-10-08): 5.1's
+`API_PRIVATE_ROUTES` fallback (routes stay on), Q1's dual-prefix alert
+rules, 5.4b's new backfill entry points (the api binaries stay, deprecated),
+Q3's enricher column target in `db-grants.yaml` (the enricher stays
+`observed`) and 5.3b's opt-in `docker-compose.direct.yml`; each section
+marks its part **Built** or **Prepared**. It lists, for each step:
 
 - the evidence needed to start;
 - what to delete, file by file;
@@ -16,8 +21,9 @@ lists, for each step:
 - the checks and the rollback.
 
 On 2026-10-08 every phase 1–4 switch is built and still **off** in
-production, except phase 1B (migrate Job, writer loops, api-maintenance),
-which is live. Every producer still calls `/private` today (§1.2).
+production, except phase 1B (migrate Job, writer loops, api-maintenance)
+and schedule-reference on its `db` sink (2a, with its per-service
+connect), which are live. Every producer still calls `/private` today (§1.2).
 
 Agents only read production. Every flip and every Ranma-Config change below
 is made by the user or by Ranma.
@@ -259,7 +265,8 @@ Order: **5.1 → 7-day soak → 5.2 + 5.3 (+ 5.3b) → 5.4 → 5.4b → 5.5 →
 
 ### 5.1 `API_PRIVATE_ROUTES` and the 7-day soak
 
-**Built (2026-10-08, off by default).** `crates/api/src/private_retired.rs`
+**Built (2026-10-08); the retirement is off by default** (`API_PRIVATE_ROUTES`
+defaults to `true`, so `/private` is served as before). `crates/api/src/private_retired.rs`
 reads `API_PRIVATE_ROUTES` (unset or `true`: unchanged). With `false`,
 `/private` nests a fallback that answers `404
 {"error":"private_routes_retired"}`, counts
@@ -671,6 +678,10 @@ stay, deprecated.**
 | `replay_uidless_movements` | `writer-maintenance replay-uidless-movements [--since]` | ingest-writer | `DATABASE_URL`: the writer role | `ds_store::backlog::replay_uidless_backlog` |
 | `backfill_incident_lines` | `writer-maintenance backfill-incident-lines` | ingest-writer | `DATABASE_URL`: the **`incidents` role** (it holds `UPDATE` on `incidents`; the writer does not, and no grant was added) | `ds_store::incidents::line_backfill` (moved from `api::data`) |
 
+Each retries its first connection like the one-shot Jobs
+(`common::startup::retry_until_ready_within`): the `ds-migrate` backfills
+for up to `MIGRATION_CONNECT_DEADLINE_SECS`, `writer-maintenance` for up to
+`BACKFILL_CONNECT_DEADLINE_SECS` (both default 120 s).
 Every new entry point refuses to run as `distant_signal_api`
 (`ds_store::maintenance::refuse_api_role`); `backfill-incident-lines` also
 checks `SELECT` on `incidents` and `stations` and `UPDATE (affected_lines)`
