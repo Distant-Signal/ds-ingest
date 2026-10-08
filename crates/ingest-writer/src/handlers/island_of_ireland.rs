@@ -13,6 +13,9 @@
 //! a station sample's is its own `polled_at`, clamped to the writer's
 //! `now() + 2 min` ([`Observed::observed_at`]). Each upsert guards on that
 //! time, so an older snapshot never overwrites a newer one.
+//!
+//! Rows are counted as the snapshot handlers count them; an unchanged or
+//! older row is `skipped`.
 
 use common::island_of_ireland::{
     IslandOfIrelandLineDefinition, IslandOfIrelandStation, IslandOfIrelandStationSample,
@@ -21,7 +24,9 @@ use ds_store::samples::island_of_ireland as store;
 use ingest_stream::{HandlerError, StreamEntry};
 use sqlx::PgConnection;
 
-use super::{Applied, BoxFuture, SchemaHandler, classify_anyhow, decode};
+use super::{
+    Applied, BoxFuture, SchemaHandler, classify_anyhow, count_apply, count_shadow, decode,
+};
 use crate::observed::Observed;
 
 /// `ioi-stations/1`.
@@ -29,7 +34,9 @@ pub struct Stations;
 
 impl SchemaHandler for Stations {
     fn check(&self, entry: &StreamEntry) -> Result<(), HandlerError> {
-        decode::<Vec<IslandOfIrelandStation>>(entry).map(|_| ())
+        let stations: Vec<IslandOfIrelandStation> = decode(entry)?;
+        count_shadow(entry, stations.len());
+        Ok(())
     }
 
     fn apply<'a>(
@@ -40,9 +47,10 @@ impl SchemaHandler for Stations {
     ) -> BoxFuture<'a, Result<Applied, HandlerError>> {
         Box::pin(async move {
             let stations: Vec<IslandOfIrelandStation> = decode(entry)?;
-            store::upsert_stations_observed(conn, &stations, observed.produced_at())
+            let written = store::upsert_stations_observed(conn, &stations, observed.produced_at())
                 .await
                 .map_err(|err| classify_anyhow(&err))?;
+            count_apply(entry, stations.len(), written);
             Ok(Applied::All)
         })
     }
@@ -53,7 +61,9 @@ pub struct Lines;
 
 impl SchemaHandler for Lines {
     fn check(&self, entry: &StreamEntry) -> Result<(), HandlerError> {
-        decode::<Vec<IslandOfIrelandLineDefinition>>(entry).map(|_| ())
+        let lines: Vec<IslandOfIrelandLineDefinition> = decode(entry)?;
+        count_shadow(entry, lines.len());
+        Ok(())
     }
 
     fn apply<'a>(
@@ -64,9 +74,10 @@ impl SchemaHandler for Lines {
     ) -> BoxFuture<'a, Result<Applied, HandlerError>> {
         Box::pin(async move {
             let lines: Vec<IslandOfIrelandLineDefinition> = decode(entry)?;
-            store::upsert_lines_observed(conn, &lines, observed.produced_at())
+            let written = store::upsert_lines_observed(conn, &lines, observed.produced_at())
                 .await
                 .map_err(|err| classify_anyhow(&err))?;
+            count_apply(entry, lines.len(), written);
             Ok(Applied::All)
         })
     }
@@ -77,7 +88,9 @@ pub struct StationSamples;
 
 impl SchemaHandler for StationSamples {
     fn check(&self, entry: &StreamEntry) -> Result<(), HandlerError> {
-        decode::<Vec<IslandOfIrelandStationSample>>(entry).map(|_| ())
+        let samples: Vec<IslandOfIrelandStationSample> = decode(entry)?;
+        count_shadow(entry, samples.len());
+        Ok(())
     }
 
     fn apply<'a>(
@@ -91,9 +104,10 @@ impl SchemaHandler for StationSamples {
             for sample in &mut samples {
                 sample.polled_at = observed.observed_at(Some(sample.polled_at));
             }
-            store::upsert_station_samples_observed(conn, &samples)
+            let written = store::upsert_station_samples_observed(conn, &samples)
                 .await
                 .map_err(|err| classify_anyhow(&err))?;
+            count_apply(entry, samples.len(), written);
             Ok(Applied::All)
         })
     }

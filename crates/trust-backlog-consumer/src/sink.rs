@@ -108,6 +108,33 @@ impl BacklogSink for HttpSink {
     }
 }
 
+/// [`DbSink`]'s `db_writes_total{operation}` (`ds_store::writes`) for a
+/// backlog batch: `ok` once committed (rows refused for a data error
+/// included: the rest landed), else its failure class.
+pub(crate) const DB_WRITE_BACKLOG: &str = "trust_event_backlog";
+/// As [`DB_WRITE_BACKLOG`], for a batch's reason codes.
+pub(crate) const DB_WRITE_REASONS: &str = "train_reasons";
+
+/// Registers both operations' `db_writes_total` series at 0.
+pub(crate) fn register_db_write_metrics() {
+    ds_store::writes::register(&[DB_WRITE_BACKLOG, DB_WRITE_REASONS]);
+}
+
+/// Runs `write`, recording it as one `operation` write.
+async fn recorded<T>(
+    operation: &'static str,
+    write: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    let started = std::time::Instant::now();
+    let result = write.await;
+    ds_store::writes::record(
+        operation,
+        result.as_ref().err().map(ds_store::writes::classify),
+        started.elapsed(),
+    );
+    result
+}
+
 /// `INGEST_SINK=db`: straight into Postgres, as the `trust_backlog` role.
 pub(crate) struct DbSink {
     pub pool: PgPool,
@@ -124,8 +151,11 @@ impl BacklogSink for DbSink {
         if reasons.is_empty() {
             return Ok(());
         }
-        ds_store::backlog::reasons::upsert_reasons(&self.pool, reasons).await?;
-        Ok(())
+        recorded(DB_WRITE_REASONS, async {
+            ds_store::backlog::reasons::upsert_reasons(&self.pool, reasons).await?;
+            Ok(())
+        })
+        .await
     }
 
     async fn write_backlog(
@@ -135,7 +165,11 @@ impl BacklogSink for DbSink {
         if events.is_empty() {
             return Ok(TrustBacklogIngestResponse::default());
         }
-        let outcome = ds_store::backlog::ingest_trust_event_backlog(&self.pool, events).await?;
+        let outcome = recorded(
+            DB_WRITE_BACKLOG,
+            ds_store::backlog::ingest_trust_event_backlog(&self.pool, events),
+        )
+        .await?;
         Ok(TrustBacklogIngestResponse {
             upserted: outcome.inserted,
             rejected: outcome.rejected,

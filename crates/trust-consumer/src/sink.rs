@@ -155,6 +155,16 @@ impl TrainEventSink for HttpSink {
     }
 }
 
+/// [`DbSink`]'s `db_writes_total{operation}` (`ds_store::writes`): one per
+/// batch transaction, `ok` once committed (rows refused for a data error
+/// included: the rest landed), else its failure class.
+pub(crate) const DB_WRITE_OPERATION: &str = "train_events";
+
+/// Registers [`DB_WRITE_OPERATION`]'s `db_writes_total` series at 0.
+pub(crate) fn register_db_write_metrics() {
+    ds_store::writes::register(&[DB_WRITE_OPERATION]);
+}
+
 /// `INGEST_SINK=db`: straight into Postgres, as the `trust_consumer` role
 /// (D1). The events and their forward signals go in one transaction.
 pub(crate) struct DbSink {
@@ -174,13 +184,27 @@ impl TrainEventSink for DbSink {
         if events.is_empty() {
             return Ok(Vec::new());
         }
-        let mut tx = self.pool.begin().await?;
-        let outcome =
-            ds_store::tracking::outbox::write_train_events_deferring(&mut tx, events, |kept| {
-                process::build_forward_signals(kept.iter().copied(), trains_id_by_tracked_train_id)
-            })
-            .await?;
-        tx.commit().await?;
+        let started = std::time::Instant::now();
+        let result: anyhow::Result<_> = async {
+            let mut tx = ds_store::pool::begin(&self.pool).await?;
+            let outcome =
+                ds_store::tracking::outbox::write_train_events_deferring(&mut tx, events, |kept| {
+                    process::build_forward_signals(
+                        kept.iter().copied(),
+                        trains_id_by_tracked_train_id,
+                    )
+                })
+                .await?;
+            tx.commit().await?;
+            Ok(outcome)
+        }
+        .await;
+        ds_store::writes::record(
+            DB_WRITE_OPERATION,
+            result.as_ref().err().map(ds_store::writes::classify),
+            started.elapsed(),
+        );
+        let outcome = result?;
         let rejected = outcome.written.rejected;
         for row in &rejected {
             // As `post_train_events` logs each one.

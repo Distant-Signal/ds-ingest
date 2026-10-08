@@ -36,7 +36,18 @@ async fn run() -> anyhow::Result<()> {
 
     if config.metrics.metrics_enabled {
         common::metrics::install(config.metrics_port)?;
+        ds_store::pool::register_metrics();
+        // Every outcome at 0, so DistantSignalTrainEventOutboxRejected's
+        // increase() sees the first rejection.
+        for outcome in ["applied", "rejected"] {
+            metrics::counter!(
+                common::metrics::metric_name(ds_store::tracking::outbox::OUTBOX_METRIC),
+                "outcome" => outcome
+            )
+            .increment(0);
+        }
     }
+    ingest_writer::telemetry::export_stream_modes(&config.streams);
 
     let (ready, progress) = health_http::spawn_worker(&config.health);
     // INF-5: wait for Postgres instead of exiting into CrashLoopBackOff.
@@ -54,7 +65,8 @@ async fn run() -> anyhow::Result<()> {
         },
     )
     .await;
-    let pool = common::pg::PoolSettings::from_env(APPLICATION_NAME, DEFAULT_MAX_CONNECTIONS)?
+    // ds_store's PoolSettings: common::pg's, plus the db_pool_* metrics.
+    let pool = ds_store::pool::PoolSettings::from_env(APPLICATION_NAME, DEFAULT_MAX_CONNECTIONS)?
         .connect(config.database_url.expose())
         .await?;
     // The schema gate (spec §12.2, plan 1B.2): before readiness and before
@@ -62,6 +74,8 @@ async fn run() -> anyhow::Result<()> {
     ds_store::schema::wait_for_schema(&pool, ds_store::schema::DbRole::Writer, Some(&progress))
         .await?;
     ready.store(true, Ordering::Relaxed);
+    // Every replica, outside the loop locks: it only reads.
+    tokio::spawn(ingest_writer::telemetry::freshness_loop(pool.clone()));
     tracing::info!(
         lines = config.lines.len(),
         loops_enabled = config.loops_enabled,

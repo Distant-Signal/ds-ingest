@@ -367,6 +367,68 @@ async fn tocs_are_applied_once_with_freshness_at_produced_at() {
     db.cleanup().await;
 }
 
+/// The 3c handlers count their rows as the snapshot handlers do (the
+/// rollout's compare step and `DistantSignalIngestApplyWritesNothing`):
+/// `ingest_stream_rows_total{mode="apply"}` for every row, and of those,
+/// `row_writes_total` `written` for a changed TOC and `skipped` for an
+/// unchanged one.
+#[tokio::test]
+#[ignore = "requires a live database (DATABASE_URL)"]
+async fn tocs_rows_are_counted_written_then_skipped() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics = recorder.handle();
+    let installed = metrics::set_global_recorder(recorder).is_ok();
+
+    let db = Db::new().await;
+    db.cleanup().await;
+    let tocs = vec![TocReference {
+        atoc_code: "9Z".into(),
+        name: "Test 3c Trains".into(),
+        legal_name: "Test 3c Trains Ltd".into(),
+        atoc_member: Some(true),
+        station_operator: None,
+    }];
+    let produced_at = at_millis(Utc::now() - TimeDelta::minutes(30));
+    let stream = "ds:ingest:reference";
+    db.applied(&db.entry(stream, "tocs", "count-1", produced_at, &tocs))
+        .await;
+    db.applied(&db.entry(stream, "tocs", "count-2", produced_at, &tocs))
+        .await;
+    db.cleanup().await;
+    if !installed {
+        // Another test in this process installed the global recorder
+        // first; the counts are not ours to read.
+        return;
+    }
+    let rendered = metrics.render();
+    let value = |series: &str| -> u64 {
+        rendered
+            .lines()
+            .find(|line| line.starts_with(series))
+            .and_then(|line| line.rsplit(' ').next()?.parse().ok())
+            .unwrap_or_else(|| panic!("{series} missing from {rendered}"))
+    };
+    let labels = r#"stream="ds:ingest:reference",schema="tocs""#;
+    assert_eq!(
+        value(&format!(
+            r#"distant_signal_ingest_stream_rows_total{{{labels},mode="apply"}}"#
+        )),
+        2
+    );
+    assert_eq!(
+        value(&format!(
+            r#"distant_signal_ingest_stream_row_writes_total{{{labels},outcome="written"}}"#
+        )),
+        1
+    );
+    assert_eq!(
+        value(&format!(
+            r#"distant_signal_ingest_stream_row_writes_total{{{labels},outcome="skipped"}}"#
+        )),
+        1
+    );
+}
+
 /// The three island-of-Ireland schemas: written, stamped with the observed
 /// time, and an older sample never overwrites a newer one.
 #[tokio::test]

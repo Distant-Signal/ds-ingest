@@ -61,6 +61,7 @@ async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     common::logging::init("trust-backlog-consumer");
     let config = Config::parse();
+    common::metrics::ingest_sink_info(&common::metrics::value_enum_name(&config.ingest_sink));
     config.validate()?;
     if config.metrics.metrics_enabled {
         common::metrics::install(config.metrics_port)?;
@@ -158,6 +159,7 @@ async fn run() -> anyhow::Result<()> {
         }
         Some(pool) => {
             tracing::info!("INGEST_SINK=db: writing the TRUST backlog to Postgres directly");
+            sink::register_db_write_metrics();
             consume(&config, &crs_index, &mut feed, &progress, &DbSink { pool }).await
         }
     }

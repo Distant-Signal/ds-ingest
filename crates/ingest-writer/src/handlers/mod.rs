@@ -254,6 +254,30 @@ pub fn decode<T: serde::de::DeserializeOwned>(entry: &StreamEntry) -> Result<T, 
     })
 }
 
+/// Counts a checked (`shadow`) entry's `rows` in
+/// `ingest_stream_rows_total`, as the snapshot handlers do, so the
+/// rollout's compare step (`distant_signal:ingest_stream_rows_vs_http:ratio`)
+/// covers every schema.
+pub fn count_shadow(entry: &StreamEntry, rows: usize) {
+    ingest_stream::metrics::rows(&entry.stream, entry.envelope.schema.name(), "shadow", rows);
+}
+
+/// Counts an applied entry's `rows` in `ingest_stream_rows_total{mode="apply"}`
+/// and, of those, the `written` ones (the rest `skipped`: unchanged, or
+/// older than the stored row) in `ingest_stream_row_writes_total`.
+pub fn count_apply(entry: &StreamEntry, rows: usize, written: u64) {
+    let schema = entry.envelope.schema.name();
+    ingest_stream::metrics::rows(&entry.stream, schema, "apply", rows);
+    ingest_stream::metrics::row_writes(
+        &entry.stream,
+        schema,
+        written,
+        u64::try_from(rows)
+            .unwrap_or(u64::MAX)
+            .saturating_sub(written),
+    );
+}
+
 /// The rows [`apply_rows`] wrote and the ones it refused, with the
 /// database's message for each.
 #[derive(Debug)]

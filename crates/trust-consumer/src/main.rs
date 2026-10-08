@@ -84,6 +84,16 @@ async fn run() -> anyhow::Result<()> {
     common::logging::init("trust-consumer");
 
     let config = Config::parse();
+    common::metrics::ingest_sink_info(&common::metrics::value_enum_name(&config.ingest_sink));
+    for (read, source) in [
+        ("tracked_trains", config.reads.tracked_trains_source),
+        ("stanox_crs", config.reads.stanox_crs_source),
+    ] {
+        common::metrics::internal_reads_source_info(
+            read,
+            &common::metrics::value_enum_name(&source),
+        );
+    }
     config.validate()?;
     if config.metrics.metrics_enabled {
         common::metrics::install(config.metrics_port)?;
@@ -138,6 +148,7 @@ async fn run() -> anyhow::Result<()> {
             tracing::info!(
                 "INGEST_SINK=db: writing train events and forward signals to Postgres directly"
             );
+            sink::register_db_write_metrics();
             ActiveSink::Db(DbSink { pool })
         }
     };

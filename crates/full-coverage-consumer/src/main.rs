@@ -116,6 +116,16 @@ async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     common::logging::init("full-coverage-consumer");
     let config = Config::parse();
+    common::metrics::ingest_sink_info(&config.ingest_sink.to_string());
+    for (read, source) in [
+        ("population", config.reads.population_source),
+        ("stanox_crs", config.reads.stanox_crs_source),
+    ] {
+        common::metrics::internal_reads_source_info(
+            read,
+            &common::metrics::value_enum_name(&source),
+        );
+    }
     config.reads.validate()?;
     if config.metrics.metrics_enabled {
         common::metrics::install(config.metrics_port)?;

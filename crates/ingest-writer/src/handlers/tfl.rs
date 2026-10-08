@@ -13,12 +13,18 @@
 //! The prune of lines that left the feed runs only for a whole snapshot (no
 //! `batch`, or `parts == 1`): one part of a split snapshot does not list
 //! every line. poller-tfl never splits (about 20 lines).
+//!
+//! Rows are counted as the snapshot handlers count them
+//! (`ingest_stream_rows_total{mode}`, and `ingest_stream_row_writes_total`
+//! with the guard's refusals as `skipped`).
 
 use common::LineStatusReport;
 use ingest_stream::{HandlerError, StreamEntry};
 use sqlx::PgConnection;
 
-use super::{Applied, BoxFuture, SchemaHandler, classify_anyhow, decode};
+use super::{
+    Applied, BoxFuture, SchemaHandler, classify_anyhow, count_apply, count_shadow, decode,
+};
 use crate::observed::Observed;
 
 /// The `tfl-line-status/1` handler.
@@ -26,7 +32,9 @@ pub struct TflLineStatus;
 
 impl SchemaHandler for TflLineStatus {
     fn check(&self, entry: &StreamEntry) -> Result<(), HandlerError> {
-        decode::<Vec<LineStatusReport>>(entry).map(|_| ())
+        let reports: Vec<LineStatusReport> = decode(entry)?;
+        count_shadow(entry, reports.len());
+        Ok(())
     }
 
     fn apply<'a>(
@@ -56,6 +64,7 @@ impl SchemaHandler for TflLineStatus {
             )
             .await
             .map_err(|err| classify_anyhow(&err))?;
+            count_apply(entry, reports.len(), applied.written);
             tracing::debug!(
                 key = %entry.envelope.key,
                 written = applied.written,

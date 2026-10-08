@@ -32,7 +32,9 @@ ds-store = { path = "../ds-store" }
 health-http = { path = "../health-http" }
 # The stream consumer runtime (plan 3a.3's Redis half, spec §7.7).
 ingest-stream = { path = "../ingest-stream" }
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+# The writer's own gauges (`telemetry`: ingest_freshness).
+metrics = "0.24"
+redis ={ version = "0.27", features = ["tokio-comp", "connection-manager"] }
 serde = { version = "1.0.228", features = ["derive"] }
 # `raw_value`: the payload of rejected rows for the dead-letter stream.
 serde_json = { version = "1.0.149", features = ["raw_value"] }
@@ -41,8 +43,7 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "
 tracing = "0.1.44"
 
 [dev-dependencies]
-# The clamp counter's unit test reads a local recorder.
-metrics = "0.24"
+# The clamp counter's and the gauges' unit tests read a local recorder.
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 [lints]
