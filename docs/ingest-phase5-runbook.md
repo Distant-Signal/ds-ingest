@@ -25,6 +25,12 @@ production, except phase 1B (migrate Job, writer loops, api-maintenance)
 and schedule-reference on its `db` sink (2a, with its per-service
 connect), which are live. Every producer still calls `/private` today (§1.2).
 
+**2026-10-09: release A.** The user replaced the per-producer flips with
+one chart release that puts every producer on its new sink by default,
+3–5 days to settle, then release B (this phase) deleting `/private`, the
+HTTP sinks and the old ingest roles together. Release A is built and held
+until Ranma's Redis ACL rollout is done: [§0](#0-release-a-every-producer-on-its-new-sink).
+
 Agents only read production. Every flip and every Ranma-Config change below
 is made by the user or by Ranma.
 
@@ -34,11 +40,241 @@ caller-less routes (Q9) have been deleted ahead of phase 5 (§1.1).
 
 ## Contents
 
+0. [Release A: every producer on its new sink](#0-release-a-every-producer-on-its-new-sink)
 1. [Entry criteria and the `/private` inventory](#1-entry-criteria-and-the-private-inventory)
 2. [Steps 5.1–5.7](#2-steps-5157)
 3. [The api's Redis client (5.4)](#3-the-apis-redis-client-54)
 4. [Final grants (5.5) and NetworkPolicies (5.6)](#4-final-grants-55-and-networkpolicies-56)
 5. [Risks and decisions](#5-risks-and-decisions)
+
+## 0. Release A: every producer on its new sink
+
+**Built 2026-10-09, held.** The user decided on 2026-10-09 to replace
+the one-producer-per-release flips and the per-stream 3-day shadow with
+three steps:
+
+1. **Release A** (this section): the chart defaults move every producer to
+   its new sink in one release.
+2. **3–5 days to settle.** The rollback is `sink: http` per producer.
+3. **Release B** (phase 5): delete the `/private` routes, the producers'
+   HTTP sink code and the old ingest roles together. Not built yet; it
+   replaces the 14-day entry rule and the separate steps 5.1–5.3 below,
+   which predate the decision.
+
+Release A ships only after Ranma's Redis ACL rollout (prerequisites
+below). Agents only build it; the user or Ranma deploys it.
+
+### 0.1 What changes
+
+| Producer | Value | Before (default; prod 2026-10-09) | After (default) | Writes through |
+|---|---|---|---|---|
+| poller-stations | `pollers.stations.ingest.sink` | `http` | `db` | `distant_signal_stations` |
+| poller-incidents | `pollers.incidents.ingest.sink` | `http` | `db` | `distant_signal_incidents`; `incident-text-changed` as Redis user `poller-incidents` |
+| trust-backlog-consumer | `trustBacklogConsumer.ingest.sink` | `http` | `db` | `distant_signal_trust_backlog` |
+| trust-consumer | `trustConsumer.ingest.sink` | `http` | `db` | `distant_signal_trust_consumer` (subscription changes via the writer's `train_event_outbox` loop) |
+| schedule-ingest (feed markers, CORPUS) | `scheduleFeed.ingest.sink` | `http` | `db` | `distant_signal_schedule_ingest` |
+| schedule-reference | `scheduleFeed.reference.ingest.sink` | `http` (prod: `db` since 2026-10-08) | `db` | `distant_signal_schedule_reference` |
+| poller-ldbws | `pollers.ldbws.ingest.sink` | `http` | `stream` | `ds:ingest:station-samples` |
+| poller-tfl | `pollers.tfl.ingest.sink` | `http` | `stream` | `ds:ingest:tfl` |
+| poller-tocs | `pollers.tocs.ingest.sink` | `http` | `stream` | `ds:ingest:reference` (D8) |
+| full-coverage-consumer | `fullCoverageConsumer.ingest.sink` | `http` | `stream` | `ds:ingest:full-coverage` |
+| ingest-writer | `ingestWriter.streams.<station-samples\|full-coverage\|tfl\|reference>` | `off` | `apply` | the writer applies the four streams |
+| ingest-writer | `postgresql.roles.perService.writer.connect` | `false` | `true` | `distant_signal_writer` instead of `distant_signal_app` (M4: `tfl: apply` needs it; approved 2026-10-09) |
+| full-coverage-consumer (reads) | `fullCoverageConsumer.internalReads.source` | `http` | `db` | `distant_signal_full_coverage_ro` (populations, STANOX/CRS) |
+| trust-consumer (reads) | `trustConsumer.internalReads.source` | `http` | `db` | `distant_signal_trust_consumer`, the sink's role and pool (plan 4.4) |
+| poller-ldbws (reads) | `pollers.ldbws.internalReads.source` | `http` | `db` | `distant_signal_ldbws_ro` (the sample-station views) |
+
+`postgresql.roles.perService.<stations|incidents|trust_backlog|trust_consumer|schedule_ingest|schedule_reference|full_coverage_ro|ldbws_ro>.connect`
+also default to `true`. A `connect` whose component does not use the role
+(disabled, or back on `http`) is now a no-op instead of a render failure,
+so neither a rollback nor a deployer without that producer needs to touch
+it. A component that does use its role still connects only as that role
+(H2), and `connect` then still needs `postgresql.roles.enabled`,
+`setupJob.enabled` and `perService.enabled`.
+
+The island-of-Ireland pollers are unchanged: stream-only and disabled
+(D8), with `ingestWriter.streams.ioi-*` `off`.
+
+`redis.acl.defaultUser: "off"` no longer needs a user for a client whose
+workload is not deployed (a disabled poller, movement-relay or
+ingest-writer). On the chart before release A, step 4 of
+`docs/redis-acl.md` also needs `clients.pollerIrishRailGtfs`,
+`pollerIrishRailLive` and `pollerNirStations` set to `true` although those
+pollers have no pods; setting them is harmless.
+
+**The internal reads are in release A too** (approved 2026-10-09): the
+phase 4 readers' `internalReads.source: db` takes the last `/private` GETs
+(`/schedule-line-population`, `/tracked-trains`, `/sample-stations`,
+`/stanox-crs`; §1.2, about 1.4M requests a week) off the api, so after
+release A no producer or reader calls `/private`.
+
+### 0.2 Prerequisites in production
+
+Release A's defaults fail the render, with one message listing what is
+missing (`templates/zz-ingest-sink-preflight.yaml`), until all of these
+hold:
+
+1. **Redis ACL steps 1–4 are done** (`docs/redis-acl.md`): `enabled`,
+   `existingSecret`, `stage: narrow`, `defaultUser: "off"`, and every
+   deployed client on its own user. Besides today's six clients that
+   includes `ingestWriter`, `pollerIncidents`, `pollerLdbws`, `pollerTfl`
+   and `pollerTocs`: on `http` those pods do not connect to Redis, so
+   their flags change nothing before release A. Their `<user>-password`
+   keys must be in the users Secret (the Redis pod needs every key from
+   step 1 anyway).
+2. **24 hours of a clean `ACL LOG` after step 4**:
+   ```sh
+   kubectl -n distant-signal exec deploy/distant-signal-redis -- \
+     redis-cli --user ds-admin ACL LOG 50
+   ```
+   empty, and no `NOPERM`, `NOAUTH` or `WRONGPASS` in any client's logs.
+   `CLIENT LIST` shows no `user=default`.
+3. **Postgres** (in place on 2026-10-09): `postgresql.roles.enabled`,
+   `setupJob.enabled`, `perService.enabled`, an `existingSecret` for every
+   per-service role (writer, schedule_ingest, schedule_reference,
+   stations, incidents, trust_backlog, trust_consumer, full_coverage_ro
+   and ldbws_ro included), and `max_connections: 200`. With release A's connects
+   the role limits render within the budget (spec §6.6).
+4. **The ingest-writer with its loops** (in place since 1B): stations'
+   `db` sink needs the CORPUS crosswalk loop, trust-consumer's needs the
+   `train_event_outbox` loop, and schedule-ingest's CORPUS gauge and
+   comparison come from the writer.
+5. **The notifier's `lineHistoryMaxAgeSeconds`** (3c.4, chart default 900)
+   is deployed before the writer applies `tfl`.
+
+Production's values need no new key for release A beyond the ACL steps.
+`scheduleFeed.reference.ingest.sink: db` and
+`perService.schedule_reference.connect: true` become redundant pins and
+may stay. The render with production's values plus ACL step 4 was checked
+on 2026-10-09 (`helm template` with the `distant-signal-config` values,
+the base HelmRelease's inline values and the step 4 `redis.acl` block).
+
+**Expected pod changes:** poller-stations, poller-incidents,
+poller-ldbws, poller-tfl, poller-tocs, trust-consumer,
+trust-backlog-consumer, full-coverage-consumer, the schedulefeed pod and
+the ingest-writer restart (new env: `INGEST_SINK`, `DATABASE_URL` as the
+producer's role, `REDIS_URL`/`REDIS_USERNAME` for the stream producers;
+the writer moves to `distant_signal_writer` and reads the four streams).
+The api, aggregator, enricher, notifier and Redis do not change. The
+producers keep their `/private` URL and OAuth env, which the rollback
+uses.
+
+### 0.3 Rollback
+
+Per producer, its own `sink: http`, nothing else:
+
+```yaml
+pollers:
+  stations:  {ingest: {sink: http}}
+  incidents: {ingest: {sink: http}}
+  ldbws:     {ingest: {sink: http}}
+  tfl:       {ingest: {sink: http}}
+  tocs:      {ingest: {sink: http}}
+trustConsumer:        {ingest: {sink: http}}
+trustBacklogConsumer: {ingest: {sink: http}}
+fullCoverageConsumer: {ingest: {sink: http}}
+scheduleFeed:
+  ingest: {sink: http}
+  # reference stays on db: it has been there since 2026-10-08.
+```
+
+Per reader, its own `internalReads.source: http`, independent of its sink:
+
+```yaml
+fullCoverageConsumer: {internalReads: {source: http}}
+trustConsumer:        {internalReads: {source: http}}
+pollers:
+  ldbws:              {internalReads: {source: http}}
+```
+
+Take any subset. trust-consumer keeps `distant_signal_trust_consumer`
+while either its sink or its reads are on `db`. Notes, checked against the chart's guards:
+
+- **The writer's streams may stay on `apply`** after their producer goes
+  back to `http` (spec §13.1): the guards allow it and the writer just
+  sees no new entries. A producer back on `stream` later needs no writer
+  change.
+- **Not `http+shadow`.** The guards allow `http+shadow` beside a stream
+  on `apply`, but then the HTTP path and the writer would both write. To
+  compare again, set the stream to `shadow` in the same values change.
+- **The connects need no change.** Back on `http` a producer does not use
+  its role, and its `connect: true` is a no-op.
+- **Rolling back the Redis ACL** (step 4 or 3) needs every stream off
+  first or in the same release: every stream producer on `http` and
+  `ingestWriter.streams.<station-samples|full-coverage|tfl|reference>:
+  "off"` (any stream not `off` needs `stage: narrow`; any `apply` needs
+  `defaultUser: "off"`).
+- **The writer's role**: `postgresql.roles.perService.writer.connect:
+  false` returns it to `distant_signal_app`, but only once
+  `ingestWriter.streams.tfl` is not `apply` (M4).
+- The rollback needs the `/private` routes (`api.privateRoutes.enabled:
+  true`, the default), the producers' OAuth Secret keys and their
+  Authentik accounts, so none of those may go before release B.
+
+`charts/distant-signal/ci/http-sinks.yaml` is this rollback (sinks and
+reads) for CI, plus the reference sink and the writer's role.
+
+### 0.4 What to watch during the settle (3–5 days)
+
+Read-only, through Grafana or the kube API proxy.
+
+- **`/private` request rate falls to 0, including the GET reads**
+  (`/schedule-line-population`, `/tracked-trains`, `/sample-stations`,
+  `/stanox-crs`, and the startup-cursor GETs of `/station-samples`,
+  `/tfl-line-status`, `/incidents`, `/stations` and `/tocs`):
+  ```promql
+  sum by (exported_endpoint, method) (
+    rate(distant_signal_http_requests_total{namespace="distant-signal",
+      exported_endpoint=~"/private/.*"}[15m]))
+  ```
+  Daily or rarer routes (`/stations`, `/tocs`, schedule-reference's,
+  `/corpus-locations`) show nothing either way; use §1.3 B's evidence for
+  them.
+- **`db_writes` per producer**, rising for each direct writer, with
+  `outcome="ok"` dominating:
+  ```promql
+  sum by (app_kubernetes_io_component, operation, outcome) (
+    rate(distant_signal_db_writes_total{namespace="distant-signal"}[15m]))
+  ```
+  poller-stations writes once a day, schedule-ingest once per delivery.
+  `DistantSignalDbPoolAcquireTimeouts` stays silent.
+- **Freshness alerts**: `DistantSignalIngestSourceStale` (every source),
+  `DistantSignalPollerStale`, `DistantSignalLdbwsStationStale`,
+  `DistantSignalScheduleFeedMarkerStale`, `DistantSignalCorpusStale` and
+  `DistantSignalScheduleReferencePublishStale` stay silent; the
+  `ingest_freshness` rows advance (`SELECT source, fetched_at FROM
+  ingest_freshness ORDER BY 1`).
+- **Stream lag and dead letters**: `DistantSignalIngestStreamStalled`,
+  `…StreamBacklog`, `…DeadLetters`, `…ProducerXaddFailing`,
+  `…UnsupportedSchema`, `…ApplyWritesNothing` and `…StreamMemoryHigh`
+  stay silent;
+  ```promql
+  max by (stream) (distant_signal_ingest_stream_lag{namespace="distant-signal"})
+  max by (stream) (distant_signal_ingest_stream_oldest_pending_age_seconds{namespace="distant-signal"})
+  sum by (stream, reason) (increase(distant_signal_ingest_stream_dead_lettered_total{namespace="distant-signal"}[1h]))
+  ```
+  and `XLEN ds:dlq:<stream>` stays at 0
+  (`redis-cli --user ds-admin XLEN ds:dlq:station-samples`, and so on).
+  `DistantSignalTrainEventOutboxStuck` and `…OutboxRejected` stay silent.
+  The movement lag alerts (`DistantSignalMovementLag*`) stay silent: the
+  TRUST consumers now ACK after their own commit.
+- **The readers' data stays current**: `DistantSignalFullCoverageWindowFeedStale`
+  silent, full coverage still reporting every enabled line, trust-consumer
+  still matching tracked trains, and poller-ldbws sampling the same
+  station count as before.
+- **Postgres connections**, per role, well inside each `CONNECTION
+  LIMIT` and the 200 total:
+  ```sql
+  SELECT usename, application_name, count(*)
+  FROM pg_stat_activity GROUP BY 1, 2 ORDER BY 3 DESC;
+  ```
+  Each producer appears under its own role (`distant_signal_stations`,
+  `…_incidents`, `…_trust_backlog`, `…_trust_consumer`,
+  `…_schedule_ingest`, `…_writer`, `…_full_coverage_ro`, `…_ldbws_ro`),
+  and `distant_signal_app` drops by the writer's 6–7.
+
+Settle ends, and release B can be planned, when 3–5 days pass with all of
+the above clean and every `/private` route, GETs included, at 0.
 
 ## 1. Entry criteria and the `/private` inventory
 
