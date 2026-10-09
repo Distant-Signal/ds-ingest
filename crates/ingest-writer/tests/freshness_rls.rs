@@ -174,6 +174,17 @@ async fn each_producer_writes_only_its_own_freshness_rows() {
         assert!(visible(pool, FIXTURE).await, "{role} reads every row");
     }
 
+    // The shared island-of-Ireland names from before the per-network split
+    // were dropped a release later: the writer may no longer record them.
+    for legacy in ["island_of_ireland_stations", "island_of_ireland_lines"] {
+        let insert = record(&writer, legacy).await;
+        assert_eq!(
+            sqlstate(&insert).as_deref(),
+            Some("42501"),
+            "writer inserting {legacy}: {insert:?}"
+        );
+    }
+
     // Every other role is unaffected: the api and the aggregator still
     // update any source's row.
     record(&api, "stations").await.unwrap();
