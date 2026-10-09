@@ -95,7 +95,7 @@ it. A component that does use its role still connects only as that role
 The island-of-Ireland pollers are unchanged: stream-only and disabled
 (D8), with `ingestWriter.streams.ioi-*` `off`.
 
-`redis.acl.defaultUser: "off"` no longer needs a user for a client whose
+`redis.acl.defaultUser: "on-unshared"` (or `"off"`) no longer needs a user for a client whose
 workload is not deployed (a disabled poller, movement-relay or
 ingest-writer). On the chart before release A, step 4 of
 `docs/redis-acl.md` also needs `clients.pollerIrishRailGtfs`,
@@ -115,7 +115,8 @@ missing (`templates/zz-ingest-sink-preflight.yaml`), until all of these
 hold:
 
 1. **Redis ACL steps 1–4 are done** (`docs/redis-acl.md`): `enabled`,
-   `existingSecret`, `stage: narrow`, `defaultUser: "off"`, and every
+   `existingSecret`, `stage: narrow`, `defaultUser: "on-unshared"` (or
+   `"off"`, which breaks AOF replay; see `docs/redis-acl.md`), and every
    deployed client on its own user. Besides today's six clients that
    includes `ingestWriter`, `pollerIncidents`, `pollerLdbws`, `pollerTfl`
    and `pollerTocs`: on `http` those pods do not connect to Redis, so
@@ -203,7 +204,7 @@ while either its sink or its reads are on `db`. Notes, checked against the chart
   first or in the same release: every stream producer on `http` and
   `ingestWriter.streams.<station-samples|full-coverage|tfl|reference>:
   "off"` (any stream not `off` needs `stage: narrow`; any `apply` needs
-  `defaultUser: "off"`).
+  `defaultUser: "on-unshared"` or `"off"`).
 - **The writer's role**: `postgresql.roles.perService.writer.connect:
   false` returns it to `distant_signal_app`, but only once
   `ingestWriter.streams.tfl` is not `apply` (M4).
