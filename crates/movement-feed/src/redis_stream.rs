@@ -1723,6 +1723,10 @@ mod restore_group_position_tests {
 
     use super::*;
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "FakeConn::new takes RedisResult replies; the helper builds one"
+    )]
     fn groups(last_delivered_id: &str) -> redis::RedisResult<Value> {
         Ok(Value::Array(vec![FakeConn::group_info(
             "trust-consumer",
