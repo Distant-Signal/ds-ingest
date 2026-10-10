@@ -66,7 +66,7 @@
 //! `upsert_train_event` now reads this module's own `derived.status ==
 //! "cancelled"` (already sent on every event below, unchanged) to flip such
 //! a subscription to `'unresolved'` instead -- see
-//! `train_tracking::mark_subscription_unresolved_on_cancellation`. The
+//! `train_tracking::mark_subscriptions_unresolved_on_cancellation`. The
 //! general "Activation this process never saw" gap above is unaffected: it
 //! is specifically about a resolving MOVEMENT going out without an identity,
 //! which a Cancellation was never going to supply anyway.

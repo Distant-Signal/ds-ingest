@@ -18,6 +18,8 @@ tracing = "0.1.44"
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "test-util", "net", "io-util"] }
+# `common::redis_group::fake::FakeConn` for the group-position tests.
+common = { path = "../common", features = ["redis", "redis-test-util"] }
 
 # `FakeMovementFeed` is gated on `any(test, feature = "test-util")`, not a
 # bare `#[cfg(test)]`: it needs to be usable from BOTH trust-consumer's and

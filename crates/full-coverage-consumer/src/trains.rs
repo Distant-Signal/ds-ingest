@@ -304,12 +304,17 @@ impl TrainState {
             self.intern(schedule_query::normalize_tiploc(t))
         });
         let day = self.day_mut(which, &uid);
-        if day.reports.len() < MAX_REPORTS_PER_TRAIN {
-            day.reports.push(Report {
-                planned_min: to_minutes(planned),
-                delay: i16::try_from(delay).unwrap_or(i16::MAX),
-                tiploc,
-            });
+        let report = Report {
+            planned_min: to_minutes(planned),
+            delay: i16::try_from(delay).unwrap_or(i16::MAX),
+            tiploc,
+        };
+        // A redelivered entry (a replayed batch, a rewound group) repeats
+        // the train's last report exactly. A copy changes no reading of the
+        // list (they pick the earliest or latest by planned time) but would
+        // use up `MAX_REPORTS_PER_TRAIN`.
+        if day.reports.last() != Some(&report) && day.reports.len() < MAX_REPORTS_PER_TRAIN {
+            day.reports.push(report);
         }
         pair.actual
     }
@@ -488,6 +493,26 @@ mod tests {
             reports[0].planned_min,
             to_minutes(at("2026-01-27T09:00:00Z"))
         );
+    }
+
+    /// A redelivered movement right after itself is recorded once; the same
+    /// report after a different one is still recorded.
+    #[test]
+    fn a_redelivered_movement_is_not_recorded_twice_in_a_row() {
+        let mut s = TrainState::new(winter());
+        s.apply_activation(&activation("1A01MW27", "C1"), false);
+        let first = movement("1A01MW27", "2026-01-27T09:00:00Z", "LATE", "12");
+        let second = movement("1A01MW27", "2026-01-27T09:10:00Z", "LATE", "13");
+        for (m, tiploc) in [
+            (&first, "LLANDUJ"),
+            (&first, "LLANDUJ"),
+            (&second, "DEGANWY"),
+            (&first, "LLANDUJ"),
+        ] {
+            s.apply_movement(m, Some(tiploc), at("2026-01-27T09:13:00Z"));
+        }
+        let delays: Vec<i16> = s.current["C1"].reports.iter().map(|r| r.delay).collect();
+        assert_eq!(delays, [12, 13, 12]);
     }
 
     /// Routing by service date: the next day's train goes to `next` and

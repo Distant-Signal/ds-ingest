@@ -87,6 +87,7 @@ async fn run() -> anyhow::Result<()> {
         "trust_backlog_consumer_errors_total",
         API_CALL_OPERATIONS,
     );
+    metrics::counter!(common::metrics::metric_name(OUTSIDE_RETENTION_METRIC)).increment(0);
     let (connection_state, progress) = health_http::spawn_with_progress(
         config.health_bind_url.clone(),
         "connected",
@@ -317,57 +318,18 @@ async fn consume<S: BacklogSink>(
                     last_pruned_rail_day = Some(today);
                 }
                 let snapshot = stanox.read().expect("stanox lock poisoned").clone();
-                let mut events = Vec::new();
-                let mut reasons = Vec::new();
-                let mut unparseable = Vec::new();
-                for entry in &batch {
-                    let raw = &entry.payload;
-                    // `now`/`today` above stay the wall clock, for pruning;
-                    // each message is dated by when it arrived (`arrival`).
-                    let (received_at, arrival_rail_day) = arrival(entry, now);
-                    match trust_schema::schema::parse_batch_detailed(raw) {
-                        Ok(parsed) => {
-                            // PL-8: count every envelope the parser dropped.
-                            for failure in &parsed.failures {
-                                metrics::counter!(
-                                    common::metrics::metric_name("trust_backlog_consumer_errors_total"),
-                                    "operation" => "parse_envelope",
-                                    "msg_type" => failure.msg_type.clone()
-                                )
-                                .increment(1);
-                            }
-                            for message in parsed.messages {
-                                if let Some(reason) = reasons::reason_message(
-                                    &message,
-                                    &process_state,
-                                    arrival_rail_day,
-                                    received_at,
-                                ) {
-                                    reasons.push(reason);
-                                }
-                                if let Some(event) = process::process_message(
-                                    &message,
-                                    &mut process_state,
-                                    &snapshot,
-                                    crs_index,
-                                    arrival_rail_day,
-                                    received_at,
-                                ) {
-                                    events.push(event);
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            tracing::error!(error = ?err, raw = %raw, "failed to parse TRUST batch; dead-lettering this payload");
-                            metrics::counter!(
-                                common::metrics::metric_name("trust_backlog_consumer_errors_total"),
-                                "operation" => "parse_batch"
-                            )
-                            .increment(1);
-                            unparseable.push(unparseable_payload(raw, &err));
-                        }
-                    }
-                }
+                let CollectedBatch {
+                    events,
+                    reasons,
+                    unparseable,
+                } = collect_batch(
+                    &batch,
+                    &mut process_state,
+                    &snapshot,
+                    crs_index,
+                    now,
+                    config.trust_event_backlog_retention_days,
+                );
 
                 // Reasons first, best-effort: a failure is logged and
                 // counted, never allowed to hold up the backlog batch (a
@@ -687,6 +649,129 @@ fn arrival(
     (received_at, current_rail_day(received_at))
 }
 
+/// What one feed batch yields: the backlog events to write, the reason
+/// codes, and the payloads to dead-letter.
+struct CollectedBatch {
+    events: Vec<common::TrustBacklogEventMessage>,
+    reasons: Vec<common::TrainReasonMessage>,
+    unparseable: Vec<DeadLetter>,
+}
+
+/// Parses and processes every entry of `batch`, dating each message by its
+/// arrival ([`arrival`]). Events of an entry outside `trust_event_backlog`'s
+/// `retention_days` ([`outside_backlog_retention`]) are processed but not
+/// returned.
+fn collect_batch(
+    batch: &[movement_feed::FeedEntry],
+    process_state: &mut process::ProcessorState,
+    snapshot: &stanox_crs::StanoxCrsTable,
+    crs_index: &HashSet<String>,
+    now: chrono::DateTime<chrono::Utc>,
+    retention_days: i64,
+) -> CollectedBatch {
+    let mut events = Vec::new();
+    let mut reasons = Vec::new();
+    let mut unparseable = Vec::new();
+    for entry in batch {
+        let raw = &entry.payload;
+        // `now`/`today` above stay the wall clock, for pruning;
+        // each message is dated by when it arrived (`arrival`).
+        let (received_at, arrival_rail_day) = arrival(entry, now);
+        let outside_retention = outside_backlog_retention(entry.received_at, now, retention_days);
+        match trust_schema::schema::parse_batch_detailed(raw) {
+            Ok(parsed) => {
+                // PL-8: count every envelope the parser dropped.
+                for failure in &parsed.failures {
+                    metrics::counter!(
+                        common::metrics::metric_name("trust_backlog_consumer_errors_total"),
+                        "operation" => "parse_envelope",
+                        "msg_type" => failure.msg_type.clone()
+                    )
+                    .increment(1);
+                }
+                for message in parsed.messages {
+                    if let Some(reason) = reasons::reason_message(
+                        &message,
+                        process_state,
+                        arrival_rail_day,
+                        received_at,
+                    ) {
+                        reasons.push(reason);
+                    }
+                    if let Some(event) = process::process_message(
+                        &message,
+                        process_state,
+                        snapshot,
+                        crs_index,
+                        arrival_rail_day,
+                        received_at,
+                    ) {
+                        // Still processed above (an old
+                        // Activation parks the identity a newer
+                        // Movement in the same replay needs),
+                        // just not written.
+                        if outside_retention {
+                            metrics::counter!(common::metrics::metric_name(
+                                OUTSIDE_RETENTION_METRIC
+                            ))
+                            .increment(1);
+                        } else {
+                            events.push(event);
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::error!(error = ?err, raw = %raw, "failed to parse TRUST batch; dead-lettering this payload");
+                metrics::counter!(
+                    common::metrics::metric_name("trust_backlog_consumer_errors_total"),
+                    "operation" => "parse_batch"
+                )
+                .increment(1);
+                unparseable.push(unparseable_payload(raw, &err));
+            }
+        }
+    }
+    CollectedBatch {
+        events,
+        reasons,
+        unparseable,
+    }
+}
+
+/// `trust_backlog_consumer_events_outside_retention_total`: events not
+/// written because their entry arrived longer ago than
+/// `trust_event_backlog`'s retention (see [`outside_backlog_retention`]).
+const OUTSIDE_RETENTION_METRIC: &str = "trust_backlog_consumer_events_outside_retention_total";
+
+/// Whether an entry that arrived at `received_at` (its stream id's time) is
+/// older than `trust_event_backlog`'s `retention_days` at `now`, so its
+/// events must not be written (2026-10-09 redelivery review).
+///
+/// `trust_event_backlog.received_at` is the row's insert time, and the
+/// aggregator prunes on it. A consumer-group rewind (a Redis restart that
+/// lost the group's position, an operator's `XGROUP SETID`) re-reads
+/// entries that may be days old; stored again, each would live for another
+/// full retention window, which defeats the TRUST licensing safeguard the
+/// 1-day retention exists for. Such an entry has been written already, or
+/// was never written in time, so dropping it loses nothing the retention
+/// would have kept.
+///
+/// An entry with no known arrival time is kept (nothing to judge it by),
+/// and `retention_days == 0` turns the check off.
+fn outside_backlog_retention(
+    received_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+    retention_days: i64,
+) -> bool {
+    match received_at {
+        Some(received_at) if retention_days > 0 => {
+            received_at < now - chrono::TimeDelta::days(retention_days)
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod rail_day_tests {
     use super::*;
@@ -784,6 +869,90 @@ mod tests {
 
     fn utc(s: &str) -> chrono::DateTime<chrono::Utc> {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn only_an_arrival_older_than_the_retention_is_outside_it() {
+        let now = utc("2026-08-28T18:34:00Z");
+        let day = 1;
+        assert!(!outside_backlog_retention(
+            Some(utc("2026-08-28T18:33:00Z")),
+            now,
+            day
+        ));
+        assert!(
+            !outside_backlog_retention(Some(utc("2026-08-27T18:34:00Z")), now, day),
+            "exactly at the boundary, still inside"
+        );
+        assert!(outside_backlog_retention(
+            Some(utc("2026-08-27T18:33:59Z")),
+            now,
+            day
+        ));
+        assert!(
+            !outside_backlog_retention(None, now, day),
+            "an unknown arrival is kept"
+        );
+        assert!(
+            !outside_backlog_retention(Some(utc("2020-01-01T00:00:00Z")), now, 0),
+            "0 turns the check off"
+        );
+        assert!(!outside_backlog_retention(
+            Some(utc("2026-08-26T18:34:00Z")),
+            now,
+            3
+        ));
+    }
+
+    /// A deep rewind re-reads an entry from two days ago next to a fresh
+    /// one: only the fresh entry's event is written.
+    #[test]
+    fn a_rewound_entry_older_than_the_retention_is_not_written() {
+        let departure = |millis: &str| {
+            format!(
+                r#"{{"header":{{"msg_type":"0003"}},"body":{{
+                    "train_id":"221832406","event_type":"DEPARTURE",
+                    "planned_timestamp":"{millis}","actual_timestamp":"{millis}",
+                    "loc_stanox":"87212","variation_status":"ON TIME"}}}}"#
+            )
+        };
+        let stanox = stanox_crs::StanoxCrsTable::from_records(vec![common::StanoxCrsRecord {
+            stanox: "87212".to_string(),
+            crs: "WAT".to_string(),
+            tiploc: "WATRLMN".to_string(),
+            station_name: "LONDON WATERLOO".to_string(),
+            source_sequence: 1,
+            change_time_minutes: None,
+        }]);
+        let crs_index: HashSet<String> = ["WAT".to_string()].into_iter().collect();
+        let batch = [
+            movement_feed::FeedEntry {
+                payload: departure("1787769200000"),
+                received_at: Some(utc("2026-08-26T18:33:30Z")),
+            },
+            movement_feed::FeedEntry {
+                payload: departure("1787942000000"),
+                received_at: Some(utc("2026-08-28T18:33:30Z")),
+            },
+        ];
+        let now = utc("2026-08-28T18:34:00Z");
+
+        let mut state = process::ProcessorState::default();
+        let collected = collect_batch(&batch, &mut state, &stanox, &crs_index, now, 1);
+        assert_eq!(collected.events.len(), 1, "{:?}", collected.events);
+        // The fresh one (its timestamp after the Europe/London correction).
+        assert_eq!(
+            collected.events[0]
+                .actual_timestamp
+                .map(|at| at.date_naive().to_string())
+                .as_deref(),
+            Some("2026-08-28")
+        );
+        assert!(collected.unparseable.is_empty());
+
+        let mut state = process::ProcessorState::default();
+        let collected = collect_batch(&batch, &mut state, &stanox, &crs_index, now, 0);
+        assert_eq!(collected.events.len(), 2, "0 turns the check off");
     }
 
     fn entry_arrived_at(at: &str) -> movement_feed::FeedEntry {

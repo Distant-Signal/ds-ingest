@@ -49,6 +49,13 @@ const DEAD_LETTER_MAX_LEN: usize = 10_000;
 /// `increase()`.
 const GROUP_RECREATED_METRIC: &str = "movement_feed_group_recreated_total";
 
+/// Counter (labelled `group`) of consumer groups found BEHIND the last entry
+/// this consumer was handed after a failed read, and moved forward to it
+/// (`XGROUP SETID`; [`restore_group_position`]): Redis came back with an
+/// older copy of its data, so the group still exists but would hand out
+/// again entries already processed. Registered at 0.
+const GROUP_RESTORED_METRIC: &str = "movement_feed_group_position_restored_total";
+
 /// Counter (labelled `group`) of delivered entries whose stream id has no
 /// parseable millisecond part, so their arrival time is unknown and the
 /// consumer stamps them with its own clock instead (see
@@ -169,8 +176,15 @@ pub struct RedisStreamMovementFeed {
     /// advanced by every `>` read to the last id it returned, exactly as
     /// Redis advances the group's own. `None` only when `XINFO GROUPS`
     /// could not be read. It is what a group lost to `NOGROUP` is
-    /// recreated at -- see [`recreate_start_id`].
+    /// recreated at -- see [`recreate_start_id`] -- and what a group that
+    /// went backwards is moved forward to (see `verify_position`).
     last_delivered_id: Option<String>,
+    /// Set by a failed read other than `NOGROUP`: before the next read,
+    /// [`restore_group_position`] checks the group did not go backwards
+    /// (2026-10-09 redelivery review). A Redis restart that reloads an older
+    /// copy of its data keeps the group but rewinds its `last-delivered-id`,
+    /// and the restart is what failed the read.
+    verify_position: bool,
 }
 
 impl RedisStreamMovementFeed {
@@ -322,6 +336,11 @@ impl RedisStreamMovementFeed {
             "group" => group.clone()
         )
         .increment(0);
+        metrics::counter!(
+            common::metrics::metric_name(GROUP_RESTORED_METRIC),
+            "group" => group.clone()
+        )
+        .increment(0);
         // ...and the long-pending counter, for DistantSignalMovementFeedLongPending.
         metrics::counter!(
             common::metrics::metric_name("movement_feed_long_pending_total"),
@@ -347,6 +366,7 @@ impl RedisStreamMovementFeed {
                 .unwrap(),
             autoclaim_min_idle,
             last_delivered_id,
+            verify_position: false,
         })
     }
 
@@ -797,6 +817,62 @@ fn next_pel_replay_cursor(
     }
 }
 
+/// After a failed read: moves `group` forward to `last_delivered_id` if
+/// Redis reports it behind (`common::redis_group::restore_group_position`),
+/// logging a warning and counting [`GROUP_RESTORED_METRIC`]; a group at or
+/// past it is adopted as the new `last_delivered_id`. Returns whether the
+/// check is done: `false` (logged) when Redis could not be asked, so the
+/// next read tries again. A missing group is done here: the read will fail
+/// `NOGROUP` and recreate it.
+///
+/// What is not undone: entries the consumer `ACKed` after the reloaded copy
+/// was written are pending again and are redelivered once idle; every
+/// consumer's writes are idempotent per entry.
+async fn restore_group_position<C: redis::aio::ConnectionLike + Send>(
+    conn: &mut C,
+    stream: &str,
+    group: &str,
+    last_delivered_id: &mut Option<String>,
+) -> bool {
+    let Some(remembered) = last_delivered_id.clone() else {
+        // Nothing to compare with; seed it, as at connect.
+        if let Ok(Some(at)) =
+            common::redis_group::group_last_delivered_id(conn, stream, group).await
+        {
+            *last_delivered_id = Some(at);
+        }
+        return true;
+    };
+    match common::redis_group::restore_group_position(conn, stream, group, &remembered).await {
+        Ok(common::redis_group::GroupPosition::Restored { was }) => {
+            tracing::warn!(
+                stream,
+                group,
+                was,
+                restored_to = %remembered,
+                "consumer group went backwards (Redis reloaded an older copy of its data); \
+                 moved it forward to the last entry this consumer was handed, so entries \
+                 already processed are not delivered again"
+            );
+            metrics::counter!(
+                common::metrics::metric_name(GROUP_RESTORED_METRIC),
+                "group" => group.to_string()
+            )
+            .increment(1);
+            true
+        }
+        Ok(common::redis_group::GroupPosition::Current { at }) => {
+            *last_delivered_id = Some(at);
+            true
+        }
+        Ok(common::redis_group::GroupPosition::Missing) => true,
+        Err(err) => {
+            tracing::warn!(error = ?err, stream, group, "could not check the consumer group's position; retrying before the next read");
+            false
+        }
+    }
+}
+
 /// Whether a feed error is Redis reporting that the stream or this
 /// consumer group does not exist (`-NOGROUP ...`).
 fn is_nogroup(err: &anyhow::Error) -> bool {
@@ -817,12 +893,27 @@ impl MovementFeed for RedisStreamMovementFeed {
     /// restart would, so entries added before the recreate are not skipped
     /// (see [`recreate_start_id`]). The error is still returned, so the
     /// caller's loop backs off as for any failed read.
+    ///
+    /// Any other failure makes the next call first check that the group did
+    /// not go BACKWARDS (see `verify_position` and
+    /// [`restore_group_position`]).
     async fn next_batch(&mut self) -> anyhow::Result<Vec<crate::FeedEntry>> {
+        if self.verify_position {
+            self.verify_position = !restore_group_position(
+                &mut self.conn,
+                &self.stream,
+                &self.group,
+                &mut self.last_delivered_id,
+            )
+            .await;
+        }
         let result = self.read_next_batch().await;
-        if let Err(err) = &result
-            && is_nogroup(err)
-        {
-            self.recreate_group().await;
+        if let Err(err) = &result {
+            if is_nogroup(err) {
+                self.recreate_group().await;
+            } else {
+                self.verify_position = true;
+            }
         }
         result
     }
@@ -1620,6 +1711,80 @@ mod recreate_start_id_tests {
     fn a_group_that_never_delivered_anything_resumes_from_its_creation_point() {
         // Created with `$` on an empty stream, nothing read yet.
         assert_eq!(recreate_start_id(Some("0-0"), Some("5-0")), "0-0");
+    }
+}
+
+/// [`restore_group_position`] against a scripted Redis
+/// (`common::redis_group::fake::FakeConn`).
+#[cfg(test)]
+mod restore_group_position_tests {
+    use common::redis_group::fake::FakeConn;
+    use redis::Value;
+
+    use super::*;
+
+    fn groups(last_delivered_id: &str) -> redis::RedisResult<Value> {
+        Ok(Value::Array(vec![FakeConn::group_info(
+            "trust-consumer",
+            last_delivered_id,
+        )]))
+    }
+
+    /// Redis reloaded an older copy: the group stands at 100-0 though this
+    /// consumer was handed 250-1. It is moved forward; the remembered id
+    /// stays.
+    #[tokio::test]
+    async fn a_group_that_went_backwards_is_moved_forward() {
+        let mut conn = FakeConn::new([groups("100-0"), Ok(Value::Okay)]);
+        let mut last = Some("250-1".to_string());
+        assert!(restore_group_position(&mut conn, "s", "trust-consumer", &mut last).await);
+        assert_eq!(last.as_deref(), Some("250-1"));
+        assert_eq!(
+            conn.sent[1],
+            ["XGROUP", "SETID", "s", "trust-consumer", "250-1"]
+        );
+    }
+
+    /// A group ahead of this consumer's copy (a read whose reply was lost)
+    /// is adopted, not moved.
+    #[tokio::test]
+    async fn a_group_ahead_is_adopted() {
+        let mut conn = FakeConn::new([groups("300-0")]);
+        let mut last = Some("250-1".to_string());
+        assert!(restore_group_position(&mut conn, "s", "trust-consumer", &mut last).await);
+        assert_eq!(last.as_deref(), Some("300-0"));
+        assert_eq!(conn.sent.len(), 1);
+    }
+
+    /// Redis still unreachable: not done, so the next read checks again.
+    #[tokio::test]
+    async fn an_unreachable_redis_leaves_the_check_for_the_next_read() {
+        let mut conn = FakeConn::new([Err(redis::RedisError::from((
+            redis::ErrorKind::IoError,
+            "connection refused",
+        )))]);
+        let mut last = Some("250-1".to_string());
+        assert!(!restore_group_position(&mut conn, "s", "trust-consumer", &mut last).await);
+        assert_eq!(last.as_deref(), Some("250-1"));
+    }
+
+    /// A missing group is left to the `NOGROUP` recreate.
+    #[tokio::test]
+    async fn a_missing_group_is_left_to_the_nogroup_recreate() {
+        let mut conn = FakeConn::new([Ok(Value::Array(vec![]))]);
+        let mut last = Some("250-1".to_string());
+        assert!(restore_group_position(&mut conn, "s", "trust-consumer", &mut last).await);
+        assert_eq!(conn.sent.len(), 1, "no SETID");
+    }
+
+    /// With no remembered id there is nothing to restore; the group's own
+    /// is adopted.
+    #[tokio::test]
+    async fn no_remembered_id_seeds_it_from_the_group() {
+        let mut conn = FakeConn::new([groups("42-0")]);
+        let mut last = None;
+        assert!(restore_group_position(&mut conn, "s", "trust-consumer", &mut last).await);
+        assert_eq!(last.as_deref(), Some("42-0"));
     }
 }
 
@@ -3104,6 +3269,102 @@ mod outage_tests {
 
         let client = redis::Client::open(direct_redis_url()).unwrap();
         let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        let _: redis::RedisResult<i64> =
+            redis::cmd("DEL").arg(&stream).query_async(&mut conn).await;
+    }
+
+    /// Redis restarts and comes back with an older copy of its data: the
+    /// group exists but stands before entries this consumer already read
+    /// (simulated by an `XGROUP SETID` back to the start while the proxy is
+    /// down). The first read after the outage moves it forward again, so
+    /// nothing already read is delivered again; a new entry still is.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn a_group_rewound_by_a_redis_restart_is_moved_forward_again() {
+        let mut proxy = Proxy::start(upstream_addr()).await;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stream = format!("movement-events-test-rewind-{nanos}");
+        let client = redis::Client::open(direct_redis_url()).unwrap();
+        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        let mut feed = RedisStreamMovementFeed::connect_for_test(
+            &with_password(&format!("redis://127.0.0.1:{}", proxy.port)),
+            &stream,
+            "test-group",
+            "test-consumer",
+            Duration::from_secs(3600),
+        )
+        .await
+        .expect("connects through the proxy");
+        assert!(feed.next_batch().await.unwrap().is_empty());
+
+        for payload in ["a", "b"] {
+            let _: String = redis::cmd("XADD")
+                .arg(&stream)
+                .arg("*")
+                .arg("payload")
+                .arg(payload)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+        }
+        let read: Vec<String> = feed
+            .next_batch()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.payload)
+            .collect();
+        assert_eq!(read, ["a", "b"]);
+        feed.commit().await.unwrap();
+        let read_up_to = feed
+            .last_delivered_id
+            .clone()
+            .expect("advanced by the read");
+
+        proxy.take_down().await;
+        let () = redis::cmd("XGROUP")
+            .arg("SETID")
+            .arg(&stream)
+            .arg("test-group")
+            .arg("0")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(feed.next_batch().await.is_err(), "Redis is down");
+        proxy.bring_up().await;
+
+        let _: String = redis::cmd("XADD")
+            .arg(&stream)
+            .arg("*")
+            .arg("payload")
+            .arg("c")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let mut read = Vec::new();
+        for _ in 0..10 {
+            if let Ok(batch) = feed.next_batch().await {
+                read.extend(batch.into_iter().map(|entry| entry.payload));
+                if !read.is_empty() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert_eq!(read, ["c"], "a and b must not be delivered again");
+        let group_at =
+            common::redis_group::group_last_delivered_id(&mut conn, &stream, "test-group")
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            !stream_id_less_than(&group_at, &read_up_to),
+            "the group is back at or past {read_up_to}, not {group_at}"
+        );
+
         let _: redis::RedisResult<i64> =
             redis::cmd("DEL").arg(&stream).query_async(&mut conn).await;
     }

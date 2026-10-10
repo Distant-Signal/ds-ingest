@@ -139,6 +139,21 @@ pub(crate) struct Config {
     /// pattern.
     #[arg(long, env, default_value_t = true)]
     pub trust_timestamp_correction_enabled: bool,
+
+    /// `trust_event_backlog`'s retention in days: the aggregator's
+    /// `TRUST_EVENT_BACKLOG_RETENTION_DAYS`, which the chart sets for both
+    /// from `aggregator.trustEventBacklogRetentionDays`. An entry that
+    /// arrived (its stream id's time) longer ago than this is not written:
+    /// `trust_event_backlog.received_at` is the insert time, so a deep
+    /// rewind of the consumer group would otherwise store it again for a
+    /// whole retention window past its arrival, defeating the TRUST
+    /// licensing safeguard that retention enforces (2026-10-09 redelivery
+    /// review). Counted in
+    /// `trust_backlog_consumer_events_outside_retention_total`. 0 turns the
+    /// check off (the aggregator then prunes every row on its next cycle
+    /// anyway).
+    #[arg(long, env, default_value_t = 1, value_parser = clap::value_parser!(i64).range(0..))]
+    pub trust_event_backlog_retention_days: i64,
 }
 
 /// `INGEST_SINK`: see [`Config::ingest_sink`].
@@ -236,5 +251,20 @@ mod tests {
         };
         assert_eq!(env("ingest_sink").as_deref(), Some("INGEST_SINK"));
         assert_eq!(env("database_url").as_deref(), Some("DATABASE_URL"));
+        assert_eq!(
+            env("trust_event_backlog_retention_days").as_deref(),
+            Some("TRUST_EVENT_BACKLOG_RETENTION_DAYS")
+        );
+    }
+
+    /// The retention guard defaults to the aggregator's 1 day and refuses a
+    /// negative value.
+    #[test]
+    fn the_backlog_retention_defaults_to_one_day_and_is_never_negative() {
+        let config = parse(&["--database-url", ""]).unwrap();
+        assert_eq!(config.trust_event_backlog_retention_days, 1);
+        let config = parse(&["--trust-event-backlog-retention-days", "0"]).unwrap();
+        assert_eq!(config.trust_event_backlog_retention_days, 0);
+        assert!(parse(&["--trust-event-backlog-retention-days", "-1"]).is_err());
     }
 }
