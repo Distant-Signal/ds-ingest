@@ -277,6 +277,109 @@ Read-only, through Grafana or the kube API proxy.
 Settle ends, and release B can be planned, when 3–5 days pass with all of
 the above clean and every `/private` route, GETs included, at 0.
 
+### 0.5 Rollout deadlock
+
+**What happened** (2026-10-10 04:21 UTC, deploying b6c26a99).
+trust-backlog-consumer ran 1 replica with the Deployment default rollout
+(RollingUpdate, maxSurge 1, maxUnavailable 0), and its role
+`distant_signal_trust_backlog` had the computed CONNECTION LIMIT 4 (pool 3
++ 1). The old pod held 3 backends. The surge pod's startup probe connected
+and closed ("Postgres is ready"), its pool opened the 4th backend, and its
+schema gate then asked for a 5th: Postgres logged `FATAL: too many
+connections for role "distant_signal_trust_backlog"`, the gate looped on
+"pool timed out while waiting for an open connection", the new pod never
+became Ready, and the rollout never stopped the old pod. trust-consumer
+(limit 3, pool 2) had the same latent problem.
+
+**Why the gate wanted a second backend.** `ds_store::schema::check` ran its
+two queries straight on the pool. sqlx 0.8 returns a dropped connection to
+the idle queue from a spawned task, after a ping round trip, so the second
+query, issued at once, found the queue empty and, the pool being below its
+maximum, connected afresh (12 ms after the first, as observed). Neither
+`min_connections` (0, the default) nor `test_before_acquire` (pings an
+idle connection, never opens one) played a part. The gate now runs both
+queries on one acquired connection and hands it back before returning, so
+startup needs exactly one backend beyond the probe's, which is closed
+before the pool connects (`ds_store::schema` test
+`the_gate_uses_one_backend`).
+
+**Why raising the limit by values does not help mid-rollout.** The role
+limits are set by the `postgres-roles` setup Job, a `post-install,
+post-upgrade` hook. Helm runs it only after the upgrade's resources are
+applied, and with `--wait` (or a GitOps health gate) only after they are
+Ready. An upgrade stuck on a pod that cannot connect never reaches it.
+
+**To unstick a stuck rollout**, one of:
+
+- **Raise the limit by hand** (preferred), as the superuser (`kubectl exec
+  -i distant-signal-postgres-0 -- psql -U distant_signal -d
+  distant_signal`): `ALTER ROLE distant_signal_trust_backlog CONNECTION
+  LIMIT 7;` ((replicas + 1) × pool + 1). The new pod's gate retries every
+  5 s and passes; the rollout then stops the old pod. The next successful
+  upgrade's setup Job resets the limit to the computed (or
+  `connectionLimit`) value.
+- **Delete the old pod** (`kubectl delete pod <old pod>`). Its backends go
+  and the new pod's next gate poll usually takes them, but the old
+  ReplicaSet still wants 1 replica until the new pod is Ready, so it
+  starts a replacement old pod that races for the same backends: repeat
+  if the new pod loses.
+- **Switch the live Deployment to Recreate** (`kubectl patch deployment
+  <name> --type merge -p
+  '{"spec":{"strategy":{"type":"Recreate","rollingUpdate":null}}}'`): the
+  controller scales the old ReplicaSet to 0 at once. This is the chart's
+  default from this release, so the next upgrade does not undo it.
+
+**The fix in the chart.** Every Postgres workload with a per-service role
+now rolls out without overlap by default:
+
+| Workload | Rollout | Computed per-service limit |
+|---|---|---|
+| trust-backlog-consumer, trust-consumer, full-coverage-consumer, enricher | `<component>.updateStrategy`, default `Recreate` (was the implicit surge) | (replicas + maxSurge) × pool + 1 |
+| aggregator, notifier, ingest-writer, schedulefeed (schedule-ingest, schedule-reference), every poller (stations, incidents, ldbws, ...) | fixed `Recreate`, as before | pool + 1 (writer: pool + its lock session) |
+| api | `api.strategy.type` (RollingUpdate keeps maxSurge 1, maxUnavailable 0) | (replicas + 1) × pool + 2 + the api-maintenance pool, as before |
+
+`Recreate` waits until the old pod has terminated before creating the new
+one, so the default limits (pool + 1) need no surge room; the +1 covers the
+startup probe connection, whose backend can outlive its close by a
+moment. `updateStrategy.type: RollingUpdate` takes `rollingUpdate.maxSurge`
+(default 0) and `maxUnavailable` (default 1); a maxSurge above 0 (a
+percentage is rounded up) is added to the replicas in the role's computed
+limit, the `app` role's sum and the max_connections budget, which still
+fails the render past `max_connections` (200) minus 3. `RollingUpdate` with
+maxSurge 0 is not as strict as `Recreate`: it starts the new pod while the
+old one is still terminating, which can cost a crash-looped start (the
+pool's first connect fails) but not a deadlock. The same brief overlap
+happens on any pod deletion or node drain, whatever the strategy: the
+ReplicaSet replaces a terminating pod at once. CI: "helm template (worker
+rollout strategy)".
+
+**Is a gap of a few seconds safe?** Yes, for each:
+
+- **trust-consumer, full-coverage-consumer, trust-backlog-consumer**: Redis
+  Streams consumer groups with one fixed consumer name each. Entries
+  arriving in the gap wait in the stream; anything the old pod read but
+  did not ack stays in the group's PEL, and the new pod (same consumer
+  name) replays it at startup. A surge was worse: two pods reading as the
+  same consumer at once.
+- **enricher**: the same for its stream (`enricher-1`), plus reclaim and
+  the sweep; the LLM batch state is in Postgres. A surge pod would also
+  have its own in-process in-flight dedupe, so the same incident could be
+  extracted, and paid for, twice.
+- **ingest-writer** (already Recreate): its loops take Postgres advisory
+  locks, released when the old pod's session ends; its streams are
+  consumer groups as above.
+- **pollers, schedulefeed, aggregator, notifier** (already Recreate):
+  the next poll or cycle picks up where the last left off.
+
+**Production's interim overrides.** Production carries
+`connectionLimit` overrides of 2 × pool + 1 for every per-service role
+(writer 2 × pool) since the incident. With this release the defaults rely
+on `Recreate` (no overlap), not on surge room, so the overrides are no
+longer needed once this release is rolled out; they are harmless to keep
+(they fit the budget). Drop them only after a successful upgrade with the
+new strategies, so the rollout that changes the strategy still has the
+room.
+
 ## 1. Entry criteria and the `/private` inventory
 
 ### 1.1 The routes
