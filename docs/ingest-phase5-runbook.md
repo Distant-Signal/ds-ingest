@@ -382,6 +382,31 @@ room.
 
 ## 1. Entry criteria and the `/private` inventory
 
+#### Switching a live Deployment to Recreate under Flux server-side apply
+
+The 2026-10-12 rollout of this change (Helm v237) failed server-side apply on
+all four switched Deployments: `spec.strategy.rollingUpdate: Forbidden: may
+not be specified when strategy type is 'Recreate'`. A Deployment created with
+the default RollingUpdate keeps the API server's defaulted `rollingUpdate`
+block. Under Flux helm-controller's server-side apply, the chart's
+`rollingUpdate: null` does not remove a field that a previous apply or
+defaulting owns. (Helm's own three-way merge client does honour the null,
+which is why the Redis Deployment switched cleanly earlier.)
+
+One-time fix before (or after a failed) upgrade, for each Deployment that
+changes to Recreate. It restarts nothing:
+
+```sh
+kubectl -n <ns> patch deployment <name> --type=json \
+  -p '[{"op":"replace","path":"/spec/strategy","value":{"type":"Recreate"}}]'
+```
+
+Then retry the HelmRelease, e.g. `flux reconcile helmrelease <name> --force`
+or wait for the retry. After that, upgrades apply cleanly; this happens only
+on the first switch away from RollingUpdate. In prod (2026-10-12) it was
+applied to trust-backlog-consumer, trust-consumer, full-coverage-consumer and
+the enricher, and Helm v238 then succeeded.
+
 ### 1.1 The routes
 
 `crates/api/src/routes/mod.rs::private_router` merges `ingest::router()`
