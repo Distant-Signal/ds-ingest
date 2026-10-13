@@ -1,5 +1,5 @@
 //! STANOX -> TIPLOC and STANOX -> CRS, from the same live
-//! `/private/stanox-crs` feed `trust-consumer` already reloads --
+//! `stanox_crs` table `trust-consumer` already reloads --
 //! extended (unlike `trust-consumer::stanox_crs::StanoxCrsTable`, which
 //! drops `tiploc`) to keep BOTH fields, since this consumer needs both:
 //! TIPLOC for line-population membership (Decision 2c), CRS for

@@ -29,7 +29,7 @@ use common::{
 };
 use ingest_stream::{Envelope, Handled, Handler, HandlerError, SchemaId, StreamEntry};
 use ingest_writer::handlers::registry;
-use ingest_writer::stream::{Mode, StreamSpec, WriterHandler};
+use ingest_writer::stream::{StreamSpec, WriterHandler};
 use serde::Serialize;
 use sqlx::PgPool;
 
@@ -81,7 +81,7 @@ impl Db {
     /// each stream applies only its own schemas).
     fn handler(&self, entry: &StreamEntry) -> WriterHandler {
         let spec = StreamSpec::by_stream(&entry.stream).expect("a writer stream");
-        WriterHandler::new(self.pool.clone(), Arc::new(registry()), spec, Mode::Apply)
+        WriterHandler::new(self.pool.clone(), Arc::new(registry()), spec)
     }
 
     fn entry<T: Serialize + ?Sized>(
@@ -656,7 +656,6 @@ impl Db {
             self.pool.clone(),
             Arc::new(ingest_writer::handlers::registry_with(options)),
             StreamSpec::by_stream(&entry.stream).expect("a writer stream"),
-            Mode::Apply,
         )
         .handle(entry)
         .await

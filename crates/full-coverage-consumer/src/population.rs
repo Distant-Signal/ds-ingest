@@ -1,6 +1,6 @@
 //! Decision 2b's in-memory population map and Decision 2c's reverse
 //! tiploc->line index, built from `schedule_query::LinePopulationEntry`
-//! rows fetched via `GET /private/schedule-line-population`.
+//! rows read from `schedule_line_population` (`population_reload::DbSource`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

@@ -1,5 +1,5 @@
 //! `tfl-line-status/1` (stream `ds:ingest:tfl`, plan 3c.1): the body is
-//! today's `POST /private/tfl-line-status` body, a `Vec<LineStatusReport>`,
+//! the old `POST /private/tfl-line-status` body, a `Vec<LineStatusReport>`,
 //! written by `ds_store::samples::upsert_tfl_line_status_observed`.
 //!
 //! Decision D13: `line_status.computed_at`, `source_updated_at` and the
@@ -22,21 +22,13 @@ use common::LineStatusReport;
 use ingest_stream::{HandlerError, StreamEntry};
 use sqlx::PgConnection;
 
-use super::{
-    Applied, BoxFuture, SchemaHandler, classify_anyhow, count_apply, count_shadow, decode,
-};
+use super::{Applied, BoxFuture, SchemaHandler, classify_anyhow, count_apply, decode};
 use crate::observed::Observed;
 
 /// The `tfl-line-status/1` handler.
 pub struct TflLineStatus;
 
 impl SchemaHandler for TflLineStatus {
-    fn check(&self, entry: &StreamEntry) -> Result<(), HandlerError> {
-        let reports: Vec<LineStatusReport> = decode(entry)?;
-        count_shadow(entry, reports.len());
-        Ok(())
-    }
-
     fn apply<'a>(
         &'a self,
         conn: &'a mut PgConnection,

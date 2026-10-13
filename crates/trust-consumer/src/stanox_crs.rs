@@ -24,8 +24,8 @@
 //!    container to `schedule-ingest`, see
 //!    docs/superpowers/specs/2026-09-01-schedule-ingest-stanox-crs-table-design.md)
 //!    has successfully parsed a CIF SCHEDULE delivery, this crate's main
-//!    loop periodically (`--stanox-crs-reload-secs`) `GET`s
-//!    `/private/stanox-crs` and swaps a fresh `StanoxCrsTable::from_records`
+//!    loop periodically (`--stanox-crs-reload-secs`) reads
+//!    `stanox_crs` (Postgres) and swaps a fresh `StanoxCrsTable::from_records`
 //!    into a shared `std::sync::RwLock` cell (see `main.rs`'s second
 //!    reload block, alongside its existing tracked-trains reload). A
 //!    failed or empty reload never clears the currently-loaded table --
@@ -154,7 +154,7 @@ impl StanoxCrsTable {
         Ok(Self { by_stanox })
     }
 
-    /// Builds a table directly from `api`'s `GET /private/stanox-crs`
+    /// Builds a table directly from `ds_store::reads::list_stanox_crs`'s
     /// response rows -- the live-reload counterpart to `from_file`/`parse`.
     /// `tiploc`/`station_name`/`source_sequence` are not needed for
     /// lookup and are dropped here; only `stanox`/`crs` matter to

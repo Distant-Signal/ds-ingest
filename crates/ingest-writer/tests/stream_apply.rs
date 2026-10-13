@@ -1,5 +1,5 @@
 //! The writer's stream half against a live database (plan 3a.3): dedup,
-//! per-row isolation, shadow mode, and the D13 observed-time guard, through
+//! per-row isolation and the D13 observed-time guard, through
 //! [`WriterHandler`] with a test-only schema handler (the product handlers
 //! are plan 3a.6). The last two tests also need Redis (`REDIS_URL`): one
 //! entry end to end through `StreamConsumer`, and the dead-letter `MINID`
@@ -23,7 +23,7 @@ use ingest_stream::{
 };
 use ingest_writer::handlers::{Applied, BoxFuture, Registry, SchemaHandler, apply_rows, decode};
 use ingest_writer::observed::{Observed, guard};
-use ingest_writer::stream::{Mode, StreamSpec, WriterHandler};
+use ingest_writer::stream::{StreamSpec, WriterHandler};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, PgPool};
 
@@ -41,10 +41,6 @@ struct Row {
 struct AppendRows;
 
 impl SchemaHandler for AppendRows {
-    fn check(&self, entry: &StreamEntry) -> Result<(), HandlerError> {
-        decode::<Vec<Row>>(entry).map(|_| ())
-    }
-
     fn apply<'a>(
         &'a self,
         conn: &'a mut PgConnection,
@@ -81,10 +77,6 @@ struct SnapshotRow {
 struct Snapshot;
 
 impl SchemaHandler for Snapshot {
-    fn check(&self, entry: &StreamEntry) -> Result<(), HandlerError> {
-        decode::<Vec<SnapshotRow>>(entry).map(|_| ())
-    }
-
     fn apply<'a>(
         &'a self,
         conn: &'a mut PgConnection,
@@ -234,8 +226,8 @@ impl Db {
             .unwrap();
     }
 
-    fn handler(&self, mode: Mode) -> WriterHandler {
-        WriterHandler::new(self.pool.clone(), registry(), TEST_STREAM, mode)
+    fn handler(&self) -> WriterHandler {
+        WriterHandler::new(self.pool.clone(), registry(), TEST_STREAM)
     }
 }
 
@@ -261,7 +253,7 @@ fn snap(id: &str, value: i32) -> SnapshotRow {
 #[ignore = "requires a live database; run with DATABASE_URL set and --ignored"]
 async fn an_entry_is_applied_once_with_dedup() {
     let db = Db::new().await;
-    let handler = db.handler(Mode::Apply);
+    let handler = db.handler();
     let entry = db.entry(rows_schema(), "k1", Utc::now(), &[row("a", 1), row("b", 2)]);
 
     assert!(matches!(handler.handle(&entry).await, Ok(Handled::Applied)));
@@ -311,7 +303,7 @@ async fn an_entry_is_applied_once_with_dedup() {
 #[ignore = "requires a live database; run with DATABASE_URL set and --ignored"]
 async fn a_data_error_rejects_its_row_and_the_rest_commit() {
     let db = Db::new().await;
-    let handler = db.handler(Mode::Apply);
+    let handler = db.handler();
     let entry = db.entry(
         rows_schema(),
         "k1",
@@ -366,7 +358,7 @@ async fn a_data_error_rejects_its_row_and_the_rest_commit() {
 #[ignore = "requires a live database; run with DATABASE_URL set and --ignored"]
 async fn a_key_claimed_on_one_stream_is_no_duplicate_on_another() {
     let db = Db::new().await;
-    let handler = db.handler(Mode::Apply);
+    let handler = db.handler();
     let entry = db.entry(rows_schema(), "k1", Utc::now(), &[row("a", 1)]);
     assert!(matches!(handler.handle(&entry).await, Ok(Handled::Applied)));
     let elsewhere = StreamEntry {
@@ -396,35 +388,9 @@ async fn a_key_claimed_on_one_stream_is_no_duplicate_on_another() {
 
 #[tokio::test]
 #[ignore = "requires a live database; run with DATABASE_URL set and --ignored"]
-async fn shadow_mode_writes_nothing() {
-    let db = Db::new().await;
-    let handler = db.handler(Mode::Shadow);
-    let entry = db.entry(rows_schema(), "k1", Utc::now(), &[row("a", 1)]);
-    assert!(matches!(handler.handle(&entry).await, Ok(Handled::Skipped)));
-    let snapshot = db.entry(snapshot_schema(), "k2", Utc::now(), &[snap("x", 1)]);
-    assert!(matches!(
-        handler.handle(&snapshot).await,
-        Ok(Handled::Skipped)
-    ));
-    assert!(db.rows().await.is_empty());
-    assert_eq!(db.snapshot("x").await, None);
-    assert!(
-        db.dedup_keys().await.is_empty(),
-        "shadow claims no dedup key"
-    );
-    // Shadow still validates: a bad payload is poison.
-    let garbage = db.entry(rows_schema(), "k3", Utc::now(), &"not rows");
-    assert!(matches!(
-        handler.handle(&garbage).await,
-        Err(HandlerError::Poison(_))
-    ));
-}
-
-#[tokio::test]
-#[ignore = "requires a live database; run with DATABASE_URL set and --ignored"]
 async fn an_observed_time_ahead_is_clamped_when_written() {
     let db = Db::new().await;
-    let handler = db.handler(Mode::Apply);
+    let handler = db.handler();
     let before = Utc::now();
     // produced_at an hour ahead (a producer's clock jumped).
     let entry = db.entry(
@@ -456,7 +422,7 @@ async fn a_row_stamped_in_the_future_is_healed_by_the_next_snapshot() {
     .execute(&db.pool)
     .await
     .unwrap();
-    let handler = db.handler(Mode::Apply);
+    let handler = db.handler();
     let now = Utc::now();
     let entry = db.entry(snapshot_schema(), "k1", now, &[snap("x", 2)]);
     assert!(matches!(handler.handle(&entry).await, Ok(Handled::Applied)));
@@ -482,7 +448,7 @@ async fn an_older_snapshot_changes_nothing() {
         .execute(&db.pool)
         .await
         .unwrap();
-    let handler = db.handler(Mode::Apply);
+    let handler = db.handler();
     let now = Utc::now();
     let newer = db.entry(snapshot_schema(), "new", now, &[snap("x", 2), snap("y", 2)]);
     assert!(matches!(handler.handle(&newer).await, Ok(Handled::Applied)));
@@ -573,7 +539,7 @@ async fn an_entry_flows_from_the_stream_to_the_database_once() {
             .await
             .unwrap();
     }
-    let handler = db.handler(Mode::Apply);
+    let handler = db.handler();
     let mut steps = Vec::new();
     for _ in 0..4 {
         let step = consumer

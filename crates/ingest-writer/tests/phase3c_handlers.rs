@@ -30,7 +30,7 @@ use common::island_of_ireland::{
 use common::{LineStatus, LineStatusReport, TocReference};
 use ingest_stream::{Envelope, Handled, Handler, HandlerError, SchemaId, StreamEntry};
 use ingest_writer::handlers::registry;
-use ingest_writer::stream::{Mode, StreamSpec, WriterHandler};
+use ingest_writer::stream::{StreamSpec, WriterHandler};
 use serde::Serialize;
 use sqlx::PgPool;
 
@@ -104,7 +104,7 @@ impl Db {
         // The entry's own stream's handler, as the writer runs one per
         // stream (security review H1: a stream applies only its schemas).
         let spec = StreamSpec::by_stream(&entry.stream).expect("a writer stream");
-        WriterHandler::new(self.pool.clone(), Arc::new(registry()), spec, Mode::Apply)
+        WriterHandler::new(self.pool.clone(), Arc::new(registry()), spec)
             .handle(entry)
             .await
     }

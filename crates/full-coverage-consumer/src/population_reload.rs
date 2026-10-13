@@ -7,11 +7,11 @@
 //! sawtooth), and a cold start or an `ETag` miss still does. It now runs
 //! here, building each new snapshot aside and swapping it in atomically
 //! ([`SharedPopulation`], an `ArcSwap`), so the loop only ever reads a
-//! complete snapshot and never waits on `api`.
+//! complete snapshot and never waits on a reload.
 //!
 //! **Why consumption waits for the first load**: the reload used to retry
-//! only after the full `population_reload_secs` (300s). When `api` was not
-//! up yet at startup (connection refused, seen at 01:24Z on 2026-09-27),
+//! only after the full `population_reload_secs` (300s). When its source was
+//! not up yet at startup (connection refused, seen at 01:24Z on 2026-09-27),
 //! up to 5 minutes of events were matched against an empty population and
 //! `ACKed` -- lost for this consumer. The first load is now awaited before
 //! anything is consumed (see [`wait_for_first_load`]), and a failed cycle
@@ -19,12 +19,12 @@
 //! the same idea as the stanox/crs reload's `failed_reload_retry_delay`.
 //!
 //! **Why a cycle stops early, and why the backoff is jittered up to 60s**
-//! (2026-10-01 outage): with api answering 5xx for six hours, every cycle
-//! still made all ~486 `(line, date)` requests back to back, and failed
-//! cycles were retried within 15s, so this one consumer sent api about
-//! 24 requests a second (~516k 5xx). Now a cycle in which the first
-//! [`ABORT_AFTER_FAILURES`] fetches all fail (nothing succeeded yet: api is
-//! down, not one line) stops there and keeps every previous snapshot, and
+//! (2026-10-01 outage): with its source (then the api) failing for six
+//! hours, every cycle still made all ~486 `(line, date)` requests back to
+//! back, and failed cycles were retried within 15s: about 24 requests a
+//! second (~516k failures). Now a cycle in which the first
+//! [`ABORT_AFTER_FAILURES`] fetches all fail (nothing succeeded yet: the
+//! source is down, not one line) stops there and keeps every previous snapshot, and
 //! consecutive failed cycles wait [`RETRY_BACKOFF`] (1s doubling to 60s,
 //! with jitter). Each cycle starts one line further along the list, so a
 //! few lines that always fail cannot stop the rest from ever loading.
@@ -36,7 +36,21 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 
 use crate::population::{LineGeometry, Population};
-use crate::queries;
+
+/// Outcome of one [`PopulationSource::fetch`] that reached its source.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LinePopulationFetch {
+    /// The population `if_none_match` described is still current. Only
+    /// possible when a validator was given.
+    NotModified,
+    /// The population as JSON text -- `null` when nothing is published yet
+    /// for that `(line, date)` -- plus its validator
+    /// (`ds_store::reads::population_version_tag`), if any.
+    ///
+    /// Left as text for the caller to deserialize, so a body that fails
+    /// to parse is still counted as a deserialize error, not a fetch error.
+    Fetched { body: String, etag: Option<String> },
+}
 
 /// A cycle stops fetching once this many fetches in a row have failed with
 /// none succeeding before them (see the module docs).
@@ -60,11 +74,11 @@ pub(crate) type SharedGeometry = Arc<ArcSwap<HashMap<String, Arc<LineGeometry>>>
 /// What one reload cycle achieved.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CycleOutcome {
-    /// Every `(line_id, date)` whose fetch failed (transport/HTTP error or
-    /// an undeserializable body). Its previous snapshot, if any, was kept.
+    /// Every `(line_id, date)` whose fetch failed (a database error or an
+    /// undeserializable body). Its previous snapshot, if any, was kept.
     pub failed: Vec<(String, chrono::NaiveDate)>,
-    /// How many `(line_id, date)` fetches reached `api` and were
-    /// understood (200 with a body or `null`, or 304).
+    /// How many `(line_id, date)` fetches reached the source and were
+    /// understood (a body or `null`, or not modified).
     pub succeeded: usize,
 }
 
@@ -104,93 +118,18 @@ pub(crate) trait PopulationSource: Sync {
         line_id: &str,
         date: chrono::NaiveDate,
         if_none_match: Option<&str>,
-    ) -> impl Future<Output = anyhow::Result<queries::LinePopulationFetch>> + Send;
+    ) -> impl Future<Output = anyhow::Result<LinePopulationFetch>> + Send;
 
-    /// `http` or `db`, for logs.
+    /// The source's name, for logs (`db`).
     fn kind(&self) -> &'static str;
 }
 
-/// `POPULATION_SOURCE=http` (the default): one conditional
-/// `GET /private/schedule-line-population` per key.
-pub(crate) struct HttpSource {
-    pub client: reqwest::Client,
-    pub url: String,
-    pub tokens: Arc<common::oauth_client::OAuthTokenCache>,
-}
-
-impl PopulationSource for HttpSource {
-    type Cycle = ();
-
-    async fn begin_cycle(&self, _line_ids: &[String], _dates: &[chrono::NaiveDate]) {}
-
-    async fn fetch(
-        &self,
-        (): &(),
-        line_id: &str,
-        date: chrono::NaiveDate,
-        if_none_match: Option<&str>,
-    ) -> anyhow::Result<queries::LinePopulationFetch> {
-        queries::fetch_line_population(
-            &self.client,
-            &self.url,
-            &self.tokens,
-            line_id,
-            date,
-            if_none_match,
-        )
-        .await
-    }
-
-    fn kind(&self) -> &'static str {
-        "http"
-    }
-}
-
-/// [`HttpSource`] over borrowed parts, for the tests' one-off cycles.
-#[cfg(test)]
-pub(crate) struct HttpSourceRef<'a> {
-    pub client: &'a reqwest::Client,
-    pub url: &'a str,
-    pub tokens: &'a common::oauth_client::OAuthTokenCache,
-}
-
-#[cfg(test)]
-impl PopulationSource for HttpSourceRef<'_> {
-    type Cycle = ();
-
-    async fn begin_cycle(&self, _line_ids: &[String], _dates: &[chrono::NaiveDate]) {}
-
-    async fn fetch(
-        &self,
-        (): &(),
-        line_id: &str,
-        date: chrono::NaiveDate,
-        if_none_match: Option<&str>,
-    ) -> anyhow::Result<queries::LinePopulationFetch> {
-        queries::fetch_line_population(
-            self.client,
-            self.url,
-            self.tokens,
-            line_id,
-            date,
-            if_none_match,
-        )
-        .await
-    }
-
-    fn kind(&self) -> &'static str {
-        "http"
-    }
-}
-
-/// `POPULATION_SOURCE=db` (spec §11.1): once per cycle,
+/// The populations from Postgres (spec §11.1): once per cycle,
 /// `ds_store::reads::list_population_versions` (one query for every key);
 /// then per key, nothing at all when the version held is still current,
 /// else `get_schedule_line_population_conditional` with the version held,
 /// so a publish between the two queries degrades to "not modified" or a
-/// fresh body. The validator is the api's `ETag`
-/// (`ds_store::reads::population_version_tag`), so a held population reads
-/// the same whichever source fetched it.
+/// fresh body. The validator is `ds_store::reads::population_version_tag`.
 pub(crate) struct DbSource {
     pub pool: sqlx::PgPool,
 }
@@ -227,16 +166,16 @@ impl PopulationSource for DbSource {
         line_id: &str,
         date: chrono::NaiveDate,
         if_none_match: Option<&str>,
-    ) -> anyhow::Result<queries::LinePopulationFetch> {
+    ) -> anyhow::Result<LinePopulationFetch> {
         let known = match db_fetch_plan(versions, line_id, date, if_none_match)? {
             DbFetchPlan::NothingPublished => {
-                // What the api answers `null`.
-                return Ok(queries::LinePopulationFetch::Fetched {
+                // Nothing published: the `null` body.
+                return Ok(LinePopulationFetch::Fetched {
                     body: "null".to_string(),
                     etag: None,
                 });
             }
-            DbFetchPlan::Unchanged => return Ok(queries::LinePopulationFetch::NotModified),
+            DbFetchPlan::Unchanged => return Ok(LinePopulationFetch::NotModified),
             DbFetchPlan::Fetch { known } => known,
         };
         Ok(
@@ -246,17 +185,17 @@ impl PopulationSource for DbSource {
             .await?
             {
                 // Deleted since the version query.
-                None => queries::LinePopulationFetch::Fetched {
+                None => LinePopulationFetch::Fetched {
                     body: "null".to_string(),
                     etag: None,
                 },
                 Some(ds_store::reads::ConditionalPopulation::NotModified { .. }) => {
-                    queries::LinePopulationFetch::NotModified
+                    LinePopulationFetch::NotModified
                 }
                 Some(ds_store::reads::ConditionalPopulation::Modified {
                     updated_at,
                     population,
-                }) => queries::LinePopulationFetch::Fetched {
+                }) => LinePopulationFetch::Fetched {
                     body: population,
                     etag: Some(ds_store::reads::population_version_tag(updated_at)),
                 },
@@ -305,7 +244,7 @@ pub(crate) fn db_fetch_plan(
 
 /// A stable checksum of the populations held for `line_ids` x `dates`:
 /// every key and its sorted uids, FNV-1a. Logged after every cycle, so the
-/// two sources can be compared over a day (spec §16 phase 4 exit).
+/// populations can be compared over a day (spec §16 phase 4 exit).
 pub(crate) fn population_checksum(
     population: &Population,
     line_ids: &[String],
@@ -341,11 +280,11 @@ pub(crate) fn population_checksum(
     hash
 }
 
-/// One reload cycle: `service_date`'s and the next day's population for
-/// every line in `line_ids` (Decision 2b -- tomorrow's too, so the rail-day
-/// rollover finds it already loaded), each conditional on the `ETag` held
-/// in `previous`. Returns a NEW snapshot; `previous` is never mutated, so
-/// the consume loop can keep reading it throughout.
+/// One reload cycle from `source`: `service_date`'s and the next day's
+/// population for every line in `line_ids` (Decision 2b -- tomorrow's too,
+/// so the rail-day rollover finds it already loaded), each conditional on
+/// the validator held in `previous`. Returns a NEW snapshot; `previous` is
+/// never mutated, so the consume loop can keep reading it throughout.
 ///
 /// Best-effort per `(line, date)`: a failure keeps that key's previous
 /// snapshot and is reported in [`CycleOutcome::failed`]; it never blocks
@@ -353,58 +292,14 @@ pub(crate) fn population_checksum(
 /// today's and tomorrow's are ever read). The reloader itself calls
 /// [`reload_cycle_with`], which also rotates the starting line.
 #[cfg(test)]
-pub(crate) async fn reload_cycle(
-    client: &reqwest::Client,
-    url: &str,
-    tokens: &common::oauth_client::OAuthTokenCache,
+pub(crate) async fn reload_cycle<S: PopulationSource>(
+    source: &S,
     line_ids: &[String],
     geometry: &HashMap<String, Arc<LineGeometry>>,
     previous: &Population,
     service_date: chrono::NaiveDate,
 ) -> (Population, CycleOutcome) {
-    reload_cycle_from(
-        client,
-        url,
-        tokens,
-        line_ids,
-        geometry,
-        previous,
-        service_date,
-        0,
-    )
-    .await
-}
-
-/// [`reload_cycle`], starting at `line_ids[start % len]`: see
-/// [`reload_cycle_with`].
-#[cfg(test)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is an independent input from the tests; a struct would only wrap them"
-)]
-pub(crate) async fn reload_cycle_from(
-    client: &reqwest::Client,
-    url: &str,
-    tokens: &common::oauth_client::OAuthTokenCache,
-    line_ids: &[String],
-    geometry: &HashMap<String, Arc<LineGeometry>>,
-    previous: &Population,
-    service_date: chrono::NaiveDate,
-    start: usize,
-) -> (Population, CycleOutcome) {
-    reload_cycle_with(
-        &HttpSourceRef {
-            client,
-            url,
-            tokens,
-        },
-        line_ids,
-        geometry,
-        previous,
-        service_date,
-        start,
-    )
-    .await
+    reload_cycle_with(source, line_ids, geometry, previous, service_date, 0).await
 }
 
 /// One cycle from `source`, starting at `line_ids[start % len]` and
@@ -445,7 +340,7 @@ pub(crate) async fn reload_cycle_with<S: PopulationSource>(
             if outcome.succeeded == 0 && failures_in_a_row >= ABORT_AFTER_FAILURES {
                 tracing::warn!(
                     failures = failures_in_a_row,
-                    "schedule population fetches keep failing with none succeeding; api looks down, so this cycle stops here and keeps every previous snapshot"
+                    "schedule population fetches keep failing with none succeeding; the source looks down, so this cycle stops here and keeps every previous snapshot"
                 );
                 aborted = true;
                 next.carry_over(previous, line_id, date);
@@ -453,15 +348,15 @@ pub(crate) async fn reload_cycle_with<S: PopulationSource>(
                 continue;
             }
             let failed_before = outcome.failed.len();
-            // The ETag of what we already hold for this key, if `api` sent
-            // one: an unchanged population then costs a bodyless 304
-            // instead of a full re-download. See `Population::etags`.
+            // The validator of what we already hold for this key, if any:
+            // an unchanged population then costs no re-read. See
+            // `Population::etags`.
             // ...unless the line's geometry changed since that population
             // was reduced: it must then be downloaded and reduced again.
             let geometry_hash = geometry.get(line_id).map_or(0, |g| g.hash);
             let if_none_match = previous.etag_if_current(line_id, date, geometry_hash);
             match source.fetch(&cycle, line_id, date, if_none_match).await {
-                Ok(queries::LinePopulationFetch::NotModified) => {
+                Ok(LinePopulationFetch::NotModified) => {
                     metrics::counter!(
                         common::metrics::metric_name(
                             "full_coverage_consumer_population_reloads_total"
@@ -472,7 +367,7 @@ pub(crate) async fn reload_cycle_with<S: PopulationSource>(
                     next.carry_over(previous, line_id, date);
                     outcome.succeeded += 1;
                 }
-                Ok(queries::LinePopulationFetch::Fetched { body, etag }) => {
+                Ok(LinePopulationFetch::Fetched { body, etag }) => {
                     metrics::counter!(
                         common::metrics::metric_name(
                             "full_coverage_consumer_population_reloads_total"
@@ -511,7 +406,7 @@ pub(crate) async fn reload_cycle_with<S: PopulationSource>(
                             outcome.succeeded += 1;
                         }
                         Err(err) => {
-                            tracing::error!(error = ?err, line_id = %line_id, %date, "failed to deserialize schedule-line-population response; keeping previous snapshot");
+                            tracing::error!(error = ?err, line_id = %line_id, %date, "failed to deserialize a schedule line population; keeping previous snapshot");
                             metrics::counter!(
                                 common::metrics::metric_name("full_coverage_consumer_errors_total"),
                                 "operation" => "reload_line_population_deserialize"
@@ -708,9 +603,6 @@ pub(crate) struct FirstLoad {
 }
 
 pub(crate) struct Reloader {
-    pub client: reqwest::Client,
-    pub url: String,
-    pub tokens: Arc<common::oauth_client::OAuthTokenCache>,
     pub line_ids: SharedLineIds,
     pub geometry: SharedGeometry,
     pub population: SharedPopulation,
@@ -721,27 +613,16 @@ pub(crate) struct Reloader {
     pub retry: common::backoff::Backoff,
     /// How long the FIRST load may keep failing for some lines (while
     /// others succeed) before consumption is let through anyway, with those
-    /// lines marked partial. While EVERY fetch fails (`api` down) the first
+    /// lines marked partial. While EVERY fetch fails (the source down) the first
     /// load is never signalled, however long that takes.
     pub initial_wait: Duration,
 }
 
 impl Reloader {
-    /// Spawns the reload loop. The returned receiver turns `Some` once, when
-    /// the first load is usable; wait on it with [`wait_for_first_load`].
-    pub(crate) fn spawn(self) -> tokio::sync::watch::Receiver<Option<FirstLoad>> {
-        let source = HttpSource {
-            client: self.client.clone(),
-            url: self.url.clone(),
-            tokens: Arc::clone(&self.tokens),
-        };
-        self.spawn_with(source)
-    }
-
-    /// [`Reloader::spawn`], fetching from `source` instead of the api
-    /// (`POPULATION_SOURCE=db`: a [`DbSource`]; `client`, `url` and
-    /// `tokens` are then unused).
-    pub(crate) fn spawn_with<S>(self, source: S) -> tokio::sync::watch::Receiver<Option<FirstLoad>>
+    /// Spawns the reload loop over `source` (a [`DbSource`] in
+    /// production). The returned receiver turns `Some` once, when the first
+    /// load is usable; wait on it with [`wait_for_first_load`].
+    pub(crate) fn spawn<S>(self, source: S) -> tokio::sync::watch::Receiver<Option<FirstLoad>>
     where
         S: PopulationSource + Send + 'static,
     {
@@ -785,8 +666,7 @@ impl Reloader {
             .await;
             cycles = cycles.wrapping_add(1);
             drop(previous);
-            // Plan 4.3's comparison of the two sources (spec §16 phase 4
-            // exit): the same checksum from either, cycle by cycle.
+            // Plan 4.3's checksum (spec §16 phase 4 exit), cycle by cycle.
             tracing::info!(
                 source = source.kind(),
                 checksum = %format!(
@@ -861,7 +741,7 @@ impl Reloader {
 
 /// Blocks until the reloader signals its first usable load, beating
 /// `progress` meanwhile (the process is alive and retrying; a restart would
-/// not make `api` come up any sooner). `Err` only if the reloader task has
+/// not make the source come up any sooner). `Err` only if the reloader task has
 /// died, which should be impossible.
 #[expect(
     clippy::expect_used,
@@ -894,8 +774,81 @@ pub(crate) async fn wait_for_first_load(
 pub(crate) mod tests {
     use super::*;
     use std::collections::HashSet;
-    use wiremock::matchers::{header, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A test [`PopulationSource`]: every fetch counts, waits `delay`, then
+    /// answers what `respond` says for `(line, date, validator held,
+    /// fetches so far)`.
+    pub(crate) struct Scripted<F> {
+        pub respond: F,
+        pub delay: Duration,
+        pub fetches: Arc<AtomicUsize>,
+    }
+
+    impl<F> Scripted<F>
+    where
+        F: Fn(&str, chrono::NaiveDate, Option<&str>, usize) -> anyhow::Result<LinePopulationFetch>
+            + Send
+            + Sync,
+    {
+        pub(crate) fn new(respond: F) -> Self {
+            Self {
+                respond,
+                delay: Duration::ZERO,
+                fetches: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        pub(crate) fn fetches(&self) -> usize {
+            self.fetches.load(Ordering::Relaxed)
+        }
+    }
+
+    impl<F> PopulationSource for Scripted<F>
+    where
+        F: Fn(&str, chrono::NaiveDate, Option<&str>, usize) -> anyhow::Result<LinePopulationFetch>
+            + Send
+            + Sync,
+    {
+        type Cycle = ();
+
+        async fn begin_cycle(&self, _line_ids: &[String], _dates: &[chrono::NaiveDate]) {}
+
+        async fn fetch(
+            &self,
+            (): &(),
+            line_id: &str,
+            date: chrono::NaiveDate,
+            if_none_match: Option<&str>,
+        ) -> anyhow::Result<LinePopulationFetch> {
+            let before = self.fetches.fetch_add(1, Ordering::Relaxed);
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            (self.respond)(line_id, date, if_none_match, before)
+        }
+
+        fn kind(&self) -> &'static str {
+            "test"
+        }
+    }
+
+    pub(crate) const BODY: &str = r#"[{"uid": "C11052", "calling_points": []}]"#;
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the shape of a `Scripted` answer, beside `down`"
+    )]
+    pub(crate) fn body(body: &str) -> anyhow::Result<LinePopulationFetch> {
+        Ok(LinePopulationFetch::Fetched {
+            body: body.to_string(),
+            etag: None,
+        })
+    }
+
+    pub(crate) fn down() -> anyhow::Result<LinePopulationFetch> {
+        Err(anyhow::anyhow!("the database is unavailable"))
+    }
 
     /// DQ11/PL-9: lines with no population for a date are counted, and the
     /// current day's count is only reported past 06:00 London on that day.
@@ -937,78 +890,32 @@ pub(crate) mod tests {
         );
     }
 
-    pub(crate) async fn mock_token_cache(
-        server: &MockServer,
-    ) -> common::oauth_client::OAuthTokenCache {
-        Mock::given(method("POST"))
-            .and(path("/token/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "fake-jwt",
-                "expires_in": 300,
-            })))
-            .mount(server)
-            .await;
-        common::oauth_client::OAuthTokenCache::new(common::oauth_client::OAuthCredentials {
-            token_url: format!("{}/token/", server.uri()),
-            client_id: "test-client".to_string(),
-            scope: "groups".to_string(),
-            username: "test-user".to_string(),
-            password: "test-password".to_string(),
-        })
-    }
-
-    const BODY: &str = r#"[{"uid": "C11052", "calling_points": []}]"#;
-
-    fn url(server: &MockServer) -> String {
-        format!("{}/private/schedule-line-population", server.uri())
-    }
-
-    /// Conditional reload, end to end through `reload_cycle`: the first
-    /// cycle downloads both dates and remembers their `ETag`s; the next
-    /// cycle sends them back, gets 304s, and keeps the snapshot it has.
-    /// The `.expect(n)` counts are the point -- they are what proves the
-    /// second cycle downloaded nothing.
+    /// A conditional reload: the first cycle reads both dates and remembers
+    /// their validators; the next cycle sends them back, is told nothing
+    /// changed, and keeps the snapshot it has.
     #[tokio::test]
-    async fn reload_cycle_revalidates_with_etags_and_keeps_the_snapshot_on_304() {
-        let server = MockServer::start().await;
-        let tokens = mock_token_cache(&server).await;
-        Mock::given(method("GET"))
-            .and(path("/private/schedule-line-population"))
-            .and(header("if-none-match", "\"slp-7\""))
-            .respond_with(ResponseTemplate::new(304).insert_header("etag", "\"slp-7\""))
-            .with_priority(1)
-            .expect(2)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/private/schedule-line-population"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("etag", "\"slp-7\"")
-                    .set_body_string(BODY),
-            )
-            .with_priority(2)
-            .expect(2)
-            .mount(&server)
-            .await;
-
-        let client = reqwest::Client::new();
+    async fn reload_cycle_revalidates_and_keeps_the_snapshot_when_unchanged() {
+        let not_modified = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&not_modified);
+        let source = Scripted::new(move |_, _, held: Option<&str>, _| {
+            if held == Some("v7") {
+                counted.fetch_add(1, Ordering::Relaxed);
+                Ok(LinePopulationFetch::NotModified)
+            } else {
+                Ok(LinePopulationFetch::Fetched {
+                    body: BODY.to_string(),
+                    etag: Some("v7".to_string()),
+                })
+            }
+        });
         let lines = vec!["waterloo-reading".to_string()];
         let today: chrono::NaiveDate = "2026-09-04".parse().unwrap();
         let tomorrow = today + chrono::Duration::days(1);
         let mut population = Population::default();
 
         for _ in 0..2 {
-            let (next, outcome) = reload_cycle(
-                &client,
-                &url(&server),
-                &tokens,
-                &lines,
-                &HashMap::new(),
-                &population,
-                today,
-            )
-            .await;
+            let (next, outcome) =
+                reload_cycle(&source, &lines, &HashMap::new(), &population, today).await;
             assert!(outcome.failed.is_empty());
             population = next;
             for date in [today, tomorrow] {
@@ -1016,43 +923,31 @@ pub(crate) mod tests {
                     population.uids_for("waterloo-reading", date),
                     vec!["C11052"]
                 );
-                assert_eq!(
-                    population.etag_for("waterloo-reading", date),
-                    Some("\"slp-7\"")
-                );
+                assert_eq!(population.etag_for("waterloo-reading", date), Some("v7"));
             }
         }
-        server.verify().await;
+        assert_eq!(source.fetches(), 4);
+        assert_eq!(not_modified.load(Ordering::Relaxed), 2);
     }
 
     /// When a line's geometry changes (a stanox/crs reload changed its
     /// TIPLOCs), its held population was reduced against the old one: the
-    /// next cycle must download it again, not accept a `304`.
+    /// next cycle must read it whole again, not accept "not modified".
     #[tokio::test]
-    async fn a_geometry_change_forces_a_refetch_instead_of_a_304() {
-        let server = MockServer::start().await;
-        let tokens = mock_token_cache(&server).await;
-        Mock::given(method("GET"))
-            .and(path("/private/schedule-line-population"))
-            .and(header("if-none-match", "\"slp-7\""))
-            .respond_with(ResponseTemplate::new(304).insert_header("etag", "\"slp-7\""))
-            .with_priority(1)
-            .expect(2)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/private/schedule-line-population"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("etag", "\"slp-7\"")
-                    .set_body_string(BODY),
-            )
-            .with_priority(2)
-            .expect(4)
-            .mount(&server)
-            .await;
-
-        let client = reqwest::Client::new();
+    async fn a_geometry_change_forces_a_refetch() {
+        let whole = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&whole);
+        let source = Scripted::new(move |_, _, held: Option<&str>, _| {
+            if held == Some("v7") {
+                Ok(LinePopulationFetch::NotModified)
+            } else {
+                counted.fetch_add(1, Ordering::Relaxed);
+                Ok(LinePopulationFetch::Fetched {
+                    body: BODY.to_string(),
+                    etag: Some("v7".to_string()),
+                })
+            }
+        });
         let lines = vec!["waterloo-reading".to_string()];
         let today: chrono::NaiveDate = "2026-09-04".parse().unwrap();
         let geometry = |tiplocs: &[&str]| {
@@ -1071,22 +966,14 @@ pub(crate) mod tests {
         let after = geometry(&["WATRLMN", "RDNGSTN", "WOKING"]);
 
         let mut population = Population::default();
-        // Cycle 1: download. Cycle 2: same geometry, 304s. Cycle 3: the
-        // geometry changed, so both dates are downloaded again.
+        // Cycle 1: read. Cycle 2: same geometry, not modified. Cycle 3: the
+        // geometry changed, so both dates are read whole again.
         for g in [&before, &before, &after] {
-            let (next, outcome) = reload_cycle(
-                &client,
-                &url(&server),
-                &tokens,
-                &lines,
-                g,
-                &population,
-                today,
-            )
-            .await;
+            let (next, outcome) = reload_cycle(&source, &lines, g, &population, today).await;
             assert!(outcome.failed.is_empty());
             population = next;
         }
+        assert_eq!(whole.load(Ordering::Relaxed), 4);
         assert_eq!(
             population
                 .line_pop("waterloo-reading", today)
@@ -1094,47 +981,6 @@ pub(crate) mod tests {
                 .geometry_hash,
             after["waterloo-reading"].hash
         );
-        server.verify().await;
-    }
-
-    /// The other compatibility direction: an `api` predating conditional
-    /// GET sends no `ETag`, so every cycle is a plain full download, and
-    /// the population is still loaded exactly as before.
-    #[tokio::test]
-    async fn reload_cycle_against_an_api_without_etags_downloads_every_cycle() {
-        let server = MockServer::start().await;
-        let tokens = mock_token_cache(&server).await;
-        Mock::given(method("GET"))
-            .and(path("/private/schedule-line-population"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(BODY))
-            .expect(4)
-            .mount(&server)
-            .await;
-
-        let client = reqwest::Client::new();
-        let lines = vec!["waterloo-reading".to_string()];
-        let today: chrono::NaiveDate = "2026-09-04".parse().unwrap();
-        let mut population = Population::default();
-
-        for _ in 0..2 {
-            let (next, _) = reload_cycle(
-                &client,
-                &url(&server),
-                &tokens,
-                &lines,
-                &HashMap::new(),
-                &population,
-                today,
-            )
-            .await;
-            population = next;
-            assert_eq!(
-                population.uids_for("waterloo-reading", today),
-                vec!["C11052"]
-            );
-            assert_eq!(population.etag_for("waterloo-reading", today), None);
-        }
-        server.verify().await;
     }
 
     /// Regression test: a rail-replacement bus (`train_status` `5`) or a
@@ -1143,24 +989,18 @@ pub(crate) mod tests {
     /// status (an older `schedule-reference`), are kept.
     #[tokio::test]
     async fn buses_and_ships_are_left_out_of_the_population() {
-        let server = MockServer::start().await;
-        let tokens = mock_token_cache(&server).await;
-        Mock::given(method("GET"))
-            .and(path("/private/schedule-line-population"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
+        let source = Scripted::new(|_, _, _, _| {
+            body(
                 r#"[{"uid": "C11052", "calling_points": [], "train_status": "P", "operator_atoc": "SW"},
                     {"uid": "B00001", "calling_points": [], "train_status": "5", "operator_atoc": "SW"},
                     {"uid": "B00002", "calling_points": [], "train_status": "B"},
                     {"uid": "S00001", "calling_points": [], "train_status": "S"},
                     {"uid": "C22222", "calling_points": []}]"#,
-            ))
-            .mount(&server)
-            .await;
+            )
+        });
         let today: chrono::NaiveDate = "2026-09-04".parse().unwrap();
         let (next, outcome) = reload_cycle(
-            &reqwest::Client::new(),
-            &url(&server),
-            &tokens,
+            &source,
             &["waterloo-reading".to_string()],
             &HashMap::new(),
             &Population::default(),
@@ -1188,17 +1028,10 @@ pub(crate) mod tests {
     }
 
     /// A failed fetch keeps the previous snapshot for that key -- a
-    /// transient `api` error must not empty a line's population.
+    /// transient error must not empty a line's population.
     #[tokio::test]
     async fn a_failed_fetch_keeps_the_previous_snapshot_and_is_reported() {
-        let server = MockServer::start().await;
-        let tokens = mock_token_cache(&server).await;
-        Mock::given(method("GET"))
-            .and(path("/private/schedule-line-population"))
-            .respond_with(ResponseTemplate::new(503))
-            .mount(&server)
-            .await;
-
+        let source = Scripted::new(|_, _, _, _| down());
         let today: chrono::NaiveDate = "2026-09-04".parse().unwrap();
         let mut previous = Population::default();
         previous.insert(
@@ -1213,16 +1046,8 @@ pub(crate) mod tests {
             }],
         );
         let lines = vec!["waterloo-reading".to_string()];
-        let (next, outcome) = reload_cycle(
-            &reqwest::Client::new(),
-            &url(&server),
-            &tokens,
-            &lines,
-            &HashMap::new(),
-            &previous,
-            today,
-        )
-        .await;
+        let (next, outcome) =
+            reload_cycle(&source, &lines, &HashMap::new(), &previous, today).await;
         assert_eq!(outcome.failed.len(), 2);
         assert_eq!(
             outcome.failed_on(today),
@@ -1231,16 +1056,9 @@ pub(crate) mod tests {
         assert_eq!(next.uids_for("waterloo-reading", today), vec!["C11052"]);
     }
 
-    fn reloader(
-        server: &MockServer,
-        tokens: common::oauth_client::OAuthTokenCache,
-        lines: &[&str],
-    ) -> (Reloader, SharedPopulation) {
+    pub(crate) fn reloader(lines: &[&str]) -> (Reloader, SharedPopulation) {
         let population: SharedPopulation = Arc::new(ArcSwap::from_pointee(Population::default()));
         let reloader = Reloader {
-            client: reqwest::Client::new(),
-            url: url(server),
-            tokens: Arc::new(tokens),
             line_ids: Arc::new(ArcSwap::from_pointee(
                 lines.iter().map(ToString::to_string).collect(),
             )),
@@ -1260,34 +1078,19 @@ pub(crate) mod tests {
         (0..n).map(|i| format!("line-{i}")).collect()
     }
 
-    /// 2026-10-01: with api down, every cycle still made all ~486 requests.
-    /// Now three failures with nothing succeeding stop the cycle; every key
-    /// keeps its previous snapshot and is reported failed.
+    /// 2026-10-01: with the source down, every cycle still made all ~486
+    /// requests. Now three failures with nothing succeeding stop the cycle;
+    /// every key keeps its previous snapshot and is reported failed.
     #[tokio::test]
-    async fn a_cycle_stops_after_three_failures_while_api_is_down() {
-        let server = MockServer::start().await;
-        let tokens = mock_token_cache(&server).await;
-        Mock::given(method("GET"))
-            .and(path("/private/schedule-line-population"))
-            .respond_with(ResponseTemplate::new(503))
-            .expect(ABORT_AFTER_FAILURES as u64)
-            .mount(&server)
-            .await;
+    async fn a_cycle_stops_after_three_failures_while_the_source_is_down() {
+        let source = Scripted::new(|_, _, _, _| down());
         let today: chrono::NaiveDate = "2026-10-01".parse().unwrap();
         let mut previous = Population::default();
         previous.insert_uids("line-4", today, ["C1".to_string()].into(), None);
 
-        let (next, outcome) = reload_cycle(
-            &reqwest::Client::new(),
-            &url(&server),
-            &tokens,
-            &lines(5),
-            &HashMap::new(),
-            &previous,
-            today,
-        )
-        .await;
-        server.verify().await;
+        let (next, outcome) =
+            reload_cycle(&source, &lines(5), &HashMap::new(), &previous, today).await;
+        assert_eq!(source.fetches(), ABORT_AFTER_FAILURES);
         assert_eq!(outcome.succeeded, 0);
         assert_eq!(outcome.failed.len(), 10, "every key is reported failed");
         assert_eq!(
@@ -1297,38 +1100,24 @@ pub(crate) mod tests {
         );
     }
 
-    /// One line failing while api is up must not stop the others: once
-    /// anything has succeeded, the cycle fetches every key.
+    /// One line failing while the source is up must not stop the others:
+    /// once anything has succeeded, the cycle fetches every key.
     #[tokio::test]
     async fn failures_after_a_success_do_not_stop_the_cycle() {
-        let server = MockServer::start().await;
-        let tokens = mock_token_cache(&server).await;
-        Mock::given(method("GET"))
-            .and(path("/private/schedule-line-population"))
-            .and(wiremock::matchers::query_param("line_id", "line-0"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(BODY))
-            .with_priority(1)
-            .expect(2)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/private/schedule-line-population"))
-            .respond_with(ResponseTemplate::new(500))
-            .with_priority(2)
-            .expect(8)
-            .mount(&server)
-            .await;
+        let source = Scripted::new(
+            |line: &str, _, _, _| {
+                if line == "line-0" { body(BODY) } else { down() }
+            },
+        );
         let (_, outcome) = reload_cycle(
-            &reqwest::Client::new(),
-            &url(&server),
-            &tokens,
+            &source,
             &lines(5),
             &HashMap::new(),
             &Population::default(),
             "2026-10-01".parse().unwrap(),
         )
         .await;
-        server.verify().await;
+        assert_eq!(source.fetches(), 10);
         assert_eq!(outcome.succeeded, 2);
         assert_eq!(outcome.failed.len(), 8);
     }
@@ -1337,101 +1126,67 @@ pub(crate) mod tests {
     /// at the front of the list cannot starve the rest.
     #[tokio::test]
     async fn a_rotated_cycle_reaches_lines_behind_failing_ones() {
-        let server = MockServer::start().await;
-        let tokens = mock_token_cache(&server).await;
-        Mock::given(method("GET"))
-            .and(path("/private/schedule-line-population"))
-            .and(wiremock::matchers::query_param("line_id", "line-2"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(BODY))
-            .with_priority(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/private/schedule-line-population"))
-            .respond_with(ResponseTemplate::new(500))
-            .with_priority(2)
-            .mount(&server)
-            .await;
+        let source = Scripted::new(
+            |line: &str, _, _, _| {
+                if line == "line-2" { body(BODY) } else { down() }
+            },
+        );
         let today: chrono::NaiveDate = "2026-10-01".parse().unwrap();
-        let fetch = |start| {
-            let (server, tokens) = (&server, &tokens);
-            async move {
-                reload_cycle_from(
-                    &reqwest::Client::new(),
-                    &url(server),
-                    tokens,
-                    &lines(3),
-                    &HashMap::new(),
-                    &Population::default(),
-                    today,
-                    start,
-                )
-                .await
-            }
-        };
-        let (_, from_0) = fetch(0).await;
+        let (_, from_0) = reload_cycle_with(
+            &source,
+            &lines(3),
+            &HashMap::new(),
+            &Population::default(),
+            today,
+            0,
+        )
+        .await;
         assert_eq!(
             from_0.succeeded, 0,
             "line-0 and line-1 fail first, so line-2 is never tried"
         );
-        let (next, from_2) = fetch(2).await;
+        let (next, from_2) = reload_cycle_with(
+            &source,
+            &lines(3),
+            &HashMap::new(),
+            &Population::default(),
+            today,
+            2,
+        )
+        .await;
         assert_eq!(from_2.succeeded, 2);
         assert_eq!(next.uids_for("line-2", today), vec!["C11052"]);
     }
 
-    /// Consecutive failed cycles back off: with api down, a 100ms backoff
-    /// doubling (jittered down to half at most) allows at most 5 cycles in
-    /// the first second -- 2 requests each for one line -- where a fixed
-    /// 100ms retry would make about 10.
+    /// Consecutive failed cycles back off: with the source down, a 100ms
+    /// backoff doubling (jittered down to half at most) allows at most 5
+    /// cycles in the first second -- 2 fetches each for one line -- where a
+    /// fixed 100ms retry would make about 10.
     #[tokio::test]
     async fn consecutive_failed_cycles_back_off() {
-        let server = MockServer::start().await;
-        let tokens = mock_token_cache(&server).await;
-        Mock::given(method("GET"))
-            .and(path("/private/schedule-line-population"))
-            .respond_with(ResponseTemplate::new(503))
-            .mount(&server)
-            .await;
-        let (mut reloader, _) = reloader(&server, tokens, &["waterloo-reading"]);
+        let source = Scripted::new(|_, _, _, _| down());
+        let fetches = Arc::clone(&source.fetches);
+        let (mut reloader, _) = reloader(&["waterloo-reading"]);
         reloader.retry =
             common::backoff::Backoff::new(Duration::from_millis(100), Duration::from_secs(60));
-        let _rx = reloader.spawn();
+        let _rx = reloader.spawn(source);
         tokio::time::sleep(Duration::from_millis(1000)).await;
-        let gets = server
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .filter(|r| r.method.as_str() == "GET")
-            .count();
-        assert!(gets >= 4, "it keeps retrying: {gets} GETs");
-        assert!(gets <= 12, "but backs off: {gets} GETs in 1s");
+        let fetches = fetches.load(Ordering::Relaxed);
+        assert!(fetches >= 4, "it keeps retrying: {fetches} fetches");
+        assert!(fetches <= 12, "but backs off: {fetches} fetches in 1s");
     }
 
-    /// `api` refusing (here: 503) at startup must not cost a full reload
-    /// interval: the reloader retries on its short backoff, and the first
-    /// load is only signalled once the fetch really succeeds -- never
-    /// against the empty population.
+    /// The source failing at startup must not cost a full reload interval:
+    /// the reloader retries on its short backoff, and the first load is
+    /// only signalled once the fetch really succeeds -- never against the
+    /// empty population.
     #[tokio::test]
     async fn a_failed_first_load_retries_quickly_and_is_only_signalled_on_success() {
-        let server = MockServer::start().await;
-        let tokens = mock_token_cache(&server).await;
-        Mock::given(method("GET"))
-            .and(path("/private/schedule-line-population"))
-            .respond_with(ResponseTemplate::new(503))
-            .up_to_n_times(4) // two failing cycles (today + tomorrow each)
-            .with_priority(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/private/schedule-line-population"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(BODY))
-            .with_priority(2)
-            .mount(&server)
-            .await;
-
-        let (reloader, population) = reloader(&server, tokens, &["waterloo-reading"]);
-        let mut rx = reloader.spawn();
+        // Two failing cycles (today + tomorrow each), then success.
+        let source = Scripted::new(|_, _, _, before| if before < 4 { down() } else { body(BODY) });
+        let fetches = Arc::clone(&source.fetches);
+        let (reloader, population) = reloader(&["waterloo-reading"]);
+        let mut rx = reloader.spawn(source);
         let started = std::time::Instant::now();
         let first = wait_for_first_load(
             &mut rx,
@@ -1446,12 +1201,11 @@ pub(crate) mod tests {
             "retried on the short backoff, not the {}s interval",
             3600
         );
-        let requests = server.received_requests().await.unwrap();
-        let gets = requests
-            .iter()
-            .filter(|r| r.method.as_str() == "GET")
-            .count();
-        assert_eq!(gets, 6, "two failing cycles, then one that succeeded");
+        assert_eq!(
+            fetches.load(Ordering::Relaxed),
+            6,
+            "two failing cycles, then one that succeeded"
+        );
         assert_eq!(
             population
                 .load()
@@ -1461,37 +1215,26 @@ pub(crate) mod tests {
         );
     }
 
-    /// While every fetch fails (`api` down), the first load is never
+    /// While every fetch fails (the source down), the first load is never
     /// signalled, however long -- consumption must not start against an
     /// empty population.
     #[tokio::test]
     async fn the_first_load_is_never_signalled_while_every_fetch_fails() {
-        let server = MockServer::start().await;
-        let tokens = mock_token_cache(&server).await;
-        Mock::given(method("GET"))
-            .and(path("/private/schedule-line-population"))
-            .respond_with(ResponseTemplate::new(503))
-            .mount(&server)
-            .await;
-        let (mut reloader, _) = reloader(&server, tokens, &["waterloo-reading"]);
+        let source = Scripted::new(|_, _, _, _| down());
+        let fetches = Arc::clone(&source.fetches);
+        let (mut reloader, _) = reloader(&["waterloo-reading"]);
         reloader.initial_wait = Duration::ZERO;
-        let mut rx = reloader.spawn();
+        let mut rx = reloader.spawn(source);
         let waited =
             tokio::time::timeout(Duration::from_millis(500), rx.wait_for(Option::is_some)).await;
         assert!(
             waited.is_err(),
-            "no first load while api refuses everything"
+            "no first load while the source refuses everything"
         );
-        let gets = server
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .filter(|r| r.method.as_str() == "GET")
-            .count();
+        let fetches = fetches.load(Ordering::Relaxed);
         assert!(
-            gets >= 6,
-            "and it kept retrying quickly meanwhile (got {gets} GETs)"
+            fetches >= 6,
+            "and it kept retrying quickly meanwhile (got {fetches} fetches)"
         );
     }
 
@@ -1500,24 +1243,16 @@ pub(crate) mod tests {
     /// is reported so its day can be marked partial.
     #[tokio::test]
     async fn a_persistently_failing_line_is_reported_missing_after_the_initial_wait() {
-        let server = MockServer::start().await;
-        let tokens = mock_token_cache(&server).await;
-        Mock::given(method("GET"))
-            .and(path("/private/schedule-line-population"))
-            .and(wiremock::matchers::query_param("line_id", "broken-line"))
-            .respond_with(ResponseTemplate::new(500))
-            .with_priority(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/private/schedule-line-population"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(BODY))
-            .with_priority(2)
-            .mount(&server)
-            .await;
-        let (mut reloader, _) = reloader(&server, tokens, &["waterloo-reading", "broken-line"]);
+        let source = Scripted::new(|line: &str, _, _, _| {
+            if line == "broken-line" {
+                down()
+            } else {
+                body(BODY)
+            }
+        });
+        let (mut reloader, _) = reloader(&["waterloo-reading", "broken-line"]);
         reloader.initial_wait = Duration::from_millis(100);
-        let mut rx = reloader.spawn();
+        let mut rx = reloader.spawn(source);
         let first = tokio::time::timeout(
             Duration::from_secs(5),
             wait_for_first_load(
@@ -1532,7 +1267,7 @@ pub(crate) mod tests {
     }
 }
 
-/// `POPULATION_SOURCE=db` (plan 4.3). The plan is unit-tested; the cycles
+/// [`DbSource`] (plan 4.3). The plan is unit-tested; the cycles
 /// run against a throwaway database (`#[sqlx::test]`, migrated from
 /// ds-store's migrations), so `DATABASE_URL` must be able to create
 /// databases.
@@ -1585,10 +1320,10 @@ mod db_tests {
             line_id: &str,
             date: chrono::NaiveDate,
             if_none_match: Option<&str>,
-        ) -> anyhow::Result<queries::LinePopulationFetch> {
+        ) -> anyhow::Result<LinePopulationFetch> {
             self.fetches.fetch_add(1, Ordering::Relaxed);
             let fetched = self.inner.fetch(cycle, line_id, date, if_none_match).await;
-            if let Ok(queries::LinePopulationFetch::Fetched { body, .. }) = &fetched
+            if let Ok(LinePopulationFetch::Fetched { body, .. }) = &fetched
                 && body != "null"
             {
                 self.bodies

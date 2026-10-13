@@ -1,4 +1,4 @@
-//! TRUST reason codes, forwarded to `api`'s `POST /private/train-reasons`
+//! TRUST reason codes, written through the sink
 //! (`common::TrainReasonMessage`, stored in `train_reasons`). This runs
 //! beside [`crate::process::process_message`], not inside it: `0006`
 //! Change of Origin has no backlog row at all, and a reason must never

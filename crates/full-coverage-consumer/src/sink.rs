@@ -1,15 +1,13 @@
-//! Where each stats write goes (ingest architecture plan 3a.8, spec §13.1),
-//! chosen by `INGEST_SINK`:
-//!
-//! | Sink | Each stats write |
-//! |---|---|
-//! | `http` (default) | today's three POSTs (`/private/full-coverage-stats`, `/private/full-coverage-window-stats` when windowed, `/private/station-full-coverage-samples`) |
-//! | `http+shadow` | the same POSTs, then the outputs the api accepted `XADD`ed to `ds:ingest:full-coverage`, best effort |
-//! | `stream` | XADD only |
+//! Where each stats write goes (ingest architecture plan 3a.8, spec
+//! §13.1): one snapshot `XADD`ed to `ds:ingest:full-coverage`, which the
+//! ingest-writer applies. Release B (ingest phase 5) removed the `http` and
+//! `http+shadow` sinks (the api's `/private/full-coverage-stats`,
+//! `/private/full-coverage-window-stats` and
+//! `/private/station-full-coverage-samples`).
 //!
 //! **One snapshot per stats write**: the three outputs
 //! (`full-coverage-stats/1`, `full-coverage-window-stats/1`,
-//! `station-full-coverage-samples/1`, each body today's POST body) share
+//! `station-full-coverage-samples/1`, each body the old POST body) share
 //! one producer item, with the write's `now` as `produced_at`, so under the
 //! latest-only policy a newer write replaces an unsent one whole, never one
 //! output of it. The write never waits for the XADD: the consume loop must
@@ -18,18 +16,17 @@
 //!
 //! `full_coverage_consumer_window_rows_posted_total` (what
 //! `DistantSignalFullCoverageWindowStatsStalled` watches) counts window rows
-//! delivered either way: on the POST's success, or under `stream` once the
-//! snapshot is written.
+//! once the snapshot carrying them is written.
 
 use chrono::{DateTime, Utc};
 use common::{FullCoverageLineStatsRow, FullCoverageWindowStatsRow, StationFullCoverageSample};
 use ingest_stream::SchemaId;
 use ingest_stream::envelope::EnvelopeError;
-use ingest_stream::snapshot::{ROWS_PER_PART, SinkMode, Snapshot, SnapshotProducer};
+use ingest_stream::snapshot::{ROWS_PER_PART, Snapshot, SnapshotProducer};
 
 use crate::config::Config;
 
-/// The three schemas' names (`/1`), for [`StatsSink::accepted`].
+/// The three schemas' names (`/1`).
 pub(crate) const LINE_STATS: &str = "full-coverage-stats";
 pub(crate) const WINDOW_STATS: &str = "full-coverage-window-stats";
 pub(crate) const STATION_SAMPLES: &str = "station-full-coverage-samples";
@@ -39,8 +36,7 @@ fn schema(name: &str) -> SchemaId {
     SchemaId::new(name, 1).expect("valid schema id")
 }
 
-/// One stats write's outputs, as the api accepted them (`http+shadow`) or
-/// as built (`stream`).
+/// One stats write's outputs.
 #[derive(Default)]
 pub(crate) struct StatsOutputs<'a> {
     pub lines: &'a [FullCoverageLineStatsRow],
@@ -48,94 +44,45 @@ pub(crate) struct StatsOutputs<'a> {
     pub stations: &'a [StationFullCoverageSample],
 }
 
-/// The configured sink.
+/// The `ds:ingest:full-coverage` producer.
 pub(crate) struct StatsSink {
-    mode: SinkMode,
-    stream: Option<SnapshotProducer>,
+    stream: SnapshotProducer,
 }
 
 impl StatsSink {
-    /// From `INGEST_SINK`, over the consumer's own Redis (`REDIS_URL`,
-    /// the `full-coverage-consumer` ACL user, which may XADD and XREVRANGE
+    /// Over the consumer's own Redis (`REDIS_URL`, the
+    /// `full-coverage-consumer` ACL user, which may XADD and XREVRANGE
     /// `ds:ingest:full-coverage`).
     pub(crate) fn from_config(config: &Config) -> anyhow::Result<Self> {
-        let stream = if config.ingest_sink.produces() {
-            let url = common::redis_auth::redis_url_with_credentials(
-                &config.redis_url,
-                config.redis_username.as_deref(),
-                config.redis_password.as_ref(),
-            )?;
-            let client = redis::Client::open(url.expose()).map_err(|_| {
-                anyhow::anyhow!("REDIS_URL is not a valid Redis URL (value not shown)")
-            })?;
-            Some(SnapshotProducer::new(
+        let url = common::redis_auth::redis_url_with_credentials(
+            &config.redis_url,
+            config.redis_username.as_deref(),
+            config.redis_password.as_ref(),
+        )?;
+        let client = redis::Client::open(url.expose())
+            .map_err(|_| anyhow::anyhow!("REDIS_URL is not a valid Redis URL (value not shown)"))?;
+        Ok(Self {
+            stream: SnapshotProducer::new(
                 client,
                 ingest_stream::streams::FULL_COVERAGE,
                 "full-coverage-consumer",
-                vec![
-                    schema(LINE_STATS),
-                    schema(WINDOW_STATS),
-                    schema(STATION_SAMPLES),
-                ],
-            ))
-        } else {
-            None
-        };
-        Ok(Self {
-            mode: config.ingest_sink,
-            stream,
+            ),
         })
     }
 
-    /// The `http` sink, for tests.
+    /// A sink on test stream `stream` at `redis_url`.
     #[cfg(test)]
-    pub(crate) fn http() -> Self {
+    pub(crate) fn on_stream(redis_url: &str, stream: &str) -> Self {
         Self {
-            mode: SinkMode::Http,
-            stream: None,
+            stream: tests::producer(redis_url, stream),
         }
     }
 
-    /// A sink in `mode` on test stream `stream` at `redis_url`.
-    #[cfg(test)]
-    pub(crate) fn on_stream(mode: SinkMode, redis_url: &str, stream: &str) -> Self {
-        Self {
-            mode,
-            stream: Some(tests::producer(redis_url, stream)),
-        }
-    }
-
-    pub(crate) fn mode(&self) -> SinkMode {
-        self.mode
-    }
-
-    /// Whether the api gets the `POST`s (`http`, `http+shadow`).
-    pub(crate) fn posts_http(&self) -> bool {
-        self.mode.posts_http()
-    }
-
-    /// Counts rows the api accepted (`ingest_stream_sink_rows_total`,
-    /// `sink="http"`), for the rollout's compare step.
-    pub(crate) fn accepted(schema: &'static str, rows: usize) {
-        if rows > 0 {
-            ingest_stream::metrics::sink_rows(
-                ingest_stream::streams::FULL_COVERAGE,
-                schema,
-                "http",
-                rows,
-            );
-        }
-    }
-
-    /// XADDs one stats write (`http+shadow`: what the api accepted;
-    /// `stream`: everything), as one snapshot at `produced_at`. Never
-    /// waits for the XADD and never fails the write: an encoding failure
-    /// is logged (and counted as `oversize` when it is one).
+    /// XADDs one stats write as one snapshot at `produced_at`. Never waits
+    /// for the XADD and never fails the write: an encoding failure is
+    /// logged (and counted as `oversize` when it is one).
     pub(crate) async fn produce(&self, produced_at: DateTime<Utc>, outputs: &StatsOutputs<'_>) {
-        let Some(stream) = self.stream.as_ref().filter(|_| self.mode.produces()) else {
-            return;
-        };
-        let snapshot = match encode(stream, produced_at, outputs) {
+        let snapshot = match encode(&self.stream, produced_at, outputs) {
             Ok(snapshot) if snapshot.is_empty() => return,
             Ok(snapshot) => snapshot,
             Err(err) => {
@@ -143,17 +90,17 @@ impl StatsSink {
                 return;
             }
         };
-        let receipt = match stream.submit(snapshot).await {
+        let receipt = match self.stream.submit(snapshot).await {
             Ok(receipt) => receipt,
             Err(err) => {
                 tracing::warn!(error = %err, "full-coverage stats snapshot not queued");
                 return;
             }
         };
-        // Under `stream`, the stalled-windows alert's counter moves when
-        // the window rows are delivered, as it does on a POST's success.
+        // The stalled-windows alert's counter moves when the window rows
+        // are delivered.
         let windows = outputs.windows.len();
-        if self.mode == SinkMode::Stream && windows > 0 {
+        if windows > 0 {
             tokio::spawn(async move {
                 if receipt.written().await.is_ok() {
                     metrics::counter!(common::metrics::metric_name(
@@ -212,11 +159,6 @@ mod tests {
             redis::Client::open(redis_url).unwrap(),
             Box::leak(stream.to_owned().into_boxed_str()),
             "full-coverage-consumer",
-            vec![
-                schema(LINE_STATS),
-                schema(WINDOW_STATS),
-                schema(STATION_SAMPLES),
-            ],
         )
     }
 
@@ -303,8 +245,7 @@ mod tests {
                 .as_nanos()
         );
         let sink = StatsSink {
-            mode: SinkMode::Stream,
-            stream: Some(producer(&redis_url, &stream)),
+            stream: producer(&redis_url, &stream),
         };
         let at: DateTime<Utc> = "2026-10-08T12:00:00.500Z".parse().unwrap();
         let lines = [line("a"), line("b")];
@@ -333,10 +274,7 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline, "not written: {len}");
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert_eq!(
-            sink.stream.as_ref().unwrap().cursor().await.unwrap(),
-            Some(at)
-        );
+        assert_eq!(sink.stream.cursor().await.unwrap(), Some(at));
         let _: () = redis::cmd("DEL")
             .arg(&stream)
             .query_async(&mut conn)

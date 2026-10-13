@@ -51,34 +51,23 @@ pub(crate) struct Config {
     #[arg(long, env, default_value_t = 60)]
     pub redis_gap_check_secs: u64,
 
-    /// The `api` crate's ingestion endpoint for this crate's own event
-    /// batches. Used only with `INGEST_SINK=http`.
-    #[arg(
-        long,
-        env,
-        default_value = "http://api:8080/private/trust-event-backlog"
-    )]
-    pub api_ingest_url: String,
-
-    /// Where each batch goes (ingest architecture plan 3b.1, spec R1):
-    /// `http` (the default, today's behaviour) POSTs the backlog events,
-    /// the reason codes and the STANOX/CRS reload to the api's `/private`
-    /// routes; `db` writes and reads Postgres directly
+    /// Where each batch goes: only `db` (ingest architecture plan 3b.1,
+    /// spec R1), which writes and reads Postgres directly
     /// (`ds_store::backlog::ingest_trust_event_backlog`,
     /// `ds_store::backlog::reasons::upsert_reasons`,
-    /// `ds_store::reference::list_stanox_crs`), as the `trust_backlog`
-    /// role. See `sink.rs`.
-    #[arg(long, env, value_enum, default_value_t = IngestSink::Http)]
-    pub ingest_sink: IngestSink,
+    /// `ds_store::reference::list_stanox_crs`) as the `trust_backlog` role.
+    /// See `sink.rs`. `http` (the api's `/private` routes) was removed in
+    /// release B (ingest phase 5, docs/ingest-phase5-runbook.md), so an old
+    /// `INGEST_SINK=http` fails at startup; the next release drops the
+    /// variable.
+    #[arg(long, env, default_value = "db", value_parser = ["db"])]
+    pub ingest_sink: String,
 
-    /// Postgres, for `INGEST_SINK=db` (required then, unused otherwise).
-    /// Pool size and timeouts come from the shared `DATABASE_*` variables
-    /// (`common::pg`); the default pool is 3 (spec §6.6, role limit 4).
+    /// Postgres, as the `trust_backlog` role. Pool size and timeouts come
+    /// from the shared `DATABASE_*` variables (`common::pg`); the default
+    /// pool is 3 (spec §6.6, role limit 4).
     #[arg(long, env, hide_env_values = true)]
-    pub database_url: Option<common::secret::Secret>,
-
-    #[command(flatten)]
-    pub internal_oauth: common::oauth_client::InternalOAuthArgs,
+    pub database_url: common::secret::Secret,
 
     /// STANOX->CRS translation table, loaded once at startup. Same file
     /// format/provenance as `trust-consumer`'s identical field --
@@ -97,11 +86,9 @@ pub(crate) struct Config {
     )]
     pub stanox_crs: StanoxCrsTable,
 
+    /// How often the live STANOX/CRS table is re-read from Postgres.
     #[arg(long, env, default_value_t = 3600)]
     pub stanox_crs_reload_secs: u64,
-
-    #[arg(long, env, default_value = "http://api:8080/private/stanox-crs")]
-    pub stanox_crs_url: String,
 
     /// Static line catalogue, needed to build the CRS reverse index this
     /// consumer scopes its writes by (Task 8) -- built independently of,
@@ -120,8 +107,8 @@ pub(crate) struct Config {
     /// (which still needs its own `failureThreshold * periodSeconds` on top
     /// of this). A healthy iteration takes a few seconds (the `XREADGROUP`
     /// blocks for at most 5s); this is sized well above the worst
-    /// legitimate one, every HTTP call in it being bounded by
-    /// `common::ingest::CONSUMER_REQUEST_TIMEOUT` (60s).
+    /// legitimate one, every database call in it being bounded by the
+    /// pool's acquire and statement timeouts (`common::pg`).
     #[arg(long, env, default_value_t = 300)]
     pub progress_stall_secs: u64,
     #[arg(long, env, default_value_t = 9096)]
@@ -156,24 +143,11 @@ pub(crate) struct Config {
     pub trust_event_backlog_retention_days: i64,
 }
 
-/// `INGEST_SINK`: see [`Config::ingest_sink`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
-pub(crate) enum IngestSink {
-    #[default]
-    Http,
-    Db,
-}
-
 impl Config {
-    /// Cross-field checks clap cannot express: `db` needs a `DATABASE_URL`.
+    /// Cross-field checks clap cannot express: an empty `DATABASE_URL`.
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
-        if self.ingest_sink == IngestSink::Db
-            && self
-                .database_url
-                .as_ref()
-                .is_none_or(common::secret::Secret::is_empty)
-        {
-            anyhow::bail!("INGEST_SINK=db needs DATABASE_URL");
+        if self.database_url.is_empty() {
+            anyhow::bail!("trust-backlog-consumer needs DATABASE_URL");
         }
         Ok(())
     }
@@ -183,58 +157,49 @@ impl Config {
 mod tests {
     use clap::Parser;
 
-    use super::{Config, IngestSink};
+    use super::Config;
 
     fn parse(extra: &[&str]) -> Result<Config, clap::Error> {
         let stanox = common::manifest_dir!().join("../../reference-data/stanox-crs.csv");
         let lines = common::manifest_dir!().join("../../lines");
-        let base = [
+        let mut base = vec![
             "trust-backlog-consumer".to_owned(),
             "--stanox-crs-file".to_owned(),
             stanox.display().to_string(),
             "--lines-dir".to_owned(),
             lines.display().to_string(),
-            "--internal-oauth-token-url".to_owned(),
-            "http://authentik.example/token".to_owned(),
-            "--internal-oauth-client-id".to_owned(),
-            "client-id".to_owned(),
-            "--internal-oauth-username".to_owned(),
-            "svc".to_owned(),
-            "--internal-oauth-password".to_owned(),
-            "pw".to_owned(),
         ];
+        if !extra.contains(&"--database-url") {
+            base.push("--database-url".to_owned());
+            base.push("postgres://distant_signal_trust_backlog:pw@postgres/ds".to_owned());
+        }
         Config::try_parse_from(
             base.into_iter()
                 .chain(extra.iter().map(|s| (*s).to_owned())),
         )
     }
 
-    /// The default is today's behaviour: POST to the api, no database.
+    /// Release B: the sink is `db`, by default and only; it needs a
+    /// `DATABASE_URL`, which `Debug` hides.
     #[test]
-    fn the_sink_defaults_to_http_and_db_needs_a_database_url() {
-        // `--database-url ""`: the test environment may set DATABASE_URL.
-        let config = parse(&["--database-url", ""]).unwrap();
-        assert_eq!(config.ingest_sink, IngestSink::Http);
+    fn the_sink_is_db_and_needs_a_database_url() {
+        let config = parse(&[]).unwrap();
+        assert_eq!(config.ingest_sink, "db");
         config.validate().unwrap();
-
-        let db = parse(&["--ingest-sink", "db", "--database-url", ""]).unwrap();
-        assert_eq!(db.ingest_sink, IngestSink::Db);
-        assert!(db.validate().is_err(), "db without DATABASE_URL");
-
-        let db = parse(&[
-            "--ingest-sink",
-            "db",
-            "--database-url",
-            "postgres://distant_signal_trust_backlog:pw@postgres/ds",
-        ])
-        .unwrap();
-        db.validate().unwrap();
         assert!(
-            !format!("{db:?}").contains(":pw@"),
+            !format!("{config:?}").contains(":pw@"),
             "the database URL must not appear in Debug output"
         );
-
-        assert!(parse(&["--ingest-sink", "stream"]).is_err());
+        assert!(
+            parse(&["--database-url", ""]).unwrap().validate().is_err(),
+            "an empty DATABASE_URL"
+        );
+        for removed in ["http", "http+shadow", "stream"] {
+            assert!(
+                parse(&["--ingest-sink", removed]).is_err(),
+                "{removed} must be refused at startup"
+            );
+        }
     }
 
     /// The chart sets these names (templates/trust-backlog-consumer-deployment.yaml).
@@ -261,7 +226,7 @@ mod tests {
     /// negative value.
     #[test]
     fn the_backlog_retention_defaults_to_one_day_and_is_never_negative() {
-        let config = parse(&["--database-url", ""]).unwrap();
+        let config = parse(&[]).unwrap();
         assert_eq!(config.trust_event_backlog_retention_days, 1);
         let config = parse(&["--trust-event-backlog-retention-days", "0"]).unwrap();
         assert_eq!(config.trust_event_backlog_retention_days, 0);

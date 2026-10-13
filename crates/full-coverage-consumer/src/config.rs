@@ -16,43 +16,13 @@ pub(crate) use movement_feed::MovementFeedBackend;
 /// docs/superpowers/plans/2026-09-04-option-b-live-consumer-plan.md Task 8.
 #[derive(Debug, Parser)]
 pub(crate) struct Config {
-    // api endpoints
-    #[arg(
-        long,
-        env,
-        default_value = "http://api:8080/private/schedule-line-population"
-    )]
-    pub schedule_line_population_url: String,
-    #[arg(
-        long,
-        env,
-        default_value = "http://api:8080/private/full-coverage-stats"
-    )]
-    pub full_coverage_stats_url: String,
-    /// The OTHER chain's own endpoint -- see this plan's Non-goals for the
-    /// merge-order dependency this URL implies (per-station-full-coverage-stats
-    /// plan owns the migration/route; this crate is only ever an HTTP
-    /// client of it).
-    #[arg(
-        long,
-        env,
-        default_value = "http://api:8080/private/station-full-coverage-samples"
-    )]
-    pub station_full_coverage_stats_url: String,
-    #[arg(long, env, default_value = "http://api:8080/private/stanox-crs")]
-    pub stanox_crs_url: String,
-
-    // Shared+distinct OAuth2 (Decision 5 -- same shape as every other caller)
-    #[command(flatten)]
-    pub internal_oauth: common::oauth_client::InternalOAuthArgs,
-
     // Reload cadences
     #[arg(long, env, default_value_t = 300)]
     pub population_reload_secs: u64,
     /// How long the FIRST population load may keep failing for some lines
     /// while others load before consumption starts anyway, with the failing
     /// lines' stats marked partial for that rail day. While every fetch
-    /// fails (`api` down) consumption never starts, however long that takes
+    /// fails (Postgres down) consumption never starts, however long that takes
     /// -- see `population_reload::Reloader`.
     #[arg(long, env, default_value_t = 600)]
     pub population_initial_wait_secs: u64,
@@ -86,13 +56,13 @@ pub(crate) struct Config {
     /// (which still needs its own `failureThreshold * periodSeconds` on top
     /// of this). A healthy iteration takes a few seconds (the `XREADGROUP`
     /// blocks for at most 5s); this is sized well above the worst
-    /// legitimate one, every HTTP call in it being bounded by
-    /// `common::ingest::CONSUMER_REQUEST_TIMEOUT` (60s).
+    /// legitimate one, every Postgres read in it being bounded by the
+    /// pool's timeouts (`common::pg`).
     /// Larger than the other two consumers': one iteration here can also
-    /// run a stats write (several requests), and a restart costs a startup
-    /// replay of the rail day so far (see `replay.rs`). The population
-    /// reload no longer runs in this loop, and startup waits (for `api`,
-    /// Redis) beat the watchdog themselves.
+    /// run a stats write, and a restart costs a startup replay of the rail
+    /// day so far (see `replay.rs`). The population reload no longer runs
+    /// in this loop, and startup waits (for Postgres, Redis) beat the
+    /// watchdog themselves.
     #[arg(long, env, default_value_t = 900)]
     pub progress_stall_secs: u64,
     #[arg(long, env, default_value_t = 9093)]
@@ -123,13 +93,14 @@ pub(crate) struct Config {
     #[arg(long, env)]
     pub redis_username: Option<String>,
 
-    /// Where each stats write goes (ingest architecture plan 3a.8; see
-    /// `sink.rs`): `http` (the default) POSTs the three outputs to the api;
-    /// `http+shadow` also XADDs what the api accepted to
-    /// `ds:ingest:full-coverage`, on this Redis as this user; `stream`
-    /// XADDs only.
-    #[arg(long, env, default_value_t = ingest_stream::snapshot::SinkMode::Http)]
-    pub ingest_sink: ingest_stream::snapshot::SinkMode,
+    /// `INGEST_SINK`: only `stream` (ingest architecture plan 3a.8; see
+    /// `sink.rs`): each stats write is `XADD`ed to `ds:ingest:full-coverage`,
+    /// on this Redis as this user. Release B (ingest phase 5,
+    /// docs/ingest-phase5-runbook.md) removed `http` and `http+shadow`, so
+    /// an old value fails at startup instead of being ignored; the next
+    /// release drops the variable.
+    #[arg(long, env = "INGEST_SINK", default_value = "stream", value_parser = ["stream"])]
+    pub ingest_sink: String,
 
     /// See `trust-consumer/src/config.rs`'s identical field.
     #[arg(long, env, default_value_t = 30)]
@@ -156,8 +127,9 @@ pub(crate) struct Config {
 /// consumer builds exactly the legacy whole-day rows and posts no windows.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct WindowedStatsArgs {
-    /// `true`: v2 day-to-date/closed-day rows, and `recent`/`day_to_date`
-    /// window POSTs to `FULL_COVERAGE_WINDOW_STATS_URL` every stats write.
+    /// `true`: v2 day-to-date/closed-day rows, and the `recent` and
+    /// `day_to_date` windows (`full-coverage-window-stats/1`) in every stats
+    /// write.
     #[arg(
         long = "full-coverage-windowed-stats",
         env = "FULL_COVERAGE_WINDOWED_STATS",
@@ -165,12 +137,6 @@ pub(crate) struct WindowedStatsArgs {
         action = clap::ArgAction::Set
     )]
     pub enabled: bool,
-    #[arg(
-        long,
-        env,
-        default_value = "http://api:8080/private/full-coverage-window-stats"
-    )]
-    pub full_coverage_window_stats_url: String,
     /// W: the `recent` window covers trains due in the last W minutes.
     #[arg(long, env, default_value_t = 60)]
     pub full_coverage_recent_window_minutes: u32,
@@ -325,17 +291,6 @@ pub(crate) mod tests {
 
     pub(crate) fn base_config(lines: Vec<LineDefinition>, shadow_lines: &str) -> Config {
         Config {
-            schedule_line_population_url: String::new(),
-            full_coverage_stats_url: String::new(),
-            station_full_coverage_stats_url: String::new(),
-            stanox_crs_url: String::new(),
-            internal_oauth: common::oauth_client::InternalOAuthArgs {
-                internal_oauth_token_url: String::new(),
-                internal_oauth_client_id: String::new(),
-                internal_oauth_scope: String::new(),
-                internal_oauth_username: String::new(),
-                internal_oauth_password: String::new(),
-            },
             population_reload_secs: 300,
             population_initial_wait_secs: 600,
             stanox_crs_reload_secs: 3600,
@@ -352,19 +307,22 @@ pub(crate) mod tests {
             redis_url: String::new(),
             redis_password: None,
             redis_username: None,
-            ingest_sink: ingest_stream::snapshot::SinkMode::Http,
+            ingest_sink: "stream".to_string(),
             redis_autoclaim_min_idle_secs: 30,
             redis_gap_check_secs: 60,
             windowed: WindowedStatsArgs {
                 enabled: false,
-                full_coverage_window_stats_url: String::new(),
                 full_coverage_recent_window_minutes: 60,
                 full_coverage_grace_minutes: 10,
                 full_coverage_activations_min: 20,
                 full_coverage_feed_stale_secs: 300,
                 line_membership: LineMembershipMode::Legacy,
             },
-            reads: crate::reads::InternalReadArgs::default(),
+            reads: crate::reads::InternalReadArgs {
+                population_source: "db".to_string(),
+                stanox_crs_source: "db".to_string(),
+                database_url: common::secret::Secret::new("postgres://nobody@127.0.0.1:1/none"),
+            },
         }
     }
 
@@ -417,14 +375,8 @@ pub(crate) mod tests {
 
         let config = Config::try_parse_from([
             "full-coverage-consumer",
-            "--internal-oauth-token-url",
-            "http://auth.example.com/token",
-            "--internal-oauth-client-id",
-            "client-id",
-            "--internal-oauth-username",
-            "svc-user",
-            "--internal-oauth-password",
-            "svc-pass",
+            "--database-url",
+            "postgres://nobody@127.0.0.1:1/none",
             "--lines-dir",
             lines_dir.to_str().unwrap(),
         ])
@@ -440,6 +392,29 @@ pub(crate) mod tests {
         );
         assert_eq!(config.windowed.full_coverage_recent_window_minutes, 60);
         assert_eq!(config.windowed.full_coverage_grace_minutes, 10);
+        assert_eq!(config.ingest_sink, "stream");
+    }
+
+    /// Release B (ingest phase 5): the sink is `stream` only; `http` and
+    /// `http+shadow` are refused at startup rather than ignored.
+    #[test]
+    fn the_sink_is_stream_only() {
+        let lines_dir = common::manifest_dir!().join("../../lines");
+        let parse = |sink: &str| {
+            Config::try_parse_from([
+                "full-coverage-consumer",
+                "--database-url",
+                "postgres://nobody@127.0.0.1:1/none",
+                "--lines-dir",
+                lines_dir.to_str().unwrap(),
+                "--ingest-sink",
+                sink,
+            ])
+        };
+        assert_eq!(parse("stream").unwrap().ingest_sink, "stream");
+        for retired in ["http", "http+shadow", "db"] {
+            assert!(parse(retired).is_err(), "{retired}");
+        }
     }
 
     /// R-101 / Deploy C: an explicit `--movement-feed-backend kafka` (or
@@ -452,14 +427,8 @@ pub(crate) mod tests {
         let parse = |backend: &str| {
             Config::try_parse_from([
                 "full-coverage-consumer",
-                "--internal-oauth-token-url",
-                "http://auth.example.com/token",
-                "--internal-oauth-client-id",
-                "client-id",
-                "--internal-oauth-username",
-                "svc-user",
-                "--internal-oauth-password",
-                "svc-pass",
+                "--database-url",
+                "postgres://nobody@127.0.0.1:1/none",
                 "--lines-dir",
                 lines_dir.to_str().unwrap(),
                 "--movement-feed-backend",

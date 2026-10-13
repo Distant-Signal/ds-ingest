@@ -14,7 +14,6 @@
 mod config;
 mod crs_index;
 mod process;
-mod queries;
 mod reasons;
 mod sink;
 mod stanox_crs;
@@ -24,30 +23,24 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use clap::Parser;
-use config::{Config, IngestSink};
+use config::Config;
 use movement_feed::ActiveFeed;
 use movement_feed::MovementFeed;
 use movement_feed::redis_stream::RedisStreamMovementFeed;
 use movement_feed::{DeadLetter, DeadLetterSink};
-use sink::{BacklogSink, DbSink, HttpSink, Operations};
+use sink::{BacklogSink, DbSink, Operations};
 
 /// Every `trust_backlog_consumer_errors_total` operation that is a failed
 /// write or read through the sink (not a data rejection, which is
 /// `post_rejected`), registered at 0 and summed by the chart's
 /// `DistantSignalConsumerApiCallsFailing` alert (2026-10-01: ~2,200 failed
-/// backlog POSTs raised nothing). `post_*` are the HTTP sink's, `db_*` the
-/// DB sink's (ingest architecture plan 3b.2; `sink::Operations`). The
-/// chart's template lists the same operations; a test below keeps the two
-/// in step.
-const API_CALL_OPERATIONS: &[&str] = &[
-    "post_batch",
-    "post_train_reasons",
-    "reload_stanox_crs",
-    "db_write",
-    "db_write_reasons",
-];
+/// backlog POSTs raised nothing). `db_*` are the sink's (ingest
+/// architecture plan 3b.2; `sink::Operations`); the HTTP sink's `post_*`
+/// went in release B. The chart's template lists the same operations; a
+/// test below keeps the two in step.
+const API_CALL_OPERATIONS: &[&str] = &["reload_stanox_crs", "db_write", "db_write_reasons"];
 
-/// `pg_stat_activity.application_name` under `INGEST_SINK=db`.
+/// `pg_stat_activity.application_name` of the sink's pool.
 const APPLICATION_NAME: &str = "distant-signal-trust-backlog-consumer";
 /// Spec §6.6: pool 3, role limit 4. One batch is written at a time.
 const DEFAULT_MAX_CONNECTIONS: u32 = 3;
@@ -61,7 +54,7 @@ async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     common::logging::init("trust-backlog-consumer");
     let config = Config::parse();
-    common::metrics::ingest_sink_info(&common::metrics::value_enum_name(&config.ingest_sink));
+    common::metrics::ingest_sink_info(&config.ingest_sink);
     config.validate()?;
     if config.metrics.metrics_enabled {
         common::metrics::install(config.metrics_port)?;
@@ -95,12 +88,9 @@ async fn run() -> anyhow::Result<()> {
         Duration::from_secs(config.progress_stall_secs),
     );
 
-    // INGEST_SINK=db: Postgres and the schema gate come before the first
-    // read from the feed, so nothing is consumed that cannot be written.
-    let pool = match config.ingest_sink {
-        IngestSink::Http => None,
-        IngestSink::Db => Some(connect_database(&config, &progress).await?),
-    };
+    // Postgres and the schema gate come before the first read from the
+    // feed, so nothing is consumed that cannot be written.
+    let pool = connect_database(&config, &progress).await?;
 
     // Built once: purely static-catalogue-derived, needs no reload at
     // runtime (config.lines doesn't change without a restart).
@@ -139,46 +129,21 @@ async fn run() -> anyhow::Result<()> {
         "trust_backlog_consumer_ready",
     );
 
-    match pool {
-        None => {
-            let ingest_url = config.api_ingest_url.clone();
-            let reasons_url = queries::train_reasons_url(&ingest_url);
-            if reasons_url.is_none() {
-                tracing::warn!(
-                    api_ingest_url = %ingest_url,
-                    "API_INGEST_URL does not end in /trust-event-backlog; TRUST reason codes will not be sent"
-                );
-            }
-            let sink = HttpSink {
-                client: common::ingest::consumer_http_client()?,
-                ingest_url,
-                reasons_url,
-                stanox_crs_url: config.stanox_crs_url.clone(),
-                tokens: config.internal_oauth.token_cache(),
-            };
-            consume(&config, &crs_index, &mut feed, &progress, &sink).await
-        }
-        Some(pool) => {
-            tracing::info!("INGEST_SINK=db: writing the TRUST backlog to Postgres directly");
-            sink::register_db_write_metrics();
-            consume(&config, &crs_index, &mut feed, &progress, &DbSink { pool }).await
-        }
-    }
+    tracing::info!("writing the TRUST backlog to Postgres directly");
+    sink::register_db_write_metrics();
+    consume(&config, &crs_index, &mut feed, &progress, &DbSink { pool }).await
 }
 
-/// `INGEST_SINK=db`: waits for Postgres (INF-5), connects the pool (with
-/// the `db_pool_*` metrics) and passes the schema gate as the
-/// `trust_backlog` role (spec §12.2). The api's CORPUS fallback setting
-/// (`CORPUS_FALLBACK_ENABLED`, which the chart passes on) is read so
-/// `list_stanox_crs` returns what the api's `GET /private/stanox-crs` does.
+/// Waits for Postgres (INF-5), connects the pool (with the `db_pool_*`
+/// metrics) and passes the schema gate as the `trust_backlog` role (spec
+/// §12.2). The api's CORPUS fallback setting (`CORPUS_FALLBACK_ENABLED`,
+/// which the chart passes on) is read so `list_stanox_crs` returns what the
+/// api's retired `GET /private/stanox-crs` did.
 async fn connect_database(
     config: &Config,
     progress: &health_http::Progress,
 ) -> anyhow::Result<sqlx::PgPool> {
-    let url = config
-        .database_url
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("INGEST_SINK=db needs DATABASE_URL"))?;
+    let url = &config.database_url;
     ds_store::corpus::init_fallback_from_env()?;
     common::startup::retry_until_ready(
         "Postgres",
@@ -206,7 +171,7 @@ async fn connect_database(
     Ok(pool)
 }
 
-/// The consume loop, over either sink. Never returns.
+/// The consume loop. Never returns.
 #[expect(
     clippy::expect_used,
     clippy::too_many_lines,
@@ -239,8 +204,7 @@ async fn consume<S: BacklogSink>(
     let mut last_redis_gap_check = tokio::time::Instant::now() - redis_gap_check_interval;
 
     // Consecutive failed deliveries and feed reads; see `delivery_wait`.
-    let mut delivery_failures =
-        common::backoff::FailureStreak::new(delivery_backoff(config.ingest_sink));
+    let mut delivery_failures = common::backoff::FailureStreak::new(DELIVERY_RETRY_BACKOFF);
     let mut feed_failures = common::backoff::FailureStreak::new(FEED_RETRY_BACKOFF);
 
     loop {
@@ -333,8 +297,8 @@ async fn consume<S: BacklogSink>(
 
                 // Reasons first, best-effort: a failure is logged and
                 // counted, never allowed to hold up the backlog batch (a
-                // reason is enrichment). The common failure, `api` or
-                // Postgres being down, also fails the backlog write below,
+                // reason is enrichment). The common failure, Postgres being
+                // down, also fails the backlog write below,
                 // which leaves the batch un-ACKed, so the reasons are
                 // re-sent on redelivery. The upsert is idempotent.
                 if let Err(err) = sink.write_reasons(&reasons).await {
@@ -346,20 +310,12 @@ async fn consume<S: BacklogSink>(
                     .increment(1);
                 }
 
-                // api's Retry-After when the POST got a 503 (its database is
-                // unavailable), for `delivery_wait`. Always `None` for the
-                // DB sink.
-                let mut retry_after = None;
                 let delivery =
                     deliver_batch(feed, &events, &unparseable, &operations, async |events| {
-                        let written = sink.write_backlog(events).await;
-                        if let Err(err) = &written {
-                            retry_after = common::ingest::retry_after(err);
-                        }
-                        written
+                        sink.write_backlog(events).await
                     })
                     .await;
-                if let Some(wait) = delivery_wait(&delivery, &mut delivery_failures, retry_after) {
+                if let Some(wait) = delivery_wait(&delivery, &mut delivery_failures) {
                     tracing::warn!(
                         failures = delivery_failures.failures(),
                         retry_in_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
@@ -404,27 +360,14 @@ fn unparseable_payload(raw: &str, err: &impl std::fmt::Debug) -> DeadLetter {
     }
 }
 
-/// Wait after a batch that was not delivered (POST failed, `api` rejected
-/// it, or a dead-letter write failed): 2s doubling to 60s, jittered, and at
-/// least `api`'s `Retry-After` on a 503. It used to be a flat 2s, so through
-/// the 2026-10-01 Postgres outage this consumer re-POSTed its pending batch
-/// every 2s for six hours (~2,200 failures).
+/// Wait after a batch that was not delivered (the write failed, its data
+/// was refused, or a dead-letter write failed): 1s doubling to 60s,
+/// jittered (spec R1, plan 3b.1). A transient DB failure pauses reading;
+/// the batch stays pending in `movement-events`, which holds about 28
+/// hours. A flat 2s through the 2026-10-01 Postgres outage re-sent the
+/// pending batch every 2s for six hours (~2,200 failures).
 const DELIVERY_RETRY_BACKOFF: common::backoff::Backoff =
-    common::backoff::Backoff::new(Duration::from_secs(2), Duration::from_secs(60));
-
-/// The same wait for the DB sink: 1s doubling to 60s, jittered (spec R1,
-/// plan 3b.1). A transient DB failure pauses reading; the batch stays
-/// pending in `movement-events`, which holds about 28 hours.
-const DB_DELIVERY_RETRY_BACKOFF: common::backoff::Backoff =
     common::backoff::Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
-
-/// The delivery backoff for `sink`.
-const fn delivery_backoff(sink: IngestSink) -> common::backoff::Backoff {
-    match sink {
-        IngestSink::Http => DELIVERY_RETRY_BACKOFF,
-        IngestSink::Db => DB_DELIVERY_RETRY_BACKOFF,
-    }
-}
 
 /// Wait after a failed read from the movement feed (Redis): 1s doubling to
 /// 30s, jittered.
@@ -434,12 +377,11 @@ const FEED_RETRY_BACKOFF: common::backoff::Backoff =
 /// How long to wait after `delivery` before the next batch, if at all: a
 /// committed batch resets the streak; a batch left pending (nothing
 /// `XACKed`, so it is redelivered: at-least-once) waits the streak's next
-/// backoff, honouring `retry_after`. A failed XACK does not wait: the batch
-/// landed, and its redelivery is a harmless duplicate.
+/// backoff. A failed XACK does not wait: the batch landed, and its
+/// redelivery is a harmless duplicate.
 fn delivery_wait(
     delivery: &Delivery,
     failures: &mut common::backoff::FailureStreak,
-    retry_after: Option<Duration>,
 ) -> Option<Duration> {
     match delivery {
         Delivery::Committed => {
@@ -448,7 +390,7 @@ fn delivery_wait(
         }
         Delivery::CommitFailed => None,
         Delivery::PostFailed | Delivery::Rejected | Delivery::DeadLetterFailed => {
-            Some(failures.failed(retry_after))
+            Some(failures.failed(None))
         }
     }
 }
@@ -458,46 +400,45 @@ fn delivery_wait(
 enum Delivery {
     /// Written (any rows the sink rejected were dead-lettered) and `XACKed`.
     Committed,
-    /// The write failed transiently (HTTP: unreachable, timeout, 5xx, ...;
-    /// DB: anything but a per-row data error, the transaction rolled back):
+    /// The write failed transiently (anything but a per-row data error;
+    /// the transaction rolled back):
     /// nothing `XACKed` and nothing dead-lettered, so the batch is
     /// redelivered later -- however long the outage lasts.
     PostFailed,
-    /// `api` refused the whole batch's data (400/413/422): handed to
+    /// The whole batch's data was refused ([`common::ingest::FailureClass::Rejected`]): handed to
     /// `MovementFeed::reject_batch`, which narrows it down to the poison
     /// entry and dead-letters only that.
     Rejected,
-    /// `api` rejected rows but they could not be dead-lettered: nothing
-    /// `XACKed`, so the rejected rows are not lost. The retry re-posts the
-    /// batch; the good rows then conflict harmlessly on `dedup_key`.
+    /// Rows were refused but could not be dead-lettered: nothing `XACKed`,
+    /// so the refused rows are not lost. The retry writes the batch again;
+    /// the good rows then conflict harmlessly on `dedup_key`.
     DeadLetterFailed,
-    /// Posted, but the XACK itself failed; the batch will be redelivered
-    /// and re-posted harmlessly.
+    /// Written, but the XACK itself failed; the batch will be redelivered
+    /// and written again harmlessly.
     CommitFailed,
 }
 
-/// Post -> dead-letter rejected rows -> XACK, extracted from the main loop
-/// so it can be tested against `FakeMovementFeed` without Redis or `api`.
+/// Write -> dead-letter rejected rows -> XACK, extracted from the main loop
+/// so it can be tested against `FakeMovementFeed` without Redis or Postgres.
 ///
-/// **Rejected rows no longer hold a batch hostage.** When `api` answers 2xx
-/// with a non-empty `rejected` list, those rows failed a constraint or were
+/// **Rejected rows do not hold a batch hostage.** When the write returns a
+/// non-empty `rejected` list, those rows failed a constraint or were
 /// invalid input and will fail identically on every retry, while every other
 /// row has already landed. So the batch is `ACKed` like any success, and the
 /// rejected rows go to the dead-letter stream (see
 /// `movement_feed::DeadLetterSink`) with the SQLSTATE and message, where an
 /// operator can inspect them and re-inject them once the cause is fixed.
-/// Only a failed POST (transient: `api` answers 500 for those) or a failed
-/// dead-letter write leaves the batch un-ACKed. A POST that `api` refused
-/// outright (400/413/422, see `common::ingest::classify_failure`) is handed
-/// to `MovementFeed::reject_batch` instead.
+/// Only a failed write (transient) or a failed dead-letter write leaves the
+/// batch un-ACKed. A write whose data was refused outright (see
+/// `common::ingest::classify_failure`) is handed to
+/// `MovementFeed::reject_batch` instead.
 ///
 /// `unparseable` (payloads in this batch that did not parse at all) are
-/// dead-lettered first; if that fails, nothing is posted or `ACKed`.
+/// dead-lettered first; if that fails, nothing is written or `ACKed`.
 ///
-/// The same for the DB sink (ingest architecture plan 3b.1): `post` is
-/// `sink::BacklogSink::write_backlog`, which returns only after its
-/// transaction committed, with the same `rejected` rows the api's route
-/// reports. `operations` names the counters and the dead-letter reason.
+/// `post` is `sink::BacklogSink::write_backlog` (ingest architecture plan
+/// 3b.1), which returns only after its transaction committed. `operations`
+/// names the counters and the dead-letter reason.
 async fn deliver_batch<F, P>(
     feed: &mut F,
     events: &[common::TrustBacklogEventMessage],
@@ -526,7 +467,7 @@ where
         Err(err)
             if common::ingest::classify_failure(&err) == common::ingest::FailureClass::Rejected =>
         {
-            tracing::error!(error = ?err, "api rejected the trust-event-backlog batch's data; isolating the poison entry");
+            tracing::error!(error = ?err, "the trust-event-backlog batch's data was refused; isolating the poison entry");
             metrics::counter!(
                 common::metrics::metric_name("trust_backlog_consumer_errors_total"),
                 "operation" => "post_rejected"
@@ -545,7 +486,7 @@ where
                 "operation" => operations.write
             )
             .increment(1);
-            // Deliberately does NOT commit on a failed post -- same
+            // Deliberately does NOT commit on a failed write -- same
             // "only ack after a successful downstream write" posture as
             // trust-consumer's own main loop, since this consumer's whole
             // reason to exist is not losing events a late-tracking pin
@@ -580,7 +521,7 @@ where
             tracing::error!(
                 error = ?err,
                 rejected = records.len(),
-                "failed to dead-letter rows api rejected; leaving the batch un-ACKed to retry"
+                "failed to dead-letter the refused rows; leaving the batch un-ACKed to retry"
             );
             metrics::counter!(
                 common::metrics::metric_name("trust_backlog_consumer_errors_total"),
@@ -1066,7 +1007,7 @@ mod deliver_batch_tests {
         }
     }
 
-    /// The production incident's fix, consumer half: a batch where `api`
+    /// The production incident's fix, consumer half: a batch where the write
     /// rejected a row is `ACKed` like any success, and the rejected row goes
     /// to the dead-letter sink with enough to recover it.
     #[tokio::test]
@@ -1074,25 +1015,19 @@ mod deliver_batch_tests {
         let mut feed = feed_with_one_batch().await;
         let events = vec![event("0003", "good"), event("0009", "bad")];
 
-        let outcome = deliver_batch(
-            &mut feed,
-            &events,
-            &[],
-            &sink::HTTP_OPERATIONS,
-            async |_| {
-                Ok(common::TrustBacklogIngestResponse {
-                    upserted: 1,
-                    rejected: vec![rejection(1, "bad")],
-                })
-            },
-        )
+        let outcome = deliver_batch(&mut feed, &events, &[], &sink::DB_OPERATIONS, async |_| {
+            Ok(common::TrustBacklogIngestResponse {
+                upserted: 1,
+                rejected: vec![rejection(1, "bad")],
+            })
+        })
         .await;
 
         assert_eq!(outcome, Delivery::Committed);
         assert_eq!(feed.committed_count, 1, "the batch must be ACKed");
         assert_eq!(feed.dead_lettered.len(), 1);
         let letter = &feed.dead_lettered[0];
-        assert_eq!(letter.reason, "rejected_by_api");
+        assert_eq!(letter.reason, "rejected_by_db");
         let payload: common::TrustBacklogEventMessage =
             serde_json::from_str(&letter.payload).expect("payload is the rejected row as JSON");
         assert_eq!(payload.dedup_key, "bad");
@@ -1110,18 +1045,12 @@ mod deliver_batch_tests {
         let mut feed = feed_with_one_batch().await;
         let events = vec![event("0003", "good")];
 
-        let outcome = deliver_batch(
-            &mut feed,
-            &events,
-            &[],
-            &sink::HTTP_OPERATIONS,
-            async |_| {
-                Ok(common::TrustBacklogIngestResponse {
-                    upserted: 1,
-                    rejected: vec![],
-                })
-            },
-        )
+        let outcome = deliver_batch(&mut feed, &events, &[], &sink::DB_OPERATIONS, async |_| {
+            Ok(common::TrustBacklogIngestResponse {
+                upserted: 1,
+                rejected: vec![],
+            })
+        })
         .await;
 
         assert_eq!(outcome, Delivery::Committed);
@@ -1129,20 +1058,16 @@ mod deliver_batch_tests {
         assert!(feed.dead_lettered.is_empty());
     }
 
-    /// A transient failure (api answers 500) must still leave the batch
-    /// un-ACKed so it is retried.
+    /// A transient failure must still leave the batch un-ACKed so it is
+    /// retried.
     #[tokio::test]
     async fn a_failed_post_is_not_acked_or_dead_lettered() {
         let mut feed = feed_with_one_batch().await;
         let events = vec![event("0003", "good")];
 
-        let outcome = deliver_batch(
-            &mut feed,
-            &events,
-            &[],
-            &sink::HTTP_OPERATIONS,
-            async |_| Err(anyhow::anyhow!("ingestion POST failed: 500")),
-        )
+        let outcome = deliver_batch(&mut feed, &events, &[], &sink::DB_OPERATIONS, async |_| {
+            Err(anyhow::anyhow!("connection refused"))
+        })
         .await;
 
         assert_eq!(outcome, Delivery::PostFailed);
@@ -1150,18 +1075,16 @@ mod deliver_batch_tests {
         assert!(feed.dead_lettered.is_empty());
     }
 
-    /// If the rejected rows cannot be stored, `ACKing` would lose them: the
-    /// batch stays pending and is retried instead.
-    /// Consecutive undelivered batches wait longer and longer (2s, 4s, 8s,
-    /// ... jittered, capped at 60s) instead of a flat 2s, at least api's
-    /// Retry-After on a 503, and a delivered batch resets that.
+    /// Consecutive undelivered batches wait longer and longer (1s, 2s, 4s,
+    /// ... jittered, capped at 60s) instead of a flat 2s, and a delivered
+    /// batch resets that.
     #[test]
     fn undelivered_batches_back_off_exponentially_and_reset_on_success() {
         let mut failures = common::backoff::FailureStreak::new(DELIVERY_RETRY_BACKOFF);
         let mut previous_ceiling = Duration::ZERO;
         for attempt in 0..8 {
-            let wait = delivery_wait(&Delivery::PostFailed, &mut failures, None)
-                .expect("a failed post waits");
+            let wait =
+                delivery_wait(&Delivery::PostFailed, &mut failures).expect("a failed write waits");
             let ceiling = DELIVERY_RETRY_BACKOFF.ceiling(attempt);
             assert!(
                 wait >= ceiling / 2 && wait <= ceiling,
@@ -1171,158 +1094,56 @@ mod deliver_batch_tests {
             previous_ceiling = ceiling;
         }
         assert_eq!(previous_ceiling, Duration::from_secs(60), "capped");
-        let wait = delivery_wait(
-            &Delivery::PostFailed,
-            &mut failures,
-            Some(Duration::from_secs(90)),
-        )
-        .unwrap();
-        assert!(
-            wait >= Duration::from_secs(90),
-            "Retry-After honoured: {wait:?}"
-        );
-        assert!(delivery_wait(&Delivery::Rejected, &mut failures, None).is_some());
-        assert!(delivery_wait(&Delivery::DeadLetterFailed, &mut failures, None).is_some());
-        assert_eq!(
-            delivery_wait(&Delivery::CommitFailed, &mut failures, None),
-            None
-        );
-        assert_eq!(
-            delivery_wait(&Delivery::Committed, &mut failures, None),
-            None
-        );
+        assert!(delivery_wait(&Delivery::Rejected, &mut failures).is_some());
+        assert!(delivery_wait(&Delivery::DeadLetterFailed, &mut failures).is_some());
+        assert_eq!(delivery_wait(&Delivery::CommitFailed, &mut failures), None);
+        assert_eq!(delivery_wait(&Delivery::Committed, &mut failures), None);
         assert_eq!(
             failures.failures(),
             0,
             "a delivered batch resets the streak"
         );
-        let wait = delivery_wait(&Delivery::PostFailed, &mut failures, None).unwrap();
-        assert!(wait <= Duration::from_secs(2), "{wait:?}");
+        let wait = delivery_wait(&Delivery::PostFailed, &mut failures).unwrap();
+        assert!(wait <= Duration::from_secs(1), "{wait:?}");
     }
 
-    /// A 503 + Retry-After from api reaches `delivery_wait` through the
-    /// real POST, and the batch stays pending (at-least-once).
-    #[tokio::test]
-    async fn a_503_leaves_the_batch_pending_and_carries_retry_after() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        // The OAuth token endpoint answers normally; the ingest POST gets
-        // api's database-unavailable 503.
-        let _server = tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            while let Ok((mut socket, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 8192];
-                let n = socket.read(&mut buf).await.unwrap_or(0);
-                let (status, extra, body) = if buf[..n].starts_with(b"POST /token/") {
-                    (
-                        "200 OK",
-                        "",
-                        r#"{"access_token":"fake-jwt","expires_in":300}"#,
-                    )
-                } else {
-                    (
-                        "503 Service Unavailable",
-                        "retry-after: 30\r\n",
-                        r#"{"error":"service_unavailable","retryable":true}"#,
-                    )
-                };
-                let reply = format!(
-                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = socket.write_all(reply.as_bytes()).await;
-            }
-        });
-        let client = reqwest::Client::new();
-        let tokens =
-            common::oauth_client::OAuthTokenCache::new(common::oauth_client::OAuthCredentials {
-                token_url: format!("http://{addr}/token/"),
-                client_id: "c".to_string(),
-                scope: "groups".to_string(),
-                username: "u".to_string(),
-                password: "p".to_string(),
-            });
-        let url = format!("http://{addr}/private/trust-event-backlog");
-        let mut feed = feed_with_one_batch().await;
-        let events = vec![event("0003", "good")];
-        let mut retry_after = None;
-        let delivery = deliver_batch(
-            &mut feed,
-            &events,
-            &[],
-            &sink::HTTP_OPERATIONS,
-            async |events| {
-                let posted =
-                    queries::post_trust_event_backlog(&client, &url, &tokens, events).await;
-                if let Err(err) = &posted {
-                    retry_after = common::ingest::retry_after(err);
-                }
-                posted
-            },
-        )
-        .await;
-        assert_eq!(delivery, Delivery::PostFailed);
-        assert_eq!(feed.committed_count, 0, "nothing acked");
-        assert!(feed.dead_lettered.is_empty(), "nothing dead-lettered");
-        assert!(feed.rejected_batches.is_empty(), "a 503 is not a rejection");
-        assert_eq!(retry_after, Some(Duration::from_secs(30)));
-        let mut failures = common::backoff::FailureStreak::new(DELIVERY_RETRY_BACKOFF);
-        let wait = delivery_wait(&delivery, &mut failures, retry_after).unwrap();
-        assert!(wait >= Duration::from_secs(30), "{wait:?}");
-    }
-
+    /// If the rejected rows cannot be stored, `ACKing` would lose them: the
+    /// batch stays pending and is retried instead.
     #[tokio::test]
     async fn a_failed_dead_letter_write_leaves_the_batch_un_acked() {
         let mut feed = feed_with_one_batch().await;
         feed.fail_next_dead_letter = true;
         let events = vec![event("0003", "good"), event("0009", "bad")];
 
-        let outcome = deliver_batch(
-            &mut feed,
-            &events,
-            &[],
-            &sink::HTTP_OPERATIONS,
-            async |_| {
-                Ok(common::TrustBacklogIngestResponse {
-                    upserted: 1,
-                    rejected: vec![rejection(1, "bad")],
-                })
-            },
-        )
+        let outcome = deliver_batch(&mut feed, &events, &[], &sink::DB_OPERATIONS, async |_| {
+            Ok(common::TrustBacklogIngestResponse {
+                upserted: 1,
+                rejected: vec![rejection(1, "bad")],
+            })
+        })
         .await;
 
         assert_eq!(outcome, Delivery::DeadLetterFailed);
         assert_eq!(feed.committed_count, 0);
     }
 
-    /// PL-2: however many times the POST fails transiently, nothing is
+    /// PL-2: however many times the write fails transiently, nothing is
     /// dead-lettered, rejected or `ACKed` -- the batch just stays pending.
     #[tokio::test]
     async fn a_transient_failure_never_dead_letters_however_often_it_repeats() {
         let mut feed = feed_with_one_batch().await;
         let events = vec![event("0003", "good")];
-        for status in [500u16, 502, 503, 504, 401, 404, 429]
-            .into_iter()
-            .cycle()
-            .take(300)
-        {
-            let outcome = deliver_batch(
-                &mut feed,
-                &events,
-                &[],
-                &sink::HTTP_OPERATIONS,
-                async |_| {
-                    Err(common::ingest::HttpStatusError {
-                        prefix: "ingestion POST failed",
-                        status: reqwest::StatusCode::from_u16(status).unwrap(),
-                        body: String::new(),
-                        retry_after: None,
-                    }
-                    .into())
-                },
-            )
-            .await;
-            assert_eq!(outcome, Delivery::PostFailed, "{status}");
+        for kind in ["pool", "closed", "other"].into_iter().cycle().take(300) {
+            let outcome =
+                deliver_batch(&mut feed, &events, &[], &sink::DB_OPERATIONS, async |_| {
+                    Err(match kind {
+                        "pool" => anyhow::Error::new(sqlx::Error::PoolTimedOut),
+                        "closed" => anyhow::Error::new(sqlx::Error::PoolClosed),
+                        _ => anyhow::anyhow!("connection refused"),
+                    })
+                })
+                .await;
+            assert_eq!(outcome, Delivery::PostFailed, "{kind}");
         }
         assert_eq!(feed.committed_count, 0);
         assert!(feed.dead_lettered.is_empty());
@@ -1332,37 +1153,25 @@ mod deliver_batch_tests {
     /// PL-2: an explicit data rejection of the batch goes to
     /// `reject_batch` (which isolates and dead-letters the poison entry).
     #[tokio::test]
-    async fn a_422_hands_the_batch_to_reject_batch() {
+    async fn a_refused_batch_goes_to_reject_batch() {
         let mut feed = feed_with_one_batch().await;
         let events = vec![event("0003", "good")];
-        let outcome = deliver_batch(
-            &mut feed,
-            &events,
-            &[],
-            &sink::HTTP_OPERATIONS,
-            async |_| {
-                Err(common::ingest::HttpStatusError {
-                    prefix: "ingestion POST failed",
-                    status: reqwest::StatusCode::UNPROCESSABLE_ENTITY,
-                    body: "bad row".to_string(),
-                    retry_after: None,
-                }
-                .into())
-            },
-        )
+        let outcome = deliver_batch(&mut feed, &events, &[], &sink::DB_OPERATIONS, async |_| {
+            Err(common::ingest::DataRejected("bad row".to_string()).into())
+        })
         .await;
         assert_eq!(outcome, Delivery::Rejected);
         assert_eq!(feed.committed_count, 0);
         assert_eq!(feed.rejected_batches.len(), 1);
         assert!(
-            feed.rejected_batches[0].contains("422"),
+            feed.rejected_batches[0].contains("bad row"),
             "{:?}",
             feed.rejected_batches
         );
     }
 
-    /// Malformed input is dead-lettered, and the rest of the batch still
-    /// posts and ACKs.
+    /// Malformed input is dead-lettered, and the rest of the batch is still
+    /// written and `ACKed`.
     #[tokio::test]
     async fn an_unparseable_payload_is_dead_lettered_and_the_batch_acked() {
         let mut feed = feed_with_one_batch().await;
@@ -1373,7 +1182,7 @@ mod deliver_batch_tests {
             &mut feed,
             &events,
             &[unparseable_payload(raw, &err)],
-            &sink::HTTP_OPERATIONS,
+            &sink::DB_OPERATIONS,
             async |_| {
                 Ok(common::TrustBacklogIngestResponse {
                     upserted: 1,
@@ -1387,80 +1196,5 @@ mod deliver_batch_tests {
         assert_eq!(feed.dead_lettered.len(), 1);
         assert_eq!(feed.dead_lettered[0].reason, "unparseable_payload");
         assert_eq!(feed.dead_lettered[0].payload, raw);
-    }
-
-    /// PL-1: an `api` that accepts the connection and never answers times
-    /// out as a transient failure: the entry stays pending (no ACK, no
-    /// dead-letter), instead of wedging the consumer forever.
-    #[tokio::test]
-    async fn a_hung_api_times_out_and_the_batch_stays_pending() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        // Answers the OAuth token request normally, then accepts the
-        // ingest POST and never replies -- a half-open `api`.
-        let _server = tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let mut held = Vec::new();
-            while let Ok((mut socket, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 4096];
-                let n = socket.read(&mut buf).await.unwrap_or(0);
-                if buf[..n].starts_with(b"POST /token/") {
-                    let body = r#"{"access_token":"fake-jwt","expires_in":300}"#;
-                    let reply = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = socket.write_all(reply.as_bytes()).await;
-                } else {
-                    held.push(socket);
-                }
-            }
-        });
-        let client = reqwest::Client::builder()
-            .connect_timeout(common::ingest::CONSUMER_CONNECT_TIMEOUT)
-            .timeout(Duration::from_millis(300))
-            .build()
-            .unwrap();
-        let tokens =
-            common::oauth_client::OAuthTokenCache::new(common::oauth_client::OAuthCredentials {
-                token_url: format!("http://{addr}/token/"),
-                client_id: "c".to_string(),
-                scope: "groups".to_string(),
-                username: "u".to_string(),
-                password: "p".to_string(),
-            });
-        let mut feed = feed_with_one_batch().await;
-        let events = vec![event("0003", "good")];
-        let url = format!("http://{addr}/private/trust-event-backlog");
-
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(10),
-            deliver_batch(
-                &mut feed,
-                &events,
-                &[],
-                &sink::HTTP_OPERATIONS,
-                async |events| {
-                    queries::post_trust_event_backlog(&client, &url, &tokens, events).await
-                },
-            ),
-        )
-        .await
-        .expect("the hung api must time out, not wedge the consumer");
-
-        assert_eq!(outcome, Delivery::PostFailed);
-        assert_eq!(feed.committed_count, 0);
-        assert!(feed.dead_lettered.is_empty());
-        assert!(feed.rejected_batches.is_empty());
-    }
-
-    /// An older `api` that only sends `upserted` still parses, as a clean
-    /// success.
-    #[test]
-    fn an_old_api_response_without_rejected_parses() {
-        let response: common::TrustBacklogIngestResponse =
-            serde_json::from_str(r#"{"upserted": 3}"#).unwrap();
-        assert_eq!(response.upserted, 3);
-        assert!(response.rejected.is_empty());
     }
 }

@@ -12,14 +12,13 @@ chrono-tz = "0.10"
 clap = { version = "4.6.6", features = ["derive", "env"] }
 common = { path = "../common" }
 dotenvy = "0.15.7"
-# `INGEST_SINK=db` (ingest architecture plan 3b.1): the backlog, shared
+# The DB sink (ingest architecture plan 3b.1): the backlog, shared
 # movement and reasons writers, `list_stanox_crs`, the pool and the schema
 # gate.
 ds-store = { path = "../ds-store" }
 health-http = { path = "../health-http" }
 metrics = "0.24"
 movement-feed = { path = "../movement-feed" }
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls", "gzip", "query"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 # The ingest-writer's features (the pool type, the Postgres wait).
@@ -32,8 +31,6 @@ trust-schema = { path = "../trust-schema" }
 movement-feed = { path = "../movement-feed", features = ["test-util"] }
 # The DB sink tests' fixtures and cleanup.
 ds-store = { path = "../ds-store", features = ["test-support"] }
-# The sink tests: `HttpSink`'s api side (the routes and the token endpoint).
-wiremock = "0.6"
 
 [lints]
 workspace = true

@@ -2,7 +2,7 @@
 //! [`SchemaHandler`].
 //!
 //! A handler is a thin wrapper over the `ds-store` function the api's
-//! `/private` route calls today. It is given the writer's open transaction
+//! removed `/private` route called. It is given the writer's open transaction
 //! (the `ingest_dedup` row is already in it) and the entry's [`Observed`]
 //! clock, and it:
 //!
@@ -13,9 +13,6 @@
 //! - isolates rows the database refuses for a data error with
 //!   [`apply_rows`], returning them as [`Applied::PartiallyRejected`] (they
 //!   go to the dead-letter stream, the rest commit).
-//!
-//! [`check`](SchemaHandler::check) is the shadow mode's half: decode and
-//! validate, write nothing.
 //!
 //! Lookup ([`Registry::lookup`]): an unknown schema *name* is poison; a known
 //! name with an unknown *version* is [`HandlerError::UnsupportedSchema`] (the
@@ -65,9 +62,6 @@ pub enum Applied {
 
 /// One schema's handler. See the module docs.
 pub trait SchemaHandler: Send + Sync {
-    /// Decodes and validates the payload; writes nothing (shadow mode).
-    fn check(&self, entry: &StreamEntry) -> Result<(), HandlerError>;
-
     /// Applies the entry inside the writer's transaction `conn`. A
     /// [`HandlerError`] rolls the whole entry back (the dedup row with it).
     fn apply<'a>(
@@ -254,14 +248,6 @@ pub fn decode<T: serde::de::DeserializeOwned>(entry: &StreamEntry) -> Result<T, 
     })
 }
 
-/// Counts a checked (`shadow`) entry's `rows` in
-/// `ingest_stream_rows_total`, as the snapshot handlers do, so the
-/// rollout's compare step (`distant_signal:ingest_stream_rows_vs_http:ratio`)
-/// covers every schema.
-pub fn count_shadow(entry: &StreamEntry, rows: usize) {
-    ingest_stream::metrics::rows(&entry.stream, entry.envelope.schema.name(), "shadow", rows);
-}
-
 /// Counts an applied entry's `rows` in `ingest_stream_rows_total{mode="apply"}`
 /// and, of those, the `written` ones (the rest `skipped`: unchanged, or
 /// older than the stored row) in `ingest_stream_row_writes_total`.
@@ -405,10 +391,6 @@ mod tests {
     struct Nop;
 
     impl SchemaHandler for Nop {
-        fn check(&self, _: &StreamEntry) -> Result<(), HandlerError> {
-            Ok(())
-        }
-
         fn apply<'a>(
             &'a self,
             _: &'a mut PgConnection,

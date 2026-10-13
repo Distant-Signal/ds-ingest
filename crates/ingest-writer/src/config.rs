@@ -74,8 +74,8 @@ pub struct Config {
 
     /// Each ingest stream's mode (spec §10, plan 3a.3;
     /// `ingestWriter.streams.<name>`): comma-separated `<stream>:<mode>`,
-    /// mode `off`, `shadow` or `apply`, e.g.
-    /// `station-samples:apply,full-coverage:shadow`. A stream not listed is
+    /// mode `off` or `apply` (`shadow` was removed in release B), e.g.
+    /// `station-samples:apply,full-coverage:apply`. A stream not listed is
     /// `off`; the default (empty) reads no stream and needs no Redis.
     #[arg(long, env = "INGEST_WRITER_STREAMS", default_value = "")]
     pub streams: StreamModes,
@@ -385,7 +385,7 @@ mod tests {
         // An empty REDIS_URL, so a REDIS_URL in the environment cannot pass.
         let config = Config::try_parse_from(args(&[
             "--streams",
-            "station-samples:shadow",
+            "station-samples:apply",
             "--redis-url",
             "",
         ]))
@@ -393,7 +393,7 @@ mod tests {
         assert!(config.validate().is_err());
         let config = Config::try_parse_from(args(&[
             "--streams",
-            "station-samples:shadow",
+            "station-samples:apply",
             "--redis-url",
             "redis://redis:6379",
             "--pod-name",

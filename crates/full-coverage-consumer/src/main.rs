@@ -37,7 +37,7 @@
 //! already due into a `recent` window (due in the last
 //! `FULL_COVERAGE_RECENT_WINDOW_MINUTES`, ending
 //! `FULL_COVERAGE_GRACE_MINUTES` ago) and a `day_to_date` window
-//! (`windows`), posted to `/private/full-coverage-window-stats`. The
+//! (`windows`), written as `full-coverage-window-stats/1` rows. The
 //! `full_coverage_line_stats` row then carries the day-to-date counts
 //! (the whole day once closed) as `stats_version` 2. The replay also starts
 //! `replay::LOOKBACK` before the rail day, so the day's first trains'
@@ -50,15 +50,16 @@
 //! (stanox-crs reload / gap check / consume-and-correlate / stats write, each
 //! on its own timer, all checked once per iteration). The population reload
 //! is NOT in this loop any more: it runs in its own task and swaps whole
-//! snapshots in, so a slow `api` can no longer stall consumption.
+//! snapshots in, so a slow reload can no longer stall consumption.
 //!
 //! # Why a batch is `ACKed` as soon as it is in memory -- and what that costs
 //!
-//! `trust-consumer` only commits after a successful POST to `api`, because
-//! a failed post there loses a real tracked-train event. This crate commits
+//! `trust-consumer` only commits after a successful write, because a
+//! failed write there loses a real tracked-train event. This crate commits
 //! (XACKs) a batch as soon as it has been dispatched into in-memory
-//! correlation state, decoupled from the periodic stats POST: a stats POST
-//! that fails is simply retried next cycle with fresher data, and
+//! correlation state, decoupled from the periodic stats write: a stats
+//! write that is not delivered is simply superseded next cycle with
+//! fresher data, and
 //! re-dispatching a redelivered batch is harmless because `DerivedState`
 //! fields are last-write-wins per event, not additive.
 //!
@@ -76,7 +77,6 @@ mod day;
 mod feed;
 mod population;
 mod population_reload;
-mod queries;
 mod reads;
 mod replay;
 mod sink;
@@ -116,44 +116,30 @@ async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     common::logging::init("full-coverage-consumer");
     let config = Config::parse();
-    common::metrics::ingest_sink_info(&config.ingest_sink.to_string());
+    common::metrics::ingest_sink_info(&config.ingest_sink);
     for (read, source) in [
-        ("population", config.reads.population_source),
-        ("stanox_crs", config.reads.stanox_crs_source),
+        ("population", &config.reads.population_source),
+        ("stanox_crs", &config.reads.stanox_crs_source),
     ] {
-        common::metrics::internal_reads_source_info(
-            read,
-            &common::metrics::value_enum_name(&source),
-        );
+        common::metrics::internal_reads_source_info(read, source);
     }
     config.reads.validate()?;
     if config.metrics.metrics_enabled {
         common::metrics::install(config.metrics_port)?;
     }
     init_metrics();
-    // Plan 3a.8: where each stats write goes (INGEST_SINK; `sink.rs`).
+    // Plan 3a.8: each stats write goes to ds:ingest:full-coverage (`sink.rs`).
     let stats_sink = sink::StatsSink::from_config(&config)?;
-    tracing::info!(ingest_sink = %stats_sink.mode(), "full-coverage stats sink");
     let (connection_state, progress) = health_http::spawn_with_progress(
         config.health_bind_url.clone(),
         "connected",
         "disconnected",
         Duration::from_secs(config.progress_stall_secs),
     );
-    let http = common::ingest::consumer_http_client()?;
-    let internal_oauth = Arc::new(config.internal_oauth.token_cache());
-    // POPULATION_SOURCE / STANOX_CRS_SOURCE=db (ingest plan 4.3): Postgres
-    // and the schema gate before anything is read. None while both are
-    // http (the default): nothing connects to Postgres, as before.
+    // The reads (ingest plan 4.3): Postgres and the schema gate before
+    // anything is read.
     let read_pool = config.reads.connect(&progress).await?;
-    let stanox_crs_source = match (&read_pool, config.reads.stanox_crs_source) {
-        (Some(pool), common::ingest::ReadSource::Db) => reads::StanoxCrsSource::Db(pool.clone()),
-        _ => reads::StanoxCrsSource::Http {
-            client: http.clone(),
-            url: config.stanox_crs_url.clone(),
-            tokens: Arc::clone(&internal_oauth),
-        },
-    };
+    let stanox_crs_source = reads::StanoxCrsSource(read_pool.clone());
 
     let mut feed = match config.movement_feed_backend {
         MovementFeedBackend::RedisStream => ActiveFeed::RedisStream(
@@ -218,9 +204,6 @@ async fn run() -> anyhow::Result<()> {
         Arc::new(ArcSwap::from_pointee(population::Population::default()));
     let population_reload_interval = Duration::from_secs(config.population_reload_secs);
     let reloader = population_reload::Reloader {
-        client: http.clone(),
-        url: config.schedule_line_population_url.clone(),
-        tokens: Arc::clone(&internal_oauth),
         line_ids: Arc::clone(&line_ids),
         geometry: Arc::clone(&geometry),
         population: Arc::clone(&population),
@@ -228,12 +211,7 @@ async fn run() -> anyhow::Result<()> {
         retry: population_reload::RETRY_BACKOFF,
         initial_wait: Duration::from_secs(config.population_initial_wait_secs),
     };
-    let mut first_load = match (&read_pool, config.reads.population_source) {
-        (Some(pool), common::ingest::ReadSource::Db) => {
-            reloader.spawn_with(population_reload::DbSource { pool: pool.clone() })
-        }
-        _ => reloader.spawn(),
-    };
+    let mut first_load = reloader.spawn(population_reload::DbSource { pool: read_pool });
 
     // Startup step 3: rebuild the rail day in progress, then consume.
     let mut day = start_consuming(
@@ -275,9 +253,7 @@ async fn run() -> anyhow::Result<()> {
             // "available" (unless the day was partial).
             debug_assert_eq!(day.service_date, closing);
             write_stats(
-                &http,
                 &config,
-                &internal_oauth,
                 &line_ids.load_full(),
                 &population.load_full(),
                 &geometry,
@@ -366,9 +342,7 @@ async fn run() -> anyhow::Result<()> {
         // 3. stats write.
         if last_stats_write.elapsed() >= stats_write_interval {
             write_stats(
-                &http,
                 &config,
-                &internal_oauth,
                 &line_ids.load_full(),
                 &population.load_full(),
                 &geometry,
@@ -392,17 +366,14 @@ async fn run() -> anyhow::Result<()> {
 /// Prometheus at all, which is indistinguishable from the check never
 /// running).
 /// Every `full_coverage_consumer_errors_total` operation that is a failed
-/// call to api, registered at 0 and summed by the chart's
+/// read, registered at 0 and summed by the chart's
 /// `DistantSignalConsumerApiCallsFailing` alert (2026-10-01: ~516k failed
-/// population reloads raised nothing). `post_window_stats` is left out: it
-/// has its own alert (`DistantSignalFullCoverageWindowPostErrors`). The
-/// chart's template lists the same operations; a test keeps them in step.
-const API_CALL_OPERATIONS: &[&str] = &[
-    "reload_line_population_fetch",
-    "post_line_stats",
-    "post_station_samples",
-    "reload_stanox_crs",
-];
+/// population reloads raised nothing). Release B (ingest phase 5) removed
+/// the HTTP sink's `post_line_stats`, `post_station_samples` and
+/// `post_window_stats`: the stats go to the stream, whose failures
+/// `DistantSignalIngestProducerXaddFailing` watches. The chart's template
+/// lists the same operations; a test keeps them in step.
+const API_CALL_OPERATIONS: &[&str] = &["reload_line_population_fetch", "reload_stanox_crs"];
 
 fn init_metrics() {
     for counter in [
@@ -430,13 +401,6 @@ fn init_metrics() {
         )
         .increment(0);
     }
-    // DistantSignalFullCoverageWindowPostErrors keys on this series; at 0
-    // from startup so `increase()` sees the first failed window POST.
-    metrics::counter!(
-        common::metrics::metric_name("full_coverage_consumer_errors_total"),
-        "operation" => "post_window_stats"
-    )
-    .increment(0);
     // DistantSignalConsumerApiCallsFailing.
     common::metrics::register_operation_counters(
         "full_coverage_consumer_errors_total",
@@ -697,7 +661,7 @@ fn rail_day_transition(
 /// twentieth of the normal interval (3 minutes at the stanox/crs 3600s
 /// default, 15s at the population 300s default), floored at 15s so a
 /// misconfigured tiny interval can't turn into a hot retry loop against
-/// the OAuth endpoint, and never longer than the normal interval itself.
+/// the database, and never longer than the normal interval itself.
 fn failed_reload_retry_delay(interval: Duration) -> Duration {
     const FLOOR: Duration = Duration::from_secs(15);
     if interval <= FLOOR {
@@ -707,25 +671,17 @@ fn failed_reload_retry_delay(interval: Duration) -> Duration {
     if backoff < FLOOR { FLOOR } else { backoff }
 }
 
-/// For every shadow-computed line, builds and POSTs its stats row; for
-/// every populated `(crs, toc_id)` station bucket, builds and POSTs its
-/// sample. Independent, best-effort failures -- Decision 3's "no shared
-/// transaction" rule: one line's or one bucket's POST failing must not
-/// block any other's.
-///
-/// With `FULL_COVERAGE_WINDOWED_STATS=true` each line's row is the v2
-/// day-to-date (closed-day, once closed) row, and every line's `recent` and
-/// `day_to_date` windows are posted as one batch.
-#[expect(
-    clippy::cast_precision_loss,
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "each argument is an independent input from the single caller; a struct would only wrap them; metric gauges take f64, and these counts and timestamps stay far below 2^52; long but linear; splitting it would scatter its shared state across helpers"
-)]
+/// One stats write's outputs.
+struct StatsWrite {
+    lines: Vec<common::FullCoverageLineStatsRow>,
+    windows: Vec<common::FullCoverageWindowStatsRow>,
+    stations: Vec<common::StationFullCoverageSample>,
+}
+
+/// Builds one stats write ([`build_stats`]) and hands it to the sink as one
+/// snapshot (`sink.rs`), without waiting for the XADD.
 async fn write_stats(
-    client: &reqwest::Client,
     config: &Config,
-    internal_oauth: &common::oauth_client::OAuthTokenCache,
     shadow_line_ids: &[String],
     population: &population::Population,
     geometry: &SharedGeometry,
@@ -734,6 +690,48 @@ async fn write_stats(
     sink: &sink::StatsSink,
 ) {
     let now = chrono::Utc::now();
+    let built = build_stats(
+        config,
+        shadow_line_ids,
+        population,
+        geometry,
+        day,
+        defaults,
+        now,
+    );
+    sink.produce(
+        now,
+        &sink::StatsOutputs {
+            lines: &built.lines,
+            windows: &built.windows,
+            stations: &built.stations,
+        },
+    )
+    .await;
+}
+
+/// For every shadow-computed line, its stats row; for every populated
+/// `(crs, toc_id)` station bucket, its sample. Decision 3's "no shared
+/// transaction" rule holds downstream: the writer applies each schema of
+/// the snapshot on its own.
+///
+/// With `FULL_COVERAGE_WINDOWED_STATS=true` each line's row is the v2
+/// day-to-date (closed-day, once closed) row, and every line's `recent` and
+/// `day_to_date` windows are in the write too.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::too_many_lines,
+    reason = "metric gauges take f64, and these counts and timestamps stay far below 2^52; long but linear; splitting it would scatter its shared state across helpers"
+)]
+fn build_stats(
+    config: &Config,
+    shadow_line_ids: &[String],
+    population: &population::Population,
+    geometry: &SharedGeometry,
+    day: &DayState,
+    defaults: &common::Defaults,
+    now: chrono::DateTime<chrono::Utc>,
+) -> StatsWrite {
     let service_date = day.service_date;
     let closed = stats::rail_day_closed(service_date, now);
 
@@ -812,21 +810,12 @@ async fn write_stats(
         }
         line_rows.push(row);
     }
-    let mut windows_accepted = false;
     if let Some((trains, ctx)) = &windowed {
         metrics::gauge!(common::metrics::metric_name(
             "full_coverage_consumer_parked_messages"
         ))
         .set(trains.parked_count() as f64);
-        windows_accepted = post_windows(
-            client,
-            config,
-            internal_oauth,
-            &window_rows,
-            ctx.feed_stale,
-            sink,
-        )
-        .await;
+        report_windows(&window_rows, ctx.feed_stale);
     }
     metrics::gauge!(common::metrics::metric_name(
         "full_coverage_consumer_lines_available_total"
@@ -841,83 +830,16 @@ async fn write_stats(
     ))
     .set(partial_count as f64);
 
-    let lines_accepted = sink.posts_http()
-        && match queries::post_full_coverage_stats(
-            client,
-            &config.full_coverage_stats_url,
-            internal_oauth,
-            &line_rows,
-        )
-        .await
-        {
-            Ok(()) => {
-                sink::StatsSink::accepted(sink::LINE_STATS, line_rows.len());
-                true
-            }
-            Err(err) => {
-                tracing::error!(error = ?err, "failed to post full-coverage line stats; will retry next cycle");
-                metrics::counter!(
-                    common::metrics::metric_name("full_coverage_consumer_errors_total"),
-                    "operation" => "post_line_stats"
-                )
-                .increment(1);
-                false
-            }
-        };
-
     let station_rows = station_correlate::build_station_rows(&day.stations, now, defaults);
     metrics::gauge!(common::metrics::metric_name(
         "full_coverage_consumer_stations_available_total"
     ))
     .set(station_rows.len() as f64);
-    let stations_accepted = sink.posts_http()
-        && match queries::post_station_full_coverage_samples(
-            client,
-            &config.station_full_coverage_stats_url,
-            internal_oauth,
-            &station_rows,
-        )
-        .await
-        {
-            Ok(()) => {
-                sink::StatsSink::accepted(sink::STATION_SAMPLES, station_rows.len());
-                true
-            }
-            Err(err) => {
-                tracing::error!(error = ?err, "failed to post station full-coverage samples; will retry next cycle");
-                metrics::counter!(
-                    common::metrics::metric_name("full_coverage_consumer_errors_total"),
-                    "operation" => "post_station_samples"
-                )
-                .increment(1);
-                false
-            }
-        };
-
-    // Plan 3a.8: the stream copy of what the api accepted (http+shadow),
-    // or the only delivery (stream); nothing under http.
-    let send = |accepted: bool| !sink.posts_http() || accepted;
-    sink.produce(
-        now,
-        &sink::StatsOutputs {
-            lines: if send(lines_accepted) {
-                &line_rows
-            } else {
-                &[]
-            },
-            windows: if send(windows_accepted) {
-                &window_rows
-            } else {
-                &[]
-            },
-            stations: if send(stations_accepted) {
-                &station_rows
-            } else {
-                &[]
-            },
-        },
-    )
-    .await;
+    StatsWrite {
+        lines: line_rows,
+        windows: window_rows,
+        stations: station_rows,
+    }
 }
 
 /// What every line of one windowed stats write shares.
@@ -969,24 +891,13 @@ fn windowed_write_context(
     }
 }
 
-/// Seconds since the Unix epoch of the last "window POST failed" warning:
-/// a new consumer against an old api gets a 404 every minute, logged at
-/// warn at most once per 10 minutes.
-static LAST_WINDOW_POST_WARNING: std::sync::atomic::AtomicI64 =
-    std::sync::atomic::AtomicI64::new(0);
-
+/// The windows' gauges: the feed health and, over the `recent` windows,
+/// the trains still pending and those presumed cancelled.
 #[expect(
     clippy::cast_precision_loss,
-    reason = "metric gauges take f64, and these counts and timestamps stay far below 2^52"
+    reason = "metric gauges take f64, and these counts stay far below 2^52"
 )]
-async fn post_windows(
-    client: &reqwest::Client,
-    config: &Config,
-    internal_oauth: &common::oauth_client::OAuthTokenCache,
-    rows: &[common::FullCoverageWindowStatsRow],
-    feed_stale: bool,
-    sink: &sink::StatsSink,
-) -> bool {
+fn report_windows(rows: &[common::FullCoverageWindowStatsRow], feed_stale: bool) {
     metrics::gauge!(common::metrics::metric_name(
         "full_coverage_consumer_window_feed_stale"
     ))
@@ -1008,41 +919,6 @@ async fn post_windows(
         "full_coverage_consumer_window_presumed_cancelled"
     ))
     .set(presumed as f64);
-    // INGEST_SINK=stream: no POST (the stream delivers them, `sink.rs`).
-    if !sink.posts_http() {
-        return false;
-    }
-    match queries::post_full_coverage_window_stats(
-        client,
-        &config.windowed.full_coverage_window_stats_url,
-        internal_oauth,
-        rows,
-    )
-    .await
-    {
-        Ok(()) => {
-            metrics::counter!(common::metrics::metric_name(
-                "full_coverage_consumer_window_rows_posted_total"
-            ))
-            .increment(rows.len() as u64);
-            sink::StatsSink::accepted(sink::WINDOW_STATS, rows.len());
-            true
-        }
-        Err(err) => {
-            metrics::counter!(
-                common::metrics::metric_name("full_coverage_consumer_errors_total"),
-                "operation" => "post_window_stats"
-            )
-            .increment(1);
-            let now = chrono::Utc::now().timestamp();
-            let last = LAST_WINDOW_POST_WARNING.load(std::sync::atomic::Ordering::Relaxed);
-            if now - last >= 600 {
-                LAST_WINDOW_POST_WARNING.store(now, std::sync::atomic::Ordering::Relaxed);
-                tracing::warn!(error = ?err, "failed to post full-coverage window stats (an api without /full-coverage-window-stats answers 404); will retry next cycle, next warning in 10 minutes at the earliest");
-            }
-            false
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1822,38 +1698,17 @@ mod tests {
     }
 
     /// Nothing is read from the stream -- not the replay, not the group --
-    /// until the first population load has succeeded, even while `api`
-    /// keeps failing; and the failed load is retried on the short backoff,
-    /// not after the 300s interval.
+    /// until the first population load has succeeded, even while the
+    /// source keeps failing; and the failed load is retried on the short
+    /// backoff, not after the 300s interval.
     #[tokio::test]
     async fn nothing_is_consumed_before_the_first_population_load() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use population_reload::tests::{BODY, Scripted, body, down};
 
-        let server = MockServer::start().await;
-        let tokens = population_reload::tests::mock_token_cache(&server).await;
-        Mock::given(method("GET"))
-            .and(path("/private/schedule-line-population"))
-            .respond_with(ResponseTemplate::new(503))
-            .up_to_n_times(6)
-            .with_priority(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/private/schedule-line-population"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(r#"[{"uid": "C11052", "calling_points": []}]"#),
-            )
-            .with_priority(2)
-            .mount(&server)
-            .await;
-
+        // Three failing cycles (today + tomorrow each), then success.
+        let source = Scripted::new(|_, _, _, before| if before < 6 { down() } else { body(BODY) });
         let population = shared(population::Population::default());
         let mut rx = population_reload::Reloader {
-            client: reqwest::Client::new(),
-            url: format!("{}/private/schedule-line-population", server.uri()),
-            tokens: Arc::new(tokens),
             line_ids: Arc::new(ArcSwap::from_pointee(vec!["waterloo-reading".to_string()])),
             geometry: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             population: Arc::clone(&population),
@@ -1864,7 +1719,7 @@ mod tests {
             ),
             initial_wait: Duration::from_secs(600),
         }
-        .spawn();
+        .spawn(source);
 
         let mut feed = RecordingFeed {
             inner: FakeMovementFeed::new(vec![vec![
@@ -1907,33 +1762,21 @@ mod tests {
         );
     }
 
-    /// A population reload that takes a long time (a cold start, an `ETag`
-    /// miss, a slow `api`) no longer holds up consumption: the loop keeps
-    /// consuming against the snapshot it has while the reload runs.
+    /// A population reload that takes a long time (a cold start, a changed
+    /// version, a slow database) no longer holds up consumption: the loop
+    /// keeps consuming against the snapshot it has while the reload runs.
     #[tokio::test]
     async fn a_slow_population_reload_does_not_block_consumption() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use population_reload::tests::{BODY, Scripted, body};
 
-        let server = MockServer::start().await;
-        let tokens = population_reload::tests::mock_token_cache(&server).await;
-        Mock::given(method("GET"))
-            .and(path("/private/schedule-line-population"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(r#"[{"uid": "C11052", "calling_points": []}]"#)
-                    .set_delay(Duration::from_secs(5)),
-            )
-            .mount(&server)
-            .await;
+        let mut source = Scripted::new(|_, _, _, _| body(BODY));
+        source.delay = Duration::from_secs(5);
+        let fetches = Arc::clone(&source.fetches);
 
         let (_, loaded) = todays_population();
         let population = shared(loaded);
         let before = population.load_full();
         let _rx = population_reload::Reloader {
-            client: reqwest::Client::new(),
-            url: format!("{}/private/schedule-line-population", server.uri()),
-            tokens: Arc::new(tokens),
             line_ids: Arc::new(ArcSwap::from_pointee(vec!["waterloo-reading".to_string()])),
             geometry: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             population: Arc::clone(&population),
@@ -1941,16 +1784,11 @@ mod tests {
             retry: population_reload::RETRY_BACKOFF,
             initial_wait: Duration::from_secs(600),
         }
-        .spawn();
-        // Let the reload's first (slow) request get in flight.
+        .spawn(source);
+        // Let the reload's first (slow) fetch get in flight.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
-            server
-                .received_requests()
-                .await
-                .unwrap()
-                .iter()
-                .any(|r| r.method.as_str() == "GET"),
+            fetches.load(std::sync::atomic::Ordering::Relaxed) > 0,
             "the reload is under way"
         );
 
@@ -1966,7 +1804,7 @@ mod tests {
         }
         assert!(
             started.elapsed() < Duration::from_secs(1),
-            "consumed two batches in {:?}, while the reload is still waiting on api",
+            "consumed two batches in {:?}, while the reload is still waiting on its source",
             started.elapsed()
         );
         assert_eq!(feed.committed_count, 2);
@@ -2026,39 +1864,12 @@ mod tests {
         );
     }
 
-    // --- 2026-09-27: windowed stats end to end through write_stats ---
+    // --- 2026-09-27: windowed stats end to end through build_stats ---
 
-    async fn capture_write(windowed: bool) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
-        capture_write_to(windowed, &sink::StatsSink::http()).await
-    }
-
-    async fn capture_write_to(
-        windowed: bool,
-        sink: &sink::StatsSink,
-    ) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        let tokens = population_reload::tests::mock_token_cache(&server).await;
-        for p in [
-            "/private/full-coverage-stats",
-            "/private/full-coverage-window-stats",
-            "/private/station-full-coverage-samples",
-        ] {
-            Mock::given(method("POST"))
-                .and(path(p))
-                .respond_with(ResponseTemplate::new(200).set_body_string("{\"upserted\":0}"))
-                .mount(&server)
-                .await;
-        }
+    /// One stats write's line rows (as their JSON array) and window rows.
+    fn capture_write(windowed: bool) -> (serde_json::Value, Vec<serde_json::Value>) {
         let mut config = config::tests::base_config(vec![], "*");
-        config.full_coverage_stats_url = format!("{}/private/full-coverage-stats", server.uri());
-        config.station_full_coverage_stats_url =
-            format!("{}/private/station-full-coverage-samples", server.uri());
         config.windowed.enabled = windowed;
-        config.windowed.full_coverage_window_stats_url =
-            format!("{}/private/full-coverage-window-stats", server.uri());
 
         let today = current_rail_service_date(chrono::Utc::now());
         let mut population = population::Population::default();
@@ -2076,43 +1887,34 @@ mod tests {
             day = day.enable_windowed();
         }
         let geometry: SharedGeometry = Arc::new(ArcSwap::from_pointee(HashMap::new()));
-        write_stats(
-            &reqwest::Client::new(),
+        let built = build_stats(
             &config,
-            &tokens,
             &["waterloo-reading".to_string()],
             &population,
             &geometry,
             &day,
             &common::Defaults::default(),
-            sink,
-        )
-        .await;
-
-        let requests = server.received_requests().await.unwrap();
-        let bodies = |p: &str| -> Vec<serde_json::Value> {
-            requests
-                .iter()
-                .filter(|r| r.url.path() == p)
-                .map(|r| serde_json::from_slice(&r.body).unwrap())
-                .collect()
-        };
+            chrono::Utc::now(),
+        );
         (
-            bodies("/private/full-coverage-stats"),
-            bodies("/private/full-coverage-window-stats"),
+            serde_json::to_value(&built.lines).unwrap(),
+            built
+                .windows
+                .iter()
+                .map(|row| serde_json::to_value(row).unwrap())
+                .collect(),
         )
     }
 
-    /// Flag off: exactly the legacy body (a golden comparison against the
-    /// pre-windowed shape -- no breakdown, no version), and no window POST.
-    #[tokio::test]
-    async fn with_windowed_stats_off_the_legacy_row_is_unchanged_and_no_windows_are_posted() {
-        let (line_posts, window_posts) = capture_write(false).await;
-        assert!(window_posts.is_empty());
-        assert_eq!(line_posts.len(), 1);
+    /// Flag off: exactly the legacy row (a golden comparison against the
+    /// pre-windowed shape -- no breakdown, no version), and no windows.
+    #[test]
+    fn with_windowed_stats_off_the_legacy_row_is_unchanged_and_there_are_no_windows() {
+        let (lines, windows) = capture_write(false);
+        assert!(windows.is_empty());
         let today = current_rail_service_date(chrono::Utc::now());
         assert_eq!(
-            line_posts[0],
+            lines,
             serde_json::json!([{
                 "line_id": "waterloo-reading",
                 "service_date": today.to_string(),
@@ -2124,58 +1926,42 @@ mod tests {
         );
     }
 
-    /// Plan 3a.8: under `INGEST_SINK=stream` a stats write POSTs nothing
-    /// (here Redis is unreachable: the snapshot stays queued, and the write
-    /// does not wait for it).
+    /// Plan 3a.8: a stats write does not wait for the XADD (here Redis is
+    /// unreachable: the snapshot stays queued).
     #[tokio::test]
-    async fn with_the_stream_sink_nothing_is_posted() {
-        let stream = sink::StatsSink::on_stream(
-            ingest_stream::snapshot::SinkMode::Stream,
-            "redis://127.0.0.1:1",
-            "test:ds:ingest:full-coverage",
-        );
-        let (line_posts, window_posts) = capture_write_to(true, &stream).await;
-        assert!(line_posts.is_empty());
-        assert!(window_posts.is_empty());
-    }
-
-    /// `http+shadow` POSTs exactly what `http` does.
-    #[tokio::test]
-    async fn with_the_shadow_sink_the_posts_are_unchanged() {
-        let shadow = sink::StatsSink::on_stream(
-            ingest_stream::snapshot::SinkMode::HttpShadow,
-            "redis://127.0.0.1:1",
-            "test:ds:ingest:full-coverage",
-        );
-        let (line_posts, window_posts) = capture_write_to(true, &shadow).await;
-        let (http_lines, http_windows) = capture_write(true).await;
-        assert_eq!(line_posts.len(), 1);
-        assert_eq!(window_posts.len(), 1);
-        assert_eq!(line_posts[0][0]["line_id"], http_lines[0][0]["line_id"]);
-        assert_eq!(
-            window_posts[0].as_array().unwrap().len(),
-            http_windows[0].as_array().unwrap().len()
-        );
+    async fn a_stats_write_does_not_wait_for_the_stream() {
+        let stream =
+            sink::StatsSink::on_stream("redis://127.0.0.1:1", "test:ds:ingest:full-coverage");
+        let mut config = config::tests::base_config(vec![], "*");
+        config.windowed.enabled = true;
+        let today = current_rail_service_date(chrono::Utc::now());
+        let geometry: SharedGeometry = Arc::new(ArcSwap::from_pointee(HashMap::new()));
+        let started = std::time::Instant::now();
+        write_stats(
+            &config,
+            &["waterloo-reading".to_string()],
+            &population::Population::default(),
+            &geometry,
+            &DayState::new(today).enable_windowed(),
+            &common::Defaults::default(),
+            &stream,
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     /// Flag on: a v2 row and both windows for the line.
-    #[tokio::test]
-    async fn with_windowed_stats_on_v2_rows_and_both_windows_are_posted() {
-        let (line_posts, window_posts) = capture_write(true).await;
-        assert_eq!(line_posts[0][0]["stats_version"], 2);
-        assert!(line_posts[0][0]["breakdown"].is_object());
-        assert_eq!(window_posts.len(), 1);
-        let kinds: Vec<&str> = window_posts[0]
-            .as_array()
-            .unwrap()
+    #[test]
+    fn with_windowed_stats_on_v2_rows_and_both_windows_are_written() {
+        let (lines, windows) = capture_write(true);
+        assert_eq!(lines[0]["stats_version"], 2);
+        assert!(lines[0]["breakdown"].is_object());
+        let kinds: Vec<&str> = windows
             .iter()
             .map(|r| r["window_kind"].as_str().unwrap())
             .collect();
         assert_eq!(kinds, vec!["recent", "day_to_date"]);
-        assert_eq!(
-            window_posts[0][0]["feed_stale"], true,
-            "nothing consumed yet"
-        );
-        assert_eq!(window_posts[0][0]["relevance"], "full");
+        assert_eq!(windows[0]["feed_stale"], true, "nothing consumed yet");
+        assert_eq!(windows[0]["relevance"], "full");
     }
 }

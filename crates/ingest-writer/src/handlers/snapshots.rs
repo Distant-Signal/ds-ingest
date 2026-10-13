@@ -22,9 +22,8 @@
 //!   it (`full_coverage_window::validate`): an invalid row is the whole
 //!   entry's fault (poison), as it is a 400 for the route.
 //!
-//! Rows are counted in `ingest_stream_rows_total{mode}` (`shadow` from
-//! [`SchemaHandler::check`], `apply` from [`SchemaHandler::apply`]) for the
-//! rollout's compare step, and applied rows again in
+//! Rows are counted in `ingest_stream_rows_total{mode="apply"}`, and
+//! again in
 //! `ingest_stream_row_writes_total{outcome}`: `written` (inserted or
 //! updated) or `skipped` (unchanged, or refused by the guard as older).
 //!
@@ -114,17 +113,6 @@ impl<T> SchemaHandler for Snapshot<T>
 where
     T: DeserializeOwned + Serialize + Send + Sync + 'static,
 {
-    fn check(&self, entry: &StreamEntry) -> Result<(), HandlerError> {
-        let rows = self.decode_valid(entry)?;
-        ingest_stream::metrics::rows(
-            &entry.stream,
-            entry.envelope.schema.name(),
-            "shadow",
-            rows.len(),
-        );
-        Ok(())
-    }
-
     fn apply<'a>(
         &'a self,
         conn: &'a mut PgConnection,

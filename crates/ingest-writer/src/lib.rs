@@ -7,7 +7,7 @@
 //! runtime's Redis half is `ingest_stream::consumer`; the writer's half is
 //! here:
 //!
-//! - [`stream`]: the per-stream modes (`off`/`shadow`/`apply`), the
+//! - [`stream`]: the per-stream modes (`off`/`apply`), the
 //!   consumer tasks and their [`ingest_stream::Handler`], and the hourly
 //!   `MINID` trim of the dead-letter streams;
 //! - [`handlers`]: the schema registry and the per-row isolation helper;

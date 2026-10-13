@@ -3,14 +3,16 @@
 //! [`WriterHandler`], plus the hourly `MINID` trim of the dead-letter
 //! streams.
 //!
-//! Modes (`INGEST_WRITER_STREAMS=station-samples:apply,full-coverage:shadow`,
+//! Modes (`INGEST_WRITER_STREAMS=station-samples:apply,full-coverage:apply`,
 //! chart `ingestWriter.streams.<name>`; every stream `off` by default):
 //!
 //! - **`off`**: the stream is not read;
-//! - **`shadow`**: decode and validate each entry, export metrics, ACK, and
-//!   write nothing (`ingest_stream_consumed_total{outcome="skipped"}`);
 //! - **`apply`**: write, with the `ingest_dedup` insert in the same
 //!   transaction.
+//!
+//! Release B (ingest phase 5) removed the cutover's `shadow` mode (decode,
+//! validate and ACK, writing nothing, to compare with the api's `/private`
+//! writes): a `shadow` now fails at startup ([`SHADOW_REMOVED`]).
 //!
 //! The Redis half (groups, PEL first, `XAUTOCLAIM`, dead letters, retries,
 //! gauges) is `ingest_stream::consumer`.
@@ -42,9 +44,14 @@ use crate::observed::Observed;
 pub enum Mode {
     #[default]
     Off,
-    Shadow,
     Apply,
 }
+
+/// Why `shadow` is refused: it only made sense while the api still wrote
+/// the same rows through `/private`.
+pub const SHADOW_REMOVED: &str = "the ingest stream mode \"shadow\" was removed in release B \
+     (ingest phase 5, docs/ingest-phase5-runbook.md): with the api's /private routes gone \
+     there is nothing to compare with; use \"apply\" or \"off\"";
 
 impl FromStr for Mode {
     type Err = anyhow::Error;
@@ -52,9 +59,9 @@ impl FromStr for Mode {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "off" => Ok(Self::Off),
-            "shadow" => Ok(Self::Shadow),
             "apply" => Ok(Self::Apply),
-            other => bail!("unknown ingest stream mode {other:?} (off, shadow or apply)"),
+            "shadow" => bail!("{SHADOW_REMOVED}"),
+            other => bail!("unknown ingest stream mode {other:?} (off or apply)"),
         }
     }
 }
@@ -63,7 +70,6 @@ impl fmt::Display for Mode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Off => "off",
-            Self::Shadow => "shadow",
             Self::Apply => "apply",
         })
     }
@@ -225,26 +231,24 @@ pub const SCHEMA_NOT_ALLOWED_ON_STREAM: &str = "schema_not_allowed_on_stream";
 /// with `<schema name>:` ([`ingest_stream::Envelope::snapshot_key`]).
 pub const KEY_NOT_FOR_SCHEMA: &str = "key_not_for_schema";
 
-/// The writer's [`Handler`] for one stream in `shadow` or `apply`.
+/// The writer's [`Handler`] for one stream in `apply`.
 pub struct WriterHandler {
     pool: PgPool,
     registry: Arc<Registry>,
     spec: StreamSpec,
-    mode: Mode,
 }
 
 impl WriterHandler {
-    pub fn new(pool: PgPool, registry: Arc<Registry>, spec: StreamSpec, mode: Mode) -> Self {
+    pub fn new(pool: PgPool, registry: Arc<Registry>, spec: StreamSpec) -> Self {
         Self {
             pool,
             registry,
             spec,
-            mode,
         }
     }
 
     /// The entry's handler, once the entry may be applied from this stream
-    /// at all. Checked in both modes, before anything is written:
+    /// at all. Checked before anything is written:
     ///
     /// - its schema must be one this stream carries, so a producer that may
     ///   `XADD` to one stream cannot write another stream's tables
@@ -298,14 +302,7 @@ impl WriterHandler {
 
 impl Handler for WriterHandler {
     async fn handle(&self, entry: &StreamEntry) -> Result<Handled, HandlerError> {
-        match self.mode {
-            Mode::Apply => self.apply(entry).await,
-            // `Off` streams get no consumer; treat a stray one as shadow.
-            Mode::Shadow | Mode::Off => {
-                self.admit(entry)?.check(entry)?;
-                Ok(Handled::Skipped)
-            }
-        }
+        self.apply(entry).await
     }
 }
 
@@ -368,12 +365,8 @@ pub fn spawn(runtime: &StreamRuntime, modes: &StreamModes) -> RunningStreams {
     for (spec, mode) in &active {
         let task_progress = Progress::new(runtime.stall_after);
         progress.push((spec.name, task_progress.clone()));
-        let handler = WriterHandler::new(
-            runtime.pool.clone(),
-            Arc::clone(&runtime.registry),
-            *spec,
-            *mode,
-        );
+        let handler =
+            WriterHandler::new(runtime.pool.clone(), Arc::clone(&runtime.registry), *spec);
         // Every stream is declared (`every_stream_is_declared_in_the_budget`);
         // the fallback is the spec's original dead-letter cap.
         let dead_letter_maxlen =
@@ -514,11 +507,11 @@ mod tests {
             "station-samples:off,full-coverage:off,tfl:off,reference:off,ioi-gtfs:off,ioi-nir:off,ioi-live:off"
         );
 
-        let modes: StreamModes = " station-samples:apply, full-coverage : shadow,tfl:off"
+        let modes: StreamModes = " station-samples:apply, full-coverage : apply,tfl:off"
             .parse()
             .unwrap();
         assert_eq!(modes.mode("station-samples"), Mode::Apply);
-        assert_eq!(modes.mode("full-coverage"), Mode::Shadow);
+        assert_eq!(modes.mode("full-coverage"), Mode::Apply);
         assert_eq!(modes.mode("tfl"), Mode::Off);
         assert_eq!(modes.mode("reference"), Mode::Off);
         assert!(modes.any_apply());
@@ -531,13 +524,19 @@ mod tests {
             active,
             [
                 ("ds:ingest:station-samples", Mode::Apply),
-                ("ds:ingest:full-coverage", Mode::Shadow)
+                ("ds:ingest:full-coverage", Mode::Apply)
             ]
         );
+    }
 
-        let shadow_only: StreamModes = "tfl:shadow".parse().unwrap();
-        assert!(shadow_only.any_active());
-        assert!(!shadow_only.any_apply());
+    /// Release B removed `shadow`: it fails at startup, naming the reason.
+    #[test]
+    fn shadow_is_refused_with_the_reason() {
+        let err = "tfl:shadow".parse::<StreamModes>().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("removed in release B"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -546,7 +545,8 @@ mod tests {
             "station-samples",
             "station-samples:on",
             "train-events:apply",
-            "tfl:apply,tfl:shadow",
+            "tfl:apply,tfl:apply",
+            "tfl:shadow",
         ] {
             assert!(bad.parse::<StreamModes>().is_err(), "{bad}");
         }
@@ -564,10 +564,10 @@ mod tests {
     fn a_stream_with_no_handler_is_uncovered() {
         // Every stream has its handlers since 3a.6 and 3c.1, so an empty
         // registry shows the check.
-        let modes: StreamModes = "tfl:shadow".parse().unwrap();
+        let modes: StreamModes = "tfl:apply".parse().unwrap();
         assert_eq!(modes.uncovered(&Registry::new()), ["tfl: tfl-line-status"]);
         // Plans 3a.6 and 3c.1: every stream is covered.
-        let modes: StreamModes = "station-samples:apply,full-coverage:shadow,tfl:apply,reference:apply,ioi-gtfs:shadow,ioi-nir:shadow,ioi-live:shadow"
+        let modes: StreamModes = "station-samples:apply,full-coverage:apply,tfl:apply,reference:apply,ioi-gtfs:apply,ioi-nir:apply,ioi-live:apply"
             .parse()
             .unwrap();
         assert!(modes.uncovered(&crate::handlers::registry()).is_empty());
@@ -580,7 +580,7 @@ mod tests {
     #[test]
     fn the_phase_3c_streams_are_covered() {
         let modes: StreamModes =
-            "tfl:apply,reference:apply,ioi-gtfs:shadow,ioi-nir:apply,ioi-live:shadow"
+            "tfl:apply,reference:apply,ioi-gtfs:apply,ioi-nir:apply,ioi-live:apply"
                 .parse()
                 .unwrap();
         assert!(
@@ -605,10 +605,9 @@ mod tests {
 
     /// Security review H1 (2026-10-08): an entry whose schema its stream
     /// does not carry, or whose key is not `<schema name>:...`, is poison
-    /// in shadow and in apply, before any database work (this pool never
-    /// connects).
+    /// before any database work (this pool never connects).
     #[tokio::test]
-    async fn an_entry_off_its_stream_or_its_key_is_poison_in_both_modes() {
+    async fn an_entry_off_its_stream_or_its_key_is_poison() {
         use chrono::Utc;
         use ingest_stream::{Envelope, SchemaId};
 
@@ -633,38 +632,29 @@ mod tests {
             Err(HandlerError::Poison(got)) => assert!(got.starts_with(reason), "{got}"),
             other => panic!("expected poison {reason}, got {other:?}"),
         };
-        for mode in [Mode::Shadow, Mode::Apply] {
-            let handler = WriterHandler::new(pool.clone(), Arc::clone(&registry), live, mode);
-            // Another poller's schema on this poller's stream.
-            poison(
-                handler
-                    .handle(&entry("ioi-stations", "ioi-stations:b:1/1"))
-                    .await,
-                SCHEMA_NOT_ALLOWED_ON_STREAM,
-            );
-            // A schema of another stream altogether.
-            poison(
-                handler.handle(&entry("tocs", "tocs:b:1/1")).await,
-                SCHEMA_NOT_ALLOWED_ON_STREAM,
-            );
-            // This stream's schema with another schema's key, or none.
-            for key in [
-                "tocs:b:1/1",
-                "ioi-station-samples",
-                "ioi-station-samples-x:b",
-            ] {
-                poison(
-                    handler.handle(&entry("ioi-station-samples", key)).await,
-                    KEY_NOT_FOR_SCHEMA,
-                );
-            }
-        }
-        let shadow = WriterHandler::new(pool, registry, live, Mode::Shadow);
-        assert!(matches!(
-            shadow
-                .handle(&entry("ioi-station-samples", "ioi-station-samples:b:1/1"))
+        let handler = WriterHandler::new(pool, registry, live);
+        // Another poller's schema on this poller's stream.
+        poison(
+            handler
+                .handle(&entry("ioi-stations", "ioi-stations:b:1/1"))
                 .await,
-            Ok(Handled::Skipped)
-        ));
+            SCHEMA_NOT_ALLOWED_ON_STREAM,
+        );
+        // A schema of another stream altogether.
+        poison(
+            handler.handle(&entry("tocs", "tocs:b:1/1")).await,
+            SCHEMA_NOT_ALLOWED_ON_STREAM,
+        );
+        // This stream's schema with another schema's key, or none.
+        for key in [
+            "tocs:b:1/1",
+            "ioi-station-samples",
+            "ioi-station-samples-x:b",
+        ] {
+            poison(
+                handler.handle(&entry("ioi-station-samples", key)).await,
+                KEY_NOT_FOR_SCHEMA,
+            );
+        }
     }
 }

@@ -86,12 +86,12 @@ mod tests {
     fn every_stream_has_a_mode_info_series() {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
-        let modes: StreamModes = "tfl:apply,station-samples:shadow".parse().unwrap();
+        let modes: StreamModes = "tfl:apply,station-samples:apply".parse().unwrap();
         metrics::with_local_recorder(&recorder, || export_stream_modes(&modes));
         let rendered = handle.render();
         for series in [
             r#"distant_signal_ingest_stream_mode_info{stream="ds:ingest:tfl",mode="apply"} 1"#,
-            r#"distant_signal_ingest_stream_mode_info{stream="ds:ingest:station-samples",mode="shadow"} 1"#,
+            r#"distant_signal_ingest_stream_mode_info{stream="ds:ingest:station-samples",mode="apply"} 1"#,
             r#"distant_signal_ingest_stream_mode_info{stream="ds:ingest:reference",mode="off"} 1"#,
         ] {
             assert!(

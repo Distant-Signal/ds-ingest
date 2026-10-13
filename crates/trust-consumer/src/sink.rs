@@ -1,33 +1,30 @@
 //! Where each batch of train events goes (ingest architecture plan 3b.3,
-//! decision D1), chosen by `INGEST_SINK`:
+//! decision D1): straight into Postgres, as the `trust_consumer` role.
 //!
-//! | | [`HttpSink`] (`http`, the default) | [`DbSink`] (`db`) |
-//! |---|---|---|
-//! | train events | `POST /private/train-events` | `ds_store::tracking::outbox::write_train_events_deferring`: most directly (`upsert_train_events_batch_in`); a resolution, cancellation or reinstatement, and the later events of its subscription, into `train_event_outbox` for the ingest-writer's loop |
-//! | forward signals | `POST /private/train-forward-signals` (best effort) | `insert_forward_signals_on`, in the same transaction (a deferred event's in its outbox row) |
+//! | | [`DbSink`] |
+//! |---|---|
+//! | train events | `ds_store::tracking::outbox::write_train_events_deferring`: most directly (`upsert_train_events_batch_in`); a resolution, cancellation or reinstatement, and the later events of its subscription, into `train_event_outbox` for the ingest-writer's loop |
+//! | forward signals | `insert_forward_signals_on`, in the same transaction (a deferred event's in its outbox row) |
 //!
 //! The `trust_consumer` role may only read `train_subscriptions` (decided
 //! 2026-10-08), so the events that update a subscription wait for the
 //! writer's `train_event_outbox` loop (5 s); see `ds_store::tracking::outbox`.
 //!
-//! The api's two handlers call the same ds-store writers, so the rows are
-//! the same either way, and so is the `rejected` list the consumer
-//! dead-letters. The forward signals are built the same way for both
-//! (`process::build_forward_signals`, for the events that were written),
-//! each keyed by its movement's `dedup_key`, so a redelivered entry queues
-//! its signal once. `main.rs`'s `run_cycle` `XACKs` the batch only after
-//! [`TrainEventSink::write`] returned (for `db`: after its commit).
+//! The forward signals are built by `process::build_forward_signals`, for
+//! the events that were written, each keyed by its movement's `dedup_key`,
+//! so a redelivered entry queues its signal once. `main.rs`'s `run_cycle`
+//! `XACKs` the batch only after [`TrainEventSink::write`] returned (after
+//! its commit).
 //!
-//! The reads (active tracked trains, STANOX/CRS) stay on the api for both
-//! sinks until phase 4 (spec §11.2).
+//! Release B (ingest phase 5) removed the `http` sink (the api's
+//! `/private/train-events` and `/private/train-forward-signals`).
 
 use std::collections::HashMap;
 
-use common::oauth_client::OAuthTokenCache;
 use common::{RejectedTrustBacklogRow, TrainMovementEventMessage};
 use sqlx::PgPool;
 
-use crate::{process, queries};
+use crate::process;
 
 /// What a sink's failures count as: the `trust_consumer_errors_total`
 /// operation of a failed write (in `API_CALL_OPERATIONS`, so the chart's
@@ -40,12 +37,6 @@ pub(crate) struct Operations {
     /// The `DeadLetter::reason` of a rejected event.
     pub rejected: &'static str,
 }
-
-/// [`HttpSink`]'s names: today's, unchanged.
-pub(crate) const HTTP_OPERATIONS: Operations = Operations {
-    write: "post_train_events",
-    rejected: "rejected_by_api",
-};
 
 /// [`DbSink`]'s names (plan 3b.4, as the backlog's 3b.2).
 pub(crate) const DB_OPERATIONS: Operations = Operations {
@@ -70,35 +61,8 @@ pub(crate) trait TrainEventSink {
     ) -> anyhow::Result<Vec<RejectedTrustBacklogRow>>;
 }
 
-/// The sink `INGEST_SINK` chose, for the main loop.
-pub(crate) enum ActiveSink {
-    /// Boxed: the HTTP sink (a client, URLs and a token cache) is much
-    /// larger than the pool.
-    Http(Box<HttpSink>),
-    Db(DbSink),
-}
-
-impl TrainEventSink for ActiveSink {
-    fn operations(&self) -> Operations {
-        match self {
-            Self::Http(sink) => sink.operations(),
-            Self::Db(sink) => sink.operations(),
-        }
-    }
-
-    async fn write(
-        &self,
-        events: &[TrainMovementEventMessage],
-        trains_id_by_tracked_train_id: &HashMap<i64, i64>,
-    ) -> anyhow::Result<Vec<RejectedTrustBacklogRow>> {
-        match self {
-            Self::Http(sink) => sink.write(events, trains_id_by_tracked_train_id).await,
-            Self::Db(sink) => sink.write(events, trains_id_by_tracked_train_id).await,
-        }
-    }
-}
-
 /// The events not in `rejected`, in order: the ones whose writes landed.
+#[cfg(test)]
 fn written<'a>(
     events: &'a [TrainMovementEventMessage],
     rejected: &[RejectedTrustBacklogRow],
@@ -110,49 +74,6 @@ fn written<'a>(
         .filter(|(index, _)| !rejected.contains(index))
         .map(|(_, event)| event)
         .collect()
-}
-
-/// `INGEST_SINK=http`: today's path through the api.
-pub(crate) struct HttpSink {
-    pub client: reqwest::Client,
-    /// `API_INGEST_URL`, `.../private/train-events`.
-    pub ingest_url: String,
-    /// `FORWARD_SIGNALS_URL`, `.../private/train-forward-signals`.
-    pub forward_signals_url: String,
-    pub tokens: OAuthTokenCache,
-}
-
-impl TrainEventSink for HttpSink {
-    fn operations(&self) -> Operations {
-        HTTP_OPERATIONS
-    }
-
-    async fn write(
-        &self,
-        events: &[TrainMovementEventMessage],
-        trains_id_by_tracked_train_id: &HashMap<i64, i64>,
-    ) -> anyhow::Result<Vec<RejectedTrustBacklogRow>> {
-        let response =
-            queries::post_train_events(&self.client, &self.ingest_url, &self.tokens, events)
-                .await?;
-        // Forward signals only for events api actually wrote. Best effort:
-        // a signal only makes notifier look sooner.
-        let signals = process::build_forward_signals(
-            written(events, &response.rejected),
-            trains_id_by_tracked_train_id,
-        );
-        if let Err(err) = queries::post_train_forward_signals(
-            &self.client,
-            &self.forward_signals_url,
-            &self.tokens,
-            &signals,
-        )
-        .await
-        {
-            tracing::warn!(error = ?err, "failed to post train forward signals");
-        }
-        Ok(response.rejected)
-    }
 }
 
 /// [`DbSink`]'s `db_writes_total{operation}` (`ds_store::writes`): one per
@@ -240,10 +161,7 @@ impl TrainEventSink for DbSink {
 /// so nothing has to be deleted first.
 #[cfg(test)]
 mod db_tests {
-    use common::oauth_client::OAuthCredentials;
     use sqlx::postgres::PgPoolOptions;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
 
@@ -457,94 +375,27 @@ mod db_tests {
             .collect()
     }
 
-    /// Plan 3b.3: the same batch through either sink leaves the same
-    /// movements, current state, forward signal and subscription, and
-    /// reports the same rejected event. The HTTP side is what the api does
-    /// with the two POST bodies: `upsert_train_events_batch` and
-    /// `insert_forward_signals`, as `post_train_events` and
-    /// `post_train_forward_signals` do.
+    /// Plan 3b.3: a batch through the sink leaves the same movements,
+    /// current state, forward signal and subscription, and reports the same
+    /// rejected event, as the reference path: `upsert_train_events_batch`
+    /// and `insert_forward_signals` (what the api's removed
+    /// `/private/train-events` and `/private/train-forward-signals` did).
     #[tokio::test]
     #[ignore = "requires a live database; run with DATABASE_URL set and --ignored"]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one fixture batch through both sinks, then every table compared"
-    )]
-    async fn both_sinks_write_the_same_rows_for_a_fixture_batch() {
+    async fn the_sink_writes_the_same_rows_as_the_reference_path() {
         let fixtures = fixture_pool().await;
-        let via_http = Fixture::new(&fixtures, "h").await;
+        let via_reference = Fixture::new(&fixtures, "h").await;
         let via_db = Fixture::new(&fixtures, "d").await;
         let pool = pool().await;
 
-        // The api's answer to the POST: what `upsert_train_events_batch`
-        // reports for this batch (checked against the real one below).
-        let api = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/token/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "fake-jwt",
-                "expires_in": 300,
-            })))
-            .mount(&api)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/private/train-events"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "upserted": 2,
-                "rejected": [{
-                    "index": 1,
-                    "dedup_key": format!("{}-bad", via_http.tag),
-                    "sqlstate": "23514",
-                    "reason": "check_violation",
-                    "constraint": "train_current_state_status_check",
-                    "message": "refused",
-                }],
-            })))
-            .expect(1)
-            .mount(&api)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/private/train-forward-signals"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"upserted": 1})),
-            )
-            .expect(1)
-            .mount(&api)
-            .await;
-        let http = HttpSink {
-            client: reqwest::Client::new(),
-            ingest_url: format!("{}/private/train-events", api.uri()),
-            forward_signals_url: format!("{}/private/train-forward-signals", api.uri()),
-            tokens: OAuthTokenCache::new(OAuthCredentials {
-                token_url: format!("{}/token/", api.uri()),
-                client_id: "test".to_owned(),
-                scope: "groups".to_owned(),
-                username: "test".to_owned(),
-                password: "test".to_owned(),
-            }),
-        };
-        http.write(
-            &via_http.events(),
-            &via_http.trains_id_by_tracked_train_id(),
-        )
-        .await
-        .unwrap();
-        let requests = api.received_requests().await.unwrap();
-        let body = |route: &str| {
-            requests
-                .iter()
-                .find(|request| request.url.path() == route)
-                .unwrap_or_else(|| panic!("no POST {route}"))
-                .body
-                .clone()
-        };
-        // The api's two handlers, on the bodies it was sent.
-        let events: Vec<TrainMovementEventMessage> =
-            serde_json::from_slice(&body("/private/train-events")).unwrap();
-        let api_outcome = ds_store::tracking::upsert_train_events_batch(&pool, &events)
+        let events = via_reference.events();
+        let reference_outcome = ds_store::tracking::upsert_train_events_batch(&pool, &events)
             .await
             .unwrap();
-        let signals: Vec<common::TrainForwardSignalMessage> =
-            serde_json::from_slice(&body("/private/train-forward-signals")).unwrap();
+        let signals = process::build_forward_signals(
+            written(&events, &reference_outcome.rejected),
+            &via_reference.trains_id_by_tracked_train_id(),
+        );
         ds_store::tracking::insert_forward_signals(&pool, &signals)
             .await
             .unwrap();
@@ -555,12 +406,12 @@ mod db_tests {
             .await
             .unwrap();
 
-        let rows_http = via_http.snapshot(&fixtures).await;
+        let rows_reference = via_reference.snapshot(&fixtures).await;
         let rows_db = via_db.snapshot(&fixtures).await;
-        via_http.cleanup(&fixtures).await;
+        via_reference.cleanup(&fixtures).await;
         via_db.cleanup(&fixtures).await;
 
-        assert_eq!(rows_db, rows_http);
+        assert_eq!(rows_db, rows_reference);
         // Two movements, the state, one signal, the subscription.
         assert_eq!(rows_db.len(), 5, "{rows_db:#?}");
         assert!(
@@ -577,7 +428,7 @@ mod db_tests {
         );
         assert_eq!(
             normalise(&db_rejected, &via_db.tag),
-            normalise(&api_outcome.rejected, &via_http.tag)
+            normalise(&reference_outcome.rejected, &via_reference.tag)
         );
         assert_eq!(db_rejected.len(), 1);
         assert_eq!(db_rejected[0].index, 1);
@@ -664,26 +515,26 @@ mod db_tests {
     /// Decided 2026-10-08: a resolution, a cancellation and a reinstatement
     /// (and the events queued behind them) wait in the outbox, and one tick
     /// of the writer's loop leaves the subscription, the train and its
-    /// movements, state and forward signal exactly as the api's HTTP path
+    /// movements, state and forward signal exactly as the reference path
     /// does. Also checks the writer role can do what the loop needs.
     #[tokio::test]
     #[ignore = "requires a live database; run with DATABASE_URL set and --ignored"]
-    async fn subscription_changes_after_one_writer_tick_match_the_http_path() {
+    async fn subscription_changes_after_one_writer_tick_match_the_reference_path() {
         let fixtures = fixture_pool().await;
         let writer = writer_pool().await;
-        let via_http = Fixture::with_status(&fixtures, "rh", "pending").await;
+        let via_reference = Fixture::with_status(&fixtures, "rh", "pending").await;
         let via_db = Fixture::with_status(&fixtures, "rd", "pending").await;
         let pool = pool().await;
 
-        // The api's POST /private/train-events and train-forward-signals,
+        // The reference path (the removed api routes' writers),
         // as the api role (`fixtures`).
-        let events = via_http.resolving_events();
-        let api_outcome = ds_store::tracking::upsert_train_events_batch(&fixtures, &events)
+        let events = via_reference.resolving_events();
+        let reference_outcome = ds_store::tracking::upsert_train_events_batch(&fixtures, &events)
             .await
             .unwrap();
         let signals = process::build_forward_signals(
-            written(&events, &api_outcome.rejected),
-            &via_http.trains_id_by_tracked_train_id(),
+            written(&events, &reference_outcome.rejected),
+            &via_reference.trains_id_by_tracked_train_id(),
         );
         ds_store::tracking::insert_forward_signals(&fixtures, &signals)
             .await
@@ -701,13 +552,13 @@ mod db_tests {
         let queued = via_db.snapshot(&fixtures).await;
         let waiting = via_db.pending(&fixtures).await;
         let applied = tick(&writer).await;
-        let rows_http = via_http.snapshot(&fixtures).await;
+        let rows_reference = via_reference.snapshot(&fixtures).await;
         let rows_db = via_db.snapshot(&fixtures).await;
         let left = via_db.pending(&fixtures).await;
-        via_http.cleanup(&fixtures).await;
+        via_reference.cleanup(&fixtures).await;
         via_db.cleanup(&fixtures).await;
 
-        assert!(rejected.is_empty() && api_outcome.rejected.is_empty());
+        assert!(rejected.is_empty() && reference_outcome.rejected.is_empty());
         assert_eq!(
             queued, before,
             "nothing of the subscription's events lands before the tick"
@@ -721,7 +572,7 @@ mod db_tests {
             "{applied:?}"
         );
         assert_eq!(left, 0);
-        assert_eq!(rows_db, rows_http);
+        assert_eq!(rows_db, rows_reference);
         assert!(
             rows_db.contains(&"subscription resolved - true".to_string()),
             "{rows_db:#?}"

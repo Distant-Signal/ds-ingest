@@ -6,9 +6,11 @@ This runbook prepares phase 5 of
 §13, §15.1, §6.4 and §16). It was written on 2026-10-08 against `main` at
 `dc2b4405`. File and line references are to that commit.
 
-**Phase 5 code starts only once every producer runs off `/private` in
-production** (user decision). The phase 5 steps themselves are not built.
-The prep that changes no default is (batch 53, 2026-10-08): 5.1's
+**Status 2026-10-12: release B (phase 5's 5.1–5.3b, the HTTP sinks and
+the `/private` routes) is built, not deployed:
+[Release B](#release-b-phase-5-built-2026-10-12).** It ships around
+13 Oct after a production recheck. Steps 5.4, 5.4b (the deletions), 5.5,
+most of 5.6 and the rest of 5.7 remain. The prep that changes no default is (batch 53, 2026-10-08): 5.1's
 `API_PRIVATE_ROUTES` fallback (routes stay on), Q1's dual-prefix alert
 rules, 5.4b's new backfill entry points (the api binaries stay, deprecated),
 Q3's enricher column target in `db-grants.yaml` (the enricher stays
@@ -40,6 +42,7 @@ caller-less routes (Q9) have been deleted ahead of phase 5 (§1.1).
 
 ## Contents
 
+- [Release B (phase 5): built 2026-10-12](#release-b-phase-5-built-2026-10-12)
 0. [Release A: every producer on its new sink](#0-release-a-every-producer-on-its-new-sink)
 1. [Entry criteria and the `/private` inventory](#1-entry-criteria-and-the-private-inventory)
 2. [Steps 5.1–5.7](#2-steps-5157)
@@ -47,9 +50,131 @@ caller-less routes (Q9) have been deleted ahead of phase 5 (§1.1).
 4. [Final grants (5.5) and NetworkPolicies (5.6)](#4-final-grants-55-and-networkpolicies-56)
 5. [Risks and decisions](#5-risks-and-decisions)
 
+## Release B (phase 5): built 2026-10-12
+
+Release A went live on 2026-10-10 at 03:43 UTC: every producer on its db
+or stream sink, every internal read on db. A read-only check after that
+deploy showed `distant_signal_http_requests_total{exported_endpoint=~"/private/.*"}`
+at 0. The user decided on 2026-10-09 that release B deletes the routes and
+the producers' HTTP code in the same release (this replaces 5.1's 7-day
+soak and the two-release split of 5.2/5.3).
+
+### What changes
+
+- **api** (5.2): every `/private/*` route is gone (`routes/ingest.rs`,
+  `routes/samples.rs`, 5.1's `private_retired.rs` fallback,
+  `require_internal_oauth`, the route table, the private timeout, the
+  100 MB body limit, the rate-limit exemption, the private route metrics).
+  `/private/...` is now the ordinary `/{unmatched}` 404. Nothing other
+  than the producers called them (§1.2; the frontend, scripts and MCP use
+  public routes only), so no route is kept. Kept for the MCP:
+  `auth/internal_oauth.rs`, `INTERNAL_OAUTH_{ISSUER_URL,CLIENT_ID,GROUP_MCP}`
+  and the `srv-ds-mcp` rate-limit budget. The api no longer reads
+  `INTERNAL_OAUTH_GROUP_*` (other than `_MCP`), `API_PRIVATE_ROUTES`,
+  `API_PRIVATE_REQUEST_TIMEOUT_SECS` or `INCIDENTS_ROW_HEARTBEAT`. Its
+  Redis client stays (5.4).
+- **Producers** (5.3): no HTTP sink, HTTP cursor, `/private` URL or
+  internal OAuth client left; `common::oauth_client` and `common::ingest`'s
+  HTTP helpers are deleted, as are `ingest_stream`'s `SinkMode` and
+  `ingest_stream_sink_rows_total`, and poller-ldbws' HTTP retry buffer
+  (`ldbws_pending_samples*`). Q8: `INGEST_SINK` and every `*_SOURCE` still
+  parse for this one release but accept only the producer's target value,
+  which is also the default (`db` for stations, incidents, the TRUST
+  consumers, schedule-ingest and schedule-reference; `stream` for ldbws,
+  tfl, tocs and full-coverage-consumer; `db` for every `*_SOURCE`). An
+  `http` or `http+shadow` value fails at startup. The next release removes
+  the variables.
+- **ingest-writer**: the `shadow` stream mode is gone (only `off` and
+  `apply`); `shadow` fails at startup.
+- **Chart**: the `ingest.sink` and `internalReads.source` values, the
+  producers' `/private` URLs, `INTERNAL_OAUTH_*` env and OAuth Secret keys,
+  `internalOauth`, `pollers.*.ingestPath`, `pollers.ldbws.sampleStationsPath`,
+  `api.privateRoutes`, `api.timeouts.privateRequestTimeoutSecs` and
+  `api.internalOauth.groups.*` other than `mcp` are gone. A producer that
+  is enabled always gets its role and Redis wiring. The preflight
+  (`zz-ingest-sink-preflight.yaml`) lists release B's prerequisites (those
+  of §0.2) and fails on a retired key set to anything but its target
+  value; a pin of the target (`scheduleFeed.reference.ingest.sink: db`) is
+  tolerated, but delete it. `ingestWriter.streams.*` takes `off` or
+  `apply`. The NetworkPolicies drop the producers from the api's ingress
+  and the workers' api and token-URL egress. `ci/http-sinks.yaml` is gone;
+  CI renders on `ci/ingest-prereqs.yaml`.
+- **Alerts**: `DistantSignalIngestShadowMismatch` (and its recording
+  rule), `DistantSignalApiIngest5xx` (the api 5xx `ingest` scope),
+  `DistantSignalApiPrivateRouteRetiredCalled` and
+  `DistantSignalFullCoverageWindowPostErrors` are gone;
+  `DistantSignalConsumerApiCallsFailing` lists only the operations the
+  consumers still run.
+- **Grants**: `db-grants.yaml` gains `app_revokes`. The app role
+  (`distant_signal_app`, and so every observed role) loses every
+  privilege on `schedule_calling_points_full_publish_keys` and
+  `schedule_destination_departures_publish_keys`, and EXECUTE on
+  `analyze_publish_keys(text)`, which it held only for the api's
+  `/private` schedule publish routes; schedule-reference keeps its own
+  grants on them. The setup Job (post-upgrade) applies it in
+  `postgres-grants.sql` step 6, after `postgres-roles.sql`'s blanket
+  grants; no migration. The wider narrowing of app's members stays 5.5.
+- **Local dev** (5.3b): `docker-compose.yml` runs the ingest-writer and
+  every producer on its db/stream sink; `docker-compose.direct.yml` is
+  folded in and deleted.
+
+### Deploy (Ranma)
+
+1. Recheck production read-only first:
+   - the §0.4 `/private` query is 0 for every pair, GETs included;
+   - every Deployment's `INGEST_SINK` is `db` or `stream` and every
+     `*_SOURCE` is `db` (§1.3 C); the writer's four streams are `apply`;
+   - no `distant_signal_app` session from a producer
+     (`SELECT usename, application_name FROM pg_stat_activity`).
+2. Values (Ranma-Config `clusters/mine-bringer/apps/distant-signal.yaml`
+   and the sealed values overlay):
+   - delete every `ingest.sink`, `internalReads.source` and
+     `ingestWriter.streams.<x>: shadow` (a non-target value fails the
+     render; a target pin renders but should go);
+   - delete `api.privateRoutes`, `api.timeouts.privateRequestTimeoutSecs`,
+     `api.internalOauth.groups.{incidents,stations,tocs,ldbws,tfl,trustConsumer,...}`
+     (keep `issuerUrl`, `clientId` and `groups.mcp`), the top-level
+     `internalOauth` block and every `internalOauthUsername` /
+     `internalOauthPassword` (reseal). Leftover keys are ignored by the
+     chart, so this can follow in the next values change.
+3. Release the chart and the images together. Expected restarts: the api,
+   every producer, the ingest-writer and the schedulefeed pod (env
+   changes); the setup Job revokes app's publish-staging grants.
+4. Checks: every producer's `/livez` green; the §1.3 B metrics keep
+   rising; `curl .../private/stations` on the api is a 404; the api logs
+   "MCP service caller recognised" and the MCP's 429 rate is unchanged;
+   no pod but the api has an `INTERNAL_OAUTH_*` env; schedule-reference's
+   next publish succeeds (it uses the revoked staging tables through its
+   own role); no SQLSTATE `42501` in any log.
+5. After a day with no `client_credentials` token issued to the ingest
+   accounts: decommission them in Authentik as 5.3's "Ranma" step 2 lists
+   (`state: absent` once, then remove). Keep `srv-ds-mcp`.
+
+### Rollback
+
+**The previous chart and the previous images together** (the release A
+chart, b6c26a99's images). The release A chart still defaults every
+producer to db/stream, so nothing calls `/private`; its api serves the
+routes again anyway. Notes:
+
+- Re-add the values deleted in step 2 only if the old chart needs them:
+  it does not (its defaults are the release A ones). Its producers' OAuth
+  env reads Secret keys only for `sink: http`, which nothing sets.
+- The publish-staging grants come back when the old chart's setup Job
+  (post-upgrade) reruns `postgres-roles.sql`. A `helm rollback` runs no
+  post-upgrade hook: then re-run the Job or `GRANT SELECT, INSERT,
+  UPDATE, DELETE ON schedule_calling_points_full_publish_keys,
+  schedule_destination_departures_publish_keys TO distant_signal_app;
+  GRANT EXECUTE ON FUNCTION analyze_publish_keys(text) TO
+  distant_signal_app;` by hand. Nothing but the old api's `/private`
+  publish routes needs them.
+- A per-producer rollback to `sink: http` (§0.3) needs the old chart, the
+  old images, the Authentik accounts and their sealed passwords: keep
+  those until release B has run cleanly for a few days (step 5 above).
+
 ## 0. Release A: every producer on its new sink
 
-**Built 2026-10-09, held.** The user decided on 2026-10-09 to replace
+**Built 2026-10-09; live 2026-10-10 03:43 UTC.** The user decided on 2026-10-09 to replace
 the one-producer-per-release flips and the per-stream 3-day shadow with
 three steps:
 
@@ -57,7 +182,8 @@ three steps:
    its new sink in one release.
 2. **3–5 days to settle.** The rollback is `sink: http` per producer.
 3. **Release B** (phase 5): delete the `/private` routes, the producers'
-   HTTP sink code and the old ingest roles together. Not built yet; it
+   HTTP sink code and the old ingest roles together. Built 2026-10-12
+   ([Release B](#release-b-phase-5-built-2026-10-12)); it
    replaces the 14-day entry rule and the separate steps 5.1–5.3 below,
    which predate the decision.
 
@@ -162,7 +288,9 @@ uses.
 
 ### 0.3 Rollback
 
-Per producer, its own `sink: http`, nothing else:
+Release A's own rollback, valid only on the release A chart; release B
+deletes the `http` paths (its rollback is the previous chart and images,
+[Release B](#release-b-phase-5-built-2026-10-12)). Per producer, its own `sink: http`, nothing else:
 
 ```yaml
 pollers:
@@ -630,6 +758,10 @@ Order: **5.1 → 7-day soak → 5.2 + 5.3 (+ 5.3b) → 5.4 → 5.4b → 5.5 →
 
 ### 5.1 `API_PRIVATE_ROUTES` and the 7-day soak
 
+**Superseded by release B (2026-10-12).** The soak was dropped (user
+decision 2026-10-09); `API_PRIVATE_ROUTES`, the fallback, its metric and
+its alert are deleted with the routes. The text below is history.
+
 **Built (2026-10-08); the retirement is off by default** (`API_PRIVATE_ROUTES`
 defaults to `true`, so `/private` is served as before). `crates/api/src/private_retired.rs`
 reads `API_PRIVATE_ROUTES` (unset or `true`: unchanged). With `false`,
@@ -682,6 +814,9 @@ remains for 5.1 is Ranma's flip.
 producer back on `sink: http` / `source: http`.
 
 ### 5.2 Delete the api's `/private` code
+
+**Done in release B (2026-10-12)**, as listed below, minus the api
+binaries (5.4b) and the Redis client (5.4).
 
 **Code. Delete:**
 
@@ -781,6 +916,11 @@ this step, never before.
 
 ### 5.3 Delete the producers' HTTP paths
 
+**Done in release B (2026-10-12)**, in one release with 5.2. Q8's first
+half: `INGEST_SINK` and `*_SOURCE` accept only the new value; the next
+release removes them. The chart values are already removed (a
+non-target value fails the render).
+
 Each producer collapses to its new path. **Decided (Q8):** `INGEST_SINK`
 and `*_SOURCE` stay for one release that accepts only the new value (`db`
 or `stream`). Under `http` or `http+shadow` the process refuses to start
@@ -867,6 +1007,8 @@ values in Ranma's git history.
 
 ### 5.3b Local dev mirrors production
 
+**Done in release B (2026-10-12).**
+
 Decided (Q10): local dev runs the same paths as production. Ship this in
 the same release as 5.3, since that release deletes the HTTP paths local
 dev uses today.
@@ -879,7 +1021,8 @@ Today:
 - `local.env.example` and `dev.env.example` document the internal OAuth
   service accounts.
 
-**Prepared (2026-10-08), opt-in:** `docker-compose.direct.yml` is that
+**Prepared (2026-10-08), opt-in; folded into `docker-compose.yml` and
+deleted in release B:** `docker-compose.direct.yml` was that
 target as an overlay. Append `:docker-compose.direct.yml` to `COMPOSE_FILE`
 in `local.env` or `dev.env` (both `*.env.example` files and the README's
 "Running it" say how). It adds the `ingest-writer` (loops on, the four
@@ -1166,6 +1309,11 @@ targets at once, or every role gets the same password.
 holds no binary that writes outside the api's grants.
 
 ### 5.6 NetworkPolicies
+
+**Partly done in release B (2026-10-12):** the api's ingress no longer
+lists the producers, the workers lost their api and token-URL egress, and
+the postgres/redis ingress no longer depend on the sink switches. The
+api's Redis egress (5.4) and Ranma's `allow-egress-same-namespace` remain.
 
 The diff against `templates/networkpolicy.yaml` is in §4.2. Chart only,
 plus Ranma's comments.

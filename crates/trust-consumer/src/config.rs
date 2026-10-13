@@ -19,50 +19,24 @@ pub(crate) use movement_feed::MovementFeedBackend;
 /// connection of its own (Deploy C, PL-15a).
 #[derive(Debug, Parser)]
 pub(crate) struct Config {
-    /// The `api` crate's ingestion endpoint for train movement events.
-    /// Used only with `INGEST_SINK=http`.
-    #[arg(long, env, default_value = "http://api:8080/private/train-events")]
-    pub api_ingest_url: String,
+    /// `INGEST_SINK`: only `db` (ingest architecture plan 3b.3, decision
+    /// D1): each batch's train events and forward signals go to Postgres
+    /// in one transaction, as the `trust_consumer` role (`sink.rs`).
+    /// Release B (ingest phase 5, docs/ingest-phase5-runbook.md) removed
+    /// `http`, so an old `INGEST_SINK=http` fails at startup instead of
+    /// being ignored; the next release drops the variable.
+    #[arg(long, env = "INGEST_SINK", default_value = "db", value_parser = ["db"])]
+    pub ingest_sink: String,
 
-    /// Where each batch's train events and forward signals go (ingest
-    /// architecture plan 3b.3, decision D1): `http` (the default, today's
-    /// behaviour) POSTs them to `API_INGEST_URL` and `FORWARD_SIGNALS_URL`;
-    /// `db` writes both to Postgres directly in one transaction, as the
-    /// `trust_consumer` role. The reads (tracked trains, STANOX/CRS) switch
-    /// separately (`reads`, plan 4.4). See `sink.rs`.
-    #[arg(long, env, value_enum, default_value_t = IngestSink::Http)]
-    pub ingest_sink: IngestSink,
-
-    /// Postgres, for `INGEST_SINK=db` or a `db` read source (required then,
-    /// unused otherwise): one URL and one pool for both, as the
-    /// `trust_consumer` role. Pool size and timeouts come from the shared
-    /// `DATABASE_*` variables (`common::pg`); the default pool is 2 (spec
-    /// §6.6, role limit 3).
+    /// Postgres, for the sink and the reads: one URL and one pool for
+    /// both, as the `trust_consumer` role. Pool size and timeouts come from
+    /// the shared `DATABASE_*` variables (`common::pg`); the default pool
+    /// is 2 (spec §6.6, role limit 3).
     #[arg(long, env, hide_env_values = true)]
-    pub database_url: Option<common::secret::Secret>,
-
-    /// The `api` crate's endpoint listing active tracked trains.
-    #[arg(long, env, default_value = "http://api:8080/private/tracked-trains")]
-    pub api_tracked_trains_url: String,
-
-    /// The `api` crate's ingestion endpoint for the notifier-forwarding
-    /// queue (Task 17) -- fast-path signals so `notifier` can poll for
-    /// newly-arrived shared-store events sooner than its existing slower
-    /// poll of `train_movement_events`.
-    #[arg(
-        long,
-        env,
-        default_value = "http://api:8080/private/train-forward-signals"
-    )]
-    pub forward_signals_url: String,
-
-    /// Shared, non-secret `OAuth2` client-credentials config (same value
-    /// across all 9 real callers).
-    #[command(flatten)]
-    pub internal_oauth: common::oauth_client::InternalOAuthArgs,
+    pub database_url: common::secret::Secret,
 
     /// How often to reload the active-tracked-trains reference set from
-    /// `api` -- picks up newly created pins and pins that resolved on a
+    /// Postgres -- picks up newly created pins and pins that resolved on a
     /// prior run before this process restarted.
     #[arg(long, env, default_value_t = 60)]
     pub reference_reload_secs: u64,
@@ -87,8 +61,8 @@ pub(crate) struct Config {
     /// (which still needs its own `failureThreshold * periodSeconds` on top
     /// of this). A healthy iteration takes a few seconds (the `XREADGROUP`
     /// blocks for at most 5s); this is sized well above the worst
-    /// legitimate one, every HTTP call in it being bounded by
-    /// `common::ingest::CONSUMER_REQUEST_TIMEOUT` (60s) and every Redis
+    /// legitimate one, every Postgres call in it being bounded by the
+    /// pool's timeouts (`common::pg`) and every Redis
     /// command by `common::redis_conn` (one reconnect attempt of at most
     /// 5s, a reply within 30s; a failed command ends the cycle). A Redis
     /// outage is therefore a run of fast failed cycles, each beating
@@ -116,7 +90,7 @@ pub(crate) struct Config {
     )]
     pub stanox_crs: StanoxCrsTable,
 
-    /// How often to reload the live STANOX->CRS table from `api`. Deliberately
+    /// How often to reload the live STANOX->CRS table from Postgres. Deliberately
     /// coarser than `reference_reload_secs`'s 60s default -- the underlying
     /// data changes roughly daily (Decision 4), so "promptly" only matters
     /// relative to that, not to a human creating a pin. UNRESEARCHED
@@ -124,10 +98,6 @@ pub(crate) struct Config {
     /// elsewhere in this codebase (see the spec's Open questions #1).
     #[arg(long, env, default_value_t = 3600)]
     pub stanox_crs_reload_secs: u64,
-
-    /// The `api` crate's endpoint for the live STANOX/CRS table.
-    #[arg(long, env, default_value = "http://api:8080/private/stanox-crs")]
-    pub stanox_crs_url: String,
 
     /// Which transport this crate's `MovementFeed` uses. See
     /// `MovementFeedBackend`'s own doc. Only `redis-stream` (the
@@ -161,7 +131,7 @@ pub(crate) struct Config {
     /// `reclaimMinIdleSecs` (1000s) -- see
     /// docs/superpowers/specs/2026-09-04-movement-relay-design.md
     /// Decision 2's own note: this crate's cycle latency (consume ->
-    /// derive -> POST to api -> ack) should be sub-second in the healthy
+    /// derive -> write to Postgres -> ack) should be sub-second in the healthy
     /// case, unlike enricher's slower LLM-call latency.
     #[arg(long, env, default_value_t = 30)]
     pub redis_autoclaim_min_idle_secs: u64,
@@ -209,68 +179,48 @@ pub(crate) struct Config {
     pub reads: crate::reads::InternalReadArgs,
 }
 
-/// `INGEST_SINK`: see [`Config::ingest_sink`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
-pub(crate) enum IngestSink {
-    #[default]
-    Http,
-    Db,
-}
-
 impl Config {
-    /// Whether anything reads or writes Postgres: the sink or a source is
-    /// `db`.
-    pub(crate) fn needs_database(&self) -> bool {
-        self.ingest_sink == IngestSink::Db || self.reads.any_db()
-    }
-
-    /// Cross-field checks clap cannot express: a `db` sink or source needs
-    /// a `DATABASE_URL`.
+    /// Cross-field checks clap cannot express: an empty `DATABASE_URL`.
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
-        if self.needs_database()
-            && self
-                .database_url
-                .as_ref()
-                .is_none_or(common::secret::Secret::is_empty)
-        {
-            anyhow::bail!(
-                "INGEST_SINK=db, TRACKED_TRAINS_SOURCE=db or STANOX_CRS_SOURCE=db needs DATABASE_URL"
-            );
+        if self.database_url.is_empty() {
+            anyhow::bail!("trust-consumer needs DATABASE_URL (its sink and reads are Postgres)");
         }
         Ok(())
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A Postgres URL for the tests that only parse (nothing connects).
+    const DATABASE_URL: &str = "postgres://distant_signal_trust_consumer:pw@postgres/ds";
+
+    pub(crate) fn parse(extra: &[&str]) -> Result<Config, clap::Error> {
+        let stanox_crs_file = common::manifest_dir!().join("../../reference-data/stanox-crs.csv");
+        let base = [
+            "trust-consumer".to_owned(),
+            "--stanox-crs-file".to_owned(),
+            stanox_crs_file.display().to_string(),
+        ];
+        // The test environment may set DATABASE_URL.
+        let database = if extra.contains(&"--database-url") {
+            vec![]
+        } else {
+            vec!["--database-url".to_owned(), DATABASE_URL.to_owned()]
+        };
+        Config::try_parse_from(
+            base.into_iter()
+                .chain(database)
+                .chain(extra.iter().map(|s| (*s).to_owned())),
+        )
+    }
 
     /// PL-15a: with no backend flag, the consumer reads the Redis stream,
     /// never Kafka directly.
     #[test]
     fn movement_feed_backend_defaults_to_redis_stream_when_unset() {
-        // The real, checked-in reference-data/stanox-crs.csv, since
-        // --stanox-crs-file's default value is parsed eagerly (its
-        // value_parser opens and parses the file) even when this test never
-        // touches STANOX/CRS behavior -- mirrors main.rs's own
-        // TEST_STANOX_CRS test fixture path.
-        let stanox_crs_file = common::manifest_dir!().join("../../reference-data/stanox-crs.csv");
-
-        let config = Config::try_parse_from([
-            "trust-consumer",
-            "--internal-oauth-token-url",
-            "http://auth.example.com/token",
-            "--internal-oauth-client-id",
-            "client-id",
-            "--internal-oauth-username",
-            "svc-user",
-            "--internal-oauth-password",
-            "svc-pass",
-            "--stanox-crs-file",
-            stanox_crs_file.to_str().unwrap(),
-        ])
-        .expect("minimal required args should parse");
-
+        let config = parse(&[]).expect("minimal required args should parse");
         assert_eq!(
             config.movement_feed_backend,
             MovementFeedBackend::RedisStream
@@ -282,89 +232,45 @@ mod tests {
     /// joining movement-relay's own Kafka consumer group).
     #[test]
     fn an_explicit_kafka_backend_fails_startup() {
-        let stanox_crs_file = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../reference-data/stanox-crs.csv");
-        let parse = |backend: &str| {
-            Config::try_parse_from([
-                "trust-consumer",
-                "--internal-oauth-token-url",
-                "http://auth.example.com/token",
-                "--internal-oauth-client-id",
-                "client-id",
-                "--internal-oauth-username",
-                "svc-user",
-                "--internal-oauth-password",
-                "svc-pass",
-                "--stanox-crs-file",
-                stanox_crs_file.to_str().unwrap(),
-                "--movement-feed-backend",
-                backend,
-            ])
-        };
-
-        let err = parse("kafka").expect_err("the kafka backend was removed");
+        let err = parse(&["--movement-feed-backend", "kafka"])
+            .expect_err("the kafka backend was removed");
         assert!(
             err.to_string()
                 .contains(movement_feed::active_feed::KAFKA_BACKEND_REMOVED),
             "{err}"
         );
         assert_eq!(
-            parse("redis-stream").unwrap().movement_feed_backend,
+            parse(&["--movement-feed-backend", "redis-stream"])
+                .unwrap()
+                .movement_feed_backend,
             MovementFeedBackend::RedisStream
         );
     }
 
-    fn parse(extra: &[&str]) -> Result<Config, clap::Error> {
-        let stanox_crs_file = common::manifest_dir!().join("../../reference-data/stanox-crs.csv");
-        let base = [
-            "trust-consumer".to_owned(),
-            "--internal-oauth-token-url".to_owned(),
-            "http://auth.example.com/token".to_owned(),
-            "--internal-oauth-client-id".to_owned(),
-            "client-id".to_owned(),
-            "--internal-oauth-username".to_owned(),
-            "svc-user".to_owned(),
-            "--internal-oauth-password".to_owned(),
-            "svc-pass".to_owned(),
-            "--stanox-crs-file".to_owned(),
-            stanox_crs_file.display().to_string(),
-        ];
-        Config::try_parse_from(
-            base.into_iter()
-                .chain(extra.iter().map(|s| (*s).to_owned())),
-        )
-    }
-
-    /// Plan 3b.3: the default is today's behaviour, POSTs to the api.
+    /// Release B (ingest phase 5): the sink is `db` only; `http` is
+    /// refused at startup rather than ignored, and `DATABASE_URL` must not
+    /// be empty.
     #[test]
-    fn the_sink_defaults_to_http_and_db_needs_a_database_url() {
-        // `--database-url ""`: the test environment may set DATABASE_URL.
-        let config = parse(&["--database-url", ""]).unwrap();
-        assert_eq!(config.ingest_sink, IngestSink::Http);
+    fn the_sink_is_db_only_and_needs_a_database_url() {
+        let config = parse(&[]).unwrap();
+        assert_eq!(config.ingest_sink, "db");
         config.validate().unwrap();
-
-        let db = parse(&["--ingest-sink", "db", "--database-url", ""]).unwrap();
-        assert!(db.validate().is_err(), "db without DATABASE_URL");
-
-        let db = parse(&[
-            "--ingest-sink",
-            "db",
-            "--database-url",
-            "postgres://distant_signal_trust_consumer:pw@postgres/ds",
-        ])
-        .unwrap();
-        assert_eq!(db.ingest_sink, IngestSink::Db);
-        db.validate().unwrap();
         assert!(
-            !format!("{db:?}").contains(":pw@"),
+            !format!("{config:?}").contains(":pw@"),
             "the database URL must not appear in Debug output"
         );
-        assert!(parse(&["--ingest-sink", "stream"]).is_err());
+        assert_eq!(parse(&["--ingest-sink", "db"]).unwrap().ingest_sink, "db");
+        for retired in ["http", "http+shadow", "stream"] {
+            assert!(parse(&["--ingest-sink", retired]).is_err(), "{retired}");
+        }
+        let empty = parse(&["--database-url", ""]).unwrap();
+        assert!(empty.validate().is_err(), "an empty DATABASE_URL");
     }
 
-    /// The chart sets these names (templates/trust-consumer-deployment.yaml).
+    /// The names the chart sets (`DATABASE_URL`) or an old values file may
+    /// still set (`INGEST_SINK`).
     #[test]
-    fn the_new_settings_read_the_chart_s_env_names() {
+    fn the_settings_read_the_chart_s_env_names() {
         use clap::CommandFactory;
         let command = Config::command();
         let env = |id: &str| {

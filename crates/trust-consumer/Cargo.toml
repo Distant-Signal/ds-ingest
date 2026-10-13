@@ -12,14 +12,13 @@ chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.6", features = ["derive", "env"] }
 common = { path = "../common" }
 dotenvy = "0.15.7"
-# `INGEST_SINK=db` (ingest architecture plan 3b.3, D1) and
-# TRACKED_TRAINS_SOURCE / STANOX_CRS_SOURCE=db (plan 4.4): the train-event
-# and forward-signal writers, the readers, the pool and the schema gate.
+# The DB sink (ingest architecture plan 3b.3, D1) and the reads (plan 4.4):
+# the train-event and forward-signal writers, the readers, the pool and the
+# schema gate.
 ds-store = { path = "../ds-store" }
 health-http = { path = "../health-http" }
 metrics = "0.24"
 movement-feed = { path = "../movement-feed" }
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls", "gzip"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 # The pool type and the Postgres wait (the sink's and the readers').
@@ -35,8 +34,8 @@ sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio", "tls-native
 movement-feed = { path = "../movement-feed", features = ["test-util"] }
 # The DB sink tests' fixtures (a subscription to write events for).
 ds-store = { path = "../ds-store", features = ["test-support"] }
-# The sink tests: `HttpSink`'s api side (the routes and the token endpoint).
-wiremock = "0.6"
+# The health-listener test's GETs.
+reqwest = { version = "0.13.4", default-features = false, features = ["native-tls"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "test-util"] }
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 

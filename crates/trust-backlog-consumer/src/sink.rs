@@ -1,26 +1,23 @@
-//! Where each batch goes (ingest architecture plan 3b.1, spec R1), chosen
-//! by `INGEST_SINK`:
+//! Where each batch goes (ingest architecture plan 3b.1, spec R1):
+//! [`DbSink`], straight into Postgres as the `trust_backlog` role.
 //!
-//! | | [`HttpSink`] (`http`, the default) | [`DbSink`] (`db`) |
-//! |---|---|---|
-//! | backlog events | `POST /private/trust-event-backlog` | `ds_store::backlog::ingest_trust_event_backlog` |
-//! | reason codes | `POST /private/train-reasons` | `ds_store::backlog::reasons::upsert_reasons` |
-//! | STANOX/CRS reload | `GET /private/stanox-crs` | `ds_store::reference::list_stanox_crs` |
+//! | | [`DbSink`] |
+//! |---|---|
+//! | backlog events | `ds_store::backlog::ingest_trust_event_backlog` |
+//! | reason codes | `ds_store::backlog::reasons::upsert_reasons` |
+//! | STANOX/CRS reload | `ds_store::reference::list_stanox_crs` |
 //!
-//! The api's two POST handlers call exactly those ds-store functions, so
-//! the rows are the same either way, and so is the `rejected` list the
-//! consumer dead-letters. Either way the batch is `XACKed` only after the
-//! write returned (for `db`: after its commit), and a transient failure
-//! leaves it pending and backs off before the next read (`main.rs`'s
-//! `deliver_batch` and `delivery_wait`).
+//! The api's retired `POST /private/trust-event-backlog` and
+//! `/private/train-reasons` (and `GET /private/stanox-crs`) called exactly
+//! those functions; the HTTP sink went in release B (ingest phase 5,
+//! docs/ingest-phase5-runbook.md). The batch is `XACKed` only after the
+//! write committed, and a transient failure leaves it pending and backs off
+//! before the next read (`main.rs`'s `deliver_batch` and `delivery_wait`).
 
-use common::oauth_client::OAuthTokenCache;
 use common::{
     StanoxCrsRecord, TrainReasonMessage, TrustBacklogEventMessage, TrustBacklogIngestResponse,
 };
 use sqlx::PgPool;
-
-use crate::queries;
 
 /// What a sink's failures count as: `trust_backlog_consumer_errors_total`
 /// operations (each in `API_CALL_OPERATIONS`, so the chart's
@@ -35,13 +32,6 @@ pub(crate) struct Operations {
     /// The `DeadLetter::reason` of a rejected row.
     pub rejected: &'static str,
 }
-
-/// [`HttpSink`]'s names: today's, unchanged.
-pub(crate) const HTTP_OPERATIONS: Operations = Operations {
-    write: "post_batch",
-    write_reasons: "post_train_reasons",
-    rejected: "rejected_by_api",
-};
 
 /// [`DbSink`]'s names (plan 3b.2).
 pub(crate) const DB_OPERATIONS: Operations = Operations {
@@ -68,44 +58,6 @@ pub(crate) trait BacklogSink {
         &self,
         events: &[TrustBacklogEventMessage],
     ) -> anyhow::Result<TrustBacklogIngestResponse>;
-}
-
-/// `INGEST_SINK=http`: today's path through the api.
-pub(crate) struct HttpSink {
-    pub client: reqwest::Client,
-    /// `API_INGEST_URL`, `.../private/trust-event-backlog`.
-    pub ingest_url: String,
-    /// `.../private/train-reasons`, beside `ingest_url`; `None` when that
-    /// URL does not end in `/trust-event-backlog` (warned at startup):
-    /// reasons are then not sent.
-    pub reasons_url: Option<String>,
-    pub stanox_crs_url: String,
-    pub tokens: OAuthTokenCache,
-}
-
-impl BacklogSink for HttpSink {
-    const OPERATIONS: Operations = HTTP_OPERATIONS;
-
-    async fn stanox_crs(&self) -> anyhow::Result<Vec<StanoxCrsRecord>> {
-        queries::fetch_stanox_crs(&self.client, &self.stanox_crs_url, &self.tokens).await
-    }
-
-    async fn write_reasons(&self, reasons: &[TrainReasonMessage]) -> anyhow::Result<()> {
-        match &self.reasons_url {
-            Some(url) => {
-                queries::post_train_reasons(&self.client, url, &self.tokens, reasons).await
-            }
-            None => Ok(()),
-        }
-    }
-
-    async fn write_backlog(
-        &self,
-        events: &[TrustBacklogEventMessage],
-    ) -> anyhow::Result<TrustBacklogIngestResponse> {
-        queries::post_trust_event_backlog(&self.client, &self.ingest_url, &self.tokens, events)
-            .await
-    }
 }
 
 /// [`DbSink`]'s `db_writes_total{operation}` (`ds_store::writes`) for a
@@ -135,7 +87,7 @@ async fn recorded<T>(
     result
 }
 
-/// `INGEST_SINK=db`: straight into Postgres, as the `trust_backlog` role.
+/// Straight into Postgres, as the `trust_backlog` role.
 pub(crate) struct DbSink {
     pub pool: PgPool,
 }
@@ -187,11 +139,8 @@ impl BacklogSink for DbSink {
 mod db_tests {
     use std::time::Duration;
 
-    use common::oauth_client::OAuthCredentials;
     use movement_feed::{FakeMovementFeed, MovementFeed};
     use sqlx::postgres::PgPoolOptions;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
     use crate::{Delivery, deliver_batch};
@@ -287,8 +236,7 @@ mod db_tests {
         }]
     }
 
-    /// Every row the fixture wrote, across the tables the route and the
-    /// sink write, with surrogate ids and write times left out and the tag
+    /// Every row the fixture wrote, across the tables the sink writes, with surrogate ids and write times left out and the tag
     /// replaced, sorted.
     async fn snapshot(pool: &PgPool, tag: &str) -> Vec<String> {
         let rows: Vec<String> = sqlx::query_scalar(
@@ -340,92 +288,24 @@ mod db_tests {
             .collect()
     }
 
-    /// Plan 3b.1: the same batch through either sink leaves the same rows
-    /// in every table, and reports the same rejected rows. The HTTP side is
-    /// what the api does with the two POST bodies: decode them and call
-    /// `ingest_trust_event_backlog` and `upsert_reasons`, exactly as
-    /// `post_trust_event_backlog` and `post_train_reasons` do.
+    /// Plan 3b.1: a fixture batch through the sink leaves the rows the api's
+    /// retired routes left (the same `ds_store` calls), and reports the
+    /// row the table refuses.
     #[tokio::test]
     #[ignore = "requires a live database; run with DATABASE_URL set and --ignored"]
-    async fn both_sinks_write_the_same_rows_for_a_fixture_batch() {
+    async fn the_db_sink_writes_a_fixture_batch() {
         let pool = pool().await;
-        let (http_tag, db_tag) = (tag("h"), tag("d"));
+        let db_tag = tag("d");
 
-        let api = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/token/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "fake-jwt",
-                "expires_in": 300,
-            })))
-            .mount(&api)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/private/trust-event-backlog"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"upserted": 0, "rejected": []})),
-            )
-            .expect(1)
-            .mount(&api)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/private/train-reasons"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"upserted": 0})),
-            )
-            .expect(1)
-            .mount(&api)
-            .await;
-        let ingest_url = format!("{}/private/trust-event-backlog", api.uri());
-        let http = HttpSink {
-            client: reqwest::Client::new(),
-            reasons_url: queries::train_reasons_url(&ingest_url),
-            ingest_url,
-            stanox_crs_url: format!("{}/private/stanox-crs", api.uri()),
-            tokens: OAuthTokenCache::new(OAuthCredentials {
-                token_url: format!("{}/token/", api.uri()),
-                client_id: "test".to_owned(),
-                scope: "groups".to_owned(),
-                username: "test".to_owned(),
-                password: "test".to_owned(),
-            }),
-        };
-        http.write_reasons(&fixture_reasons(&http_tag))
-            .await
-            .unwrap();
-        http.write_backlog(&fixture_batch(&http_tag)).await.unwrap();
-        let requests = api.received_requests().await.unwrap();
-        let body = |route: &str| {
-            requests
-                .iter()
-                .find(|request| request.url.path() == route)
-                .unwrap_or_else(|| panic!("no POST {route}"))
-                .body
-                .clone()
-        };
-        // The api's two handlers, on the bodies it was sent.
-        let reasons: Vec<TrainReasonMessage> =
-            serde_json::from_slice(&body("/private/train-reasons")).unwrap();
-        ds_store::backlog::reasons::upsert_reasons(&pool, &reasons)
-            .await
-            .unwrap();
-        let events: Vec<TrustBacklogEventMessage> =
-            serde_json::from_slice(&body("/private/trust-event-backlog")).unwrap();
-        let via_api = ds_store::backlog::ingest_trust_event_backlog(&pool, &events)
-            .await
-            .unwrap();
-
+        let db = DbSink { pool: pool.clone() };
+        db.write_reasons(&fixture_reasons(&db_tag)).await.unwrap();
         let db = DbSink { pool: pool.clone() };
         db.write_reasons(&fixture_reasons(&db_tag)).await.unwrap();
         let via_db = db.write_backlog(&fixture_batch(&db_tag)).await.unwrap();
 
-        let rows_http = snapshot(&pool, &http_tag).await;
         let rows_db = snapshot(&pool, &db_tag).await;
-        cleanup(&pool, &http_tag).await;
         cleanup(&pool, &db_tag).await;
 
-        assert_eq!(rows_db, rows_http);
         // Three backlog rows, one train, two movements, its state, the reason.
         assert_eq!(rows_db.len(), 8, "{rows_db:#?}");
         assert!(
@@ -434,12 +314,13 @@ mod db_tests {
                 .any(|row| row.starts_with("movement ") && row.contains("2099-04-04T07:59:00")),
             "the departure's gbtt_timestamp reaches train_movement_events: {rows_db:#?}"
         );
-        assert_eq!(via_db.upserted, via_api.inserted);
+        assert_eq!(via_db.upserted, 3);
         assert_eq!(
-            normalise(&via_db.rejected, &db_tag),
-            normalise(&via_api.rejected, &http_tag)
+            normalise(&via_db.rejected, &db_tag).len(),
+            1,
+            "{:?}",
+            via_db.rejected
         );
-        assert_eq!(via_db.rejected.len(), 1);
         assert_eq!(via_db.rejected[0].index, 3);
         assert_eq!(via_db.rejected[0].sqlstate, "23514");
     }
@@ -538,10 +419,8 @@ mod db_tests {
         assert_eq!(feed.committed_count, 0, "nothing XACKed");
         assert!(feed.dead_lettered.is_empty());
         assert!(feed.rejected_batches.is_empty());
-        let mut failures = common::backoff::FailureStreak::new(crate::delivery_backoff(
-            crate::config::IngestSink::Db,
-        ));
-        let wait = crate::delivery_wait(&delivery, &mut failures, None).unwrap();
+        let mut failures = common::backoff::FailureStreak::new(crate::DELIVERY_RETRY_BACKOFF);
+        let wait = crate::delivery_wait(&delivery, &mut failures).unwrap();
         assert!(wait <= Duration::from_secs(1), "{wait:?}");
 
         let mut redelivered = feed_with_one_batch().await;
