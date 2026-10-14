@@ -234,6 +234,10 @@ impl Db {
             "DELETE FROM transit_networks WHERE network = $1",
             "DELETE FROM transit_rail_links WHERE network = $1",
             "DELETE FROM ingest_freshness WHERE source = 'transit-' || $1 || '-timetable'",
+            "DELETE FROM ingest_freshness WHERE source = 'transit-' || $1 || '-situations'",
+            "DELETE FROM transit_situations WHERE network = $1",
+            "DELETE FROM line_status_history WHERE starts_with(line_id, $1 || ':')",
+            "DELETE FROM line_status WHERE starts_with(line_id, $1 || ':')",
             "DELETE FROM ingest_dedup WHERE key LIKE '%transit-test-%' AND $1 <> ''",
         ] {
             sqlx::query(sql)

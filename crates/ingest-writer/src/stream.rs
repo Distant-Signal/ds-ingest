@@ -142,13 +142,14 @@ pub const STREAMS: [StreamSpec; 8] = [
         schemas: &["ioi-station-samples"],
     },
     // One stream per transit network (transit spec §5, §9.1), off by
-    // default. Its situations schema joins with its handler (batch 4).
+    // default.
     StreamSpec {
         name: "transit-metrolink",
         stream: streams::TRANSIT_METROLINK,
         schemas: &[
             common::transit::schema::TIMETABLE,
             common::transit::schema::TIMETABLE_COMMIT,
+            common::transit::schema::SITUATIONS,
         ],
     },
 ];
@@ -615,6 +616,7 @@ mod tests {
         assert_eq!(transit.name, "transit-metrolink");
         assert!(transit.carries("transit-timetable"));
         assert!(transit.carries("transit-timetable-commit"));
+        assert!(transit.carries("transit-situations"));
         assert!(!transit.carries("tfl-line-status"));
         assert_eq!(
             "transit-metrolink:apply"

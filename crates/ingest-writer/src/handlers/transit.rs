@@ -5,8 +5,11 @@
 //! |---|---|---|
 //! | `transit-timetable/1` | [`TimetablePart`] | `ds_store::transit::stage_part` |
 //! | `transit-timetable-commit/1` | [`TimetableCommit`] | `ds_store::transit::commit` |
+//! | `transit-situations/1` | [`TransitSituations`] | `ds_store::transit::apply_situations` |
 //!
-//! `transit-situations/1` joins in batch 4.
+//! The situations handler also writes the network's `line_status` rows
+//! (`source = 'transit'`, ids `<network>:<line>`; spec §10.3), which the
+//! writer's row policy admits (db-grants.yaml, plan 4.1).
 //!
 //! **Network pinning** (spec §9.1): each stream carries only its own
 //! network ([`stream_network`]). An entry whose body names another network
@@ -27,9 +30,11 @@
 
 use common::transit::{
     MAX_FEED_VERSION_LEN, MAX_PICKUP_DROP_OFF, NETWORKS, NetworkId, TimetableCommit, TimetablePart,
-    TimetableRows, is_id, is_stop_id,
+    TimetableRows, TransitSituations, is_id, is_stop_id,
 };
-use ds_store::transit::{CommitOutcome, PartIndex, StageOutcome, commit, stage_part};
+use ds_store::transit::{
+    CommitOutcome, PartIndex, SituationsOutcome, StageOutcome, apply_situations, commit, stage_part,
+};
 use ingest_stream::{HandlerError, StreamEntry};
 use sqlx::PgConnection;
 
@@ -240,6 +245,76 @@ impl SchemaHandler for TimetableCommitHandler {
     }
 }
 
+/// The longest `SituationNumber` the table accepts.
+pub const MAX_SITUATION_ID_LEN: usize = 128;
+
+/// A snapshot's ids follow their grammar: each situation's number, and every
+/// line and stop id it and its consequences name.
+pub fn check_situations(snapshot: &TransitSituations) -> Result<(), HandlerError> {
+    snapshot.situations.iter().try_for_each(|situation| {
+        let id = &situation.situation_id;
+        if id.is_empty() || id.len() > MAX_SITUATION_ID_LEN {
+            return Err(invalid("situation id", id));
+        }
+        let lines = situation
+            .line_ids
+            .iter()
+            .chain(situation.consequences.iter().flat_map(|c| &c.line_ids));
+        let stops = situation
+            .stop_ids
+            .iter()
+            .chain(situation.consequences.iter().flat_map(|c| &c.stop_ids));
+        lines.into_iter().try_for_each(|l| check_line(Some(l)))?;
+        stops.into_iter().try_for_each(|s| check_stop(s))
+    })
+}
+
+/// `transit-situations/1`: the network's whole situation set, and the line
+/// statuses derived from it (spec §9.3, §10.3). An older snapshot than the
+/// newest applied changes nothing and is counted as skipped.
+pub struct Situations;
+
+impl SchemaHandler for Situations {
+    fn apply<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        entry: &'a StreamEntry,
+        observed: &'a Observed,
+    ) -> BoxFuture<'a, Result<Applied, HandlerError>> {
+        Box::pin(async move {
+            let snapshot: TransitSituations = decode(entry)?;
+            pin_network(entry, &snapshot.network)?;
+            check_situations(&snapshot)?;
+            let outcome = apply_situations(conn, &snapshot, observed.produced_at())
+                .await
+                .map_err(|err| classify_anyhow(&err))?;
+            let rows = snapshot.situations.len();
+            match outcome {
+                SituationsOutcome::Applied(applied) => {
+                    tracing::debug!(
+                        network = snapshot.network.as_str(),
+                        situations = applied.situations,
+                        ended = applied.ended,
+                        lines = applied.lines,
+                        history = applied.history,
+                        pruned = applied.pruned,
+                        "applied transit situations"
+                    );
+                    count_apply(entry, rows, applied.situations);
+                }
+                SituationsOutcome::Older => {
+                    tracing::info!(
+                        network = snapshot.network.as_str(),
+                        "transit situations older than the newest applied; nothing written"
+                    );
+                    count_apply(entry, rows, 0);
+                }
+            }
+            Ok(Applied::All)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
@@ -378,5 +453,23 @@ mod tests {
             part_index(&numbered),
             Err(HandlerError::Poison(_))
         ));
+    }
+
+    #[test]
+    fn situation_ids_outside_their_grammar_are_poison() {
+        let fixture: TransitSituations = serde_json::from_str(include_str!(
+            "../../../common/tests/fixtures/transit/situations.json"
+        ))
+        .unwrap();
+        assert!(check_situations(&fixture).is_ok());
+        let mut long = fixture.clone();
+        long.situations[0].situation_id = "x".repeat(MAX_SITUATION_ID_LEN + 1);
+        assert!(poisoned(check_situations(&long), INVALID_TRANSIT_ROW));
+        let mut line = fixture.clone();
+        line.situations[1].consequences[0].line_ids = vec!["Blue".to_owned()];
+        assert!(poisoned(check_situations(&line), INVALID_TRANSIT_ROW));
+        let mut stop = fixture;
+        stop.situations[0].stop_ids = vec!["9400zzmahea".to_owned()];
+        assert!(poisoned(check_situations(&stop), INVALID_TRANSIT_ROW));
     }
 }
