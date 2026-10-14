@@ -229,7 +229,7 @@ async fn the_prune_touches_only_this_networks_transit_rows() {
     let left: Vec<String> = sqlx::query_scalar(
         "SELECT line_id FROM line_status \
           WHERE line_id IN ('TEST-SIT-AGG', 'tfl-test-sit', 'othernet:blue', 'metrolink:gone', \
-                            'metrolink:blue') ORDER BY 1 COLLATE \"C\"",
+                            'metrolink:blue') ORDER BY line_id COLLATE \"C\"",
     )
     .fetch_all(&db.admin)
     .await
