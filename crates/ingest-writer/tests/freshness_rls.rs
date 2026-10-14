@@ -85,6 +85,23 @@ async fn visible(pool: &PgPool, source: &str) -> bool {
 /// A source no producer owns, present for the whole test.
 const FIXTURE: &str = "TEST-L4-not-yours";
 
+/// Each transit network's timetable and situations sources (transit spec
+/// §8.5), which the writer records.
+fn transit_sources() -> Vec<String> {
+    let sources: Vec<String> = common::transit::NETWORKS
+        .iter()
+        .map(|id| common::transit::NetworkId::parse(id).unwrap())
+        .flat_map(|network| {
+            [
+                common::transit::timetable_freshness_source(&network),
+                common::transit::situations_freshness_source(&network),
+            ]
+        })
+        .collect();
+    assert!(sources.contains(&"transit-metrolink-situations".to_owned()));
+    sources
+}
+
 #[tokio::test]
 #[ignore = "requires the per-service roles: run under scripts/test-postgres-roles.py --mode per-service"]
 async fn each_producer_writes_only_its_own_freshness_rows() {
@@ -123,25 +140,26 @@ async fn each_producer_writes_only_its_own_freshness_rows() {
     tx.commit().await.unwrap();
 
     // Each narrow role: its own source(s) succeed ...
+    let transit = transit_sources();
+    let writer_sources: Vec<&str> = [
+        "tfl",
+        "tocs",
+        ds_store::samples::sources::STATION_SAMPLES,
+        ds_store::samples::sources::FULL_COVERAGE_STATS,
+        ds_store::samples::sources::FULL_COVERAGE_WINDOW_STATS,
+        ds_store::samples::sources::STATION_FULL_COVERAGE_SAMPLES,
+        ds_store::samples::island_of_ireland::sources::STATIONS_GTFS,
+        ds_store::samples::island_of_ireland::sources::LINES_GTFS,
+        ds_store::samples::island_of_ireland::sources::STATIONS_NIR,
+        ds_store::samples::island_of_ireland::sources::LINES_NIR,
+    ]
+    .into_iter()
+    .chain(transit.iter().map(String::as_str))
+    .collect();
     let own: [(&str, &PgPool, &[&str]); 3] = [
         ("stations", &stations, &["stations"]),
         ("incidents", &incidents, &["incidents"]),
-        (
-            "writer",
-            &writer,
-            &[
-                "tfl",
-                "tocs",
-                ds_store::samples::sources::STATION_SAMPLES,
-                ds_store::samples::sources::FULL_COVERAGE_STATS,
-                ds_store::samples::sources::FULL_COVERAGE_WINDOW_STATS,
-                ds_store::samples::sources::STATION_FULL_COVERAGE_SAMPLES,
-                ds_store::samples::island_of_ireland::sources::STATIONS_GTFS,
-                ds_store::samples::island_of_ireland::sources::LINES_GTFS,
-                ds_store::samples::island_of_ireland::sources::STATIONS_NIR,
-                ds_store::samples::island_of_ireland::sources::LINES_NIR,
-            ],
-        ),
+        ("writer", &writer, &writer_sources),
     ];
     for (role, pool, sources) in own {
         for source in sources {

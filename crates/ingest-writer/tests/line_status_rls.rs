@@ -232,3 +232,89 @@ async fn the_writer_is_pinned_to_tfl_rows_and_every_other_role_is_unchanged() {
     );
     assert_eq!(rows_affected(&aggregator, CLEANUP).await.unwrap(), 1);
 }
+
+const TRANSIT_CLEANUP: &str = "DELETE FROM line_status WHERE line_id LIKE 'test-rls:%' \
+     OR line_id LIKE 'TEST-RLS-TRANSIT%'";
+
+/// Transit spec §8.5 and §10.4 (plan 4.1): the writer's policy also admits
+/// `source = 'transit'`, and the CHECK keeps every transit id qualified
+/// (`<network>:<line>`), whoever writes it.
+#[tokio::test]
+#[ignore = "requires the per-service roles: run under scripts/test-postgres-roles.py --mode per-service"]
+async fn the_writer_may_write_qualified_transit_rows() {
+    let (Some(writer), Some(aggregator)) = (
+        pool("DATABASE_URL_WRITER").await,
+        pool("DATABASE_URL_AGGREGATOR").await,
+    ) else {
+        eprintln!(
+            "DATABASE_URL_WRITER/_AGGREGATOR not set: run under \
+             scripts/test-postgres-roles.py --mode per-service; nothing checked"
+        );
+        return;
+    };
+    rows_affected(&aggregator, TRANSIT_CLEANUP).await.unwrap();
+
+    // A qualified transit row: insert, update and delete as the writer.
+    assert_eq!(
+        rows_affected(
+            &writer,
+            "INSERT INTO line_status (line_id, name, mode_name, operators, statuses, source) \
+             VALUES ('test-rls:blue', 'Blue Line', 'test-rls', '{METL}', '[]', 'transit')"
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        rows_affected(
+            &writer,
+            "UPDATE line_status SET name = 'Blue' WHERE line_id = 'test-rls:blue'"
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    // Still no aggregator row for the writer.
+    let insert = rows_affected(
+        &writer,
+        "INSERT INTO line_status (line_id, name, mode_name, operators, statuses, source) \
+         VALUES ('test-rls:agg', 'not mine', 'national-rail', '{NT}', '[]', 'aggregator')",
+    )
+    .await;
+    assert_eq!(sqlstate(&insert).as_deref(), Some("42501"), "{insert:?}");
+
+    // The CHECK refuses an unqualified transit id, for the writer and for
+    // a role RLS does not restrict alike (23514, check_violation).
+    for (role, pool) in [("writer", &writer), ("aggregator", &aggregator)] {
+        let bare = rows_affected(
+            pool,
+            "INSERT INTO line_status (line_id, name, mode_name, operators, statuses, source) \
+             VALUES ('TEST-RLS-TRANSIT', 'bare', 'test-rls', '{METL}', '[]', 'transit')",
+        )
+        .await;
+        assert_eq!(
+            sqlstate(&bare).as_deref(),
+            Some("23514"),
+            "{role}: {bare:?}"
+        );
+    }
+    let validated: bool = sqlx::query_scalar(
+        "SELECT convalidated FROM pg_constraint \
+         WHERE conname = 'line_status_transit_line_id_check'",
+    )
+    .fetch_one(&aggregator)
+    .await
+    .unwrap();
+    assert!(validated, "the second migration validates the CHECK");
+
+    assert_eq!(
+        rows_affected(
+            &writer,
+            "DELETE FROM line_status WHERE line_id = 'test-rls:blue'"
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    rows_affected(&aggregator, TRANSIT_CLEANUP).await.unwrap();
+}
