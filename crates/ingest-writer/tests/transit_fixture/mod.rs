@@ -194,6 +194,7 @@ impl Feed {
                 url_kind: "bods-gtfs".to_owned(),
                 feed_version: Some(version.to_owned()),
                 published_at: None,
+                refresh: None,
             },
         };
         Self { parts, commit }
