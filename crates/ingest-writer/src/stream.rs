@@ -101,7 +101,7 @@ impl StreamSpec {
 /// The ingest streams (spec §7.1; D1: no `train-events`). Each
 /// island-of-Ireland poller has its own stream, so its ACL user can produce
 /// only its own schemas (2026-10-08 security review, H1).
-pub const STREAMS: [StreamSpec; 7] = [
+pub const STREAMS: [StreamSpec; 8] = [
     StreamSpec {
         name: "station-samples",
         stream: streams::STATION_SAMPLES,
@@ -140,6 +140,16 @@ pub const STREAMS: [StreamSpec; 7] = [
         name: "ioi-live",
         stream: streams::IOI_LIVE,
         schemas: &["ioi-station-samples"],
+    },
+    // One stream per transit network (transit spec §5, §9.1), off by
+    // default. Its situations schema joins with its handler (batch 4).
+    StreamSpec {
+        name: "transit-metrolink",
+        stream: streams::TRANSIT_METROLINK,
+        schemas: &[
+            common::transit::schema::TIMETABLE,
+            common::transit::schema::TIMETABLE_COMMIT,
+        ],
     },
 ];
 
@@ -504,7 +514,7 @@ mod tests {
         assert_eq!(modes, StreamModes::default());
         assert_eq!(
             modes.to_string(),
-            "station-samples:off,full-coverage:off,tfl:off,reference:off,ioi-gtfs:off,ioi-nir:off,ioi-live:off"
+            "station-samples:off,full-coverage:off,tfl:off,reference:off,ioi-gtfs:off,ioi-nir:off,ioi-live:off,transit-metrolink:off"
         );
 
         let modes: StreamModes = " station-samples:apply, full-coverage : apply,tfl:off"
@@ -567,7 +577,7 @@ mod tests {
         let modes: StreamModes = "tfl:apply".parse().unwrap();
         assert_eq!(modes.uncovered(&Registry::new()), ["tfl: tfl-line-status"]);
         // Plans 3a.6 and 3c.1: every stream is covered.
-        let modes: StreamModes = "station-samples:apply,full-coverage:apply,tfl:apply,reference:apply,ioi-gtfs:apply,ioi-nir:apply,ioi-live:apply"
+        let modes: StreamModes = "station-samples:apply,full-coverage:apply,tfl:apply,reference:apply,ioi-gtfs:apply,ioi-nir:apply,ioi-live:apply,transit-metrolink:apply"
             .parse()
             .unwrap();
         assert!(modes.uncovered(&crate::handlers::registry()).is_empty());
@@ -601,6 +611,18 @@ mod tests {
         let live = StreamSpec::by_stream(streams::IOI_LIVE).unwrap();
         assert!(live.carries("ioi-station-samples"));
         assert!(!live.carries("ioi-stations"));
+        let transit = StreamSpec::by_stream(streams::TRANSIT_METROLINK).unwrap();
+        assert_eq!(transit.name, "transit-metrolink");
+        assert!(transit.carries("transit-timetable"));
+        assert!(transit.carries("transit-timetable-commit"));
+        assert!(!transit.carries("tfl-line-status"));
+        assert_eq!(
+            "transit-metrolink:apply"
+                .parse::<StreamModes>()
+                .unwrap()
+                .mode("transit-metrolink"),
+            Mode::Apply
+        );
     }
 
     /// Security review H1 (2026-10-08): an entry whose schema its stream

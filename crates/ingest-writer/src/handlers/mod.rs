@@ -22,7 +22,8 @@
 //! schemas of `ds:ingest:station-samples` and `ds:ingest:full-coverage`
 //! ([`snapshots`]) and plan 3c's `tfl-line-status/1` ([`tfl`]), `tocs/1`
 //! ([`tocs`]) and the three island-of-Ireland schemas
-//! ([`island_of_ireland`]). The writer refuses to start a stream whose
+//! ([`island_of_ireland`]); the transit networks' timetable schemas
+//! ([`transit`], off by default). The writer refuses to start a stream whose
 //! schemas have no handler (`stream::StreamModes::uncovered`), so a stream
 //! turned on early cannot dead-letter everything as unknown.
 
@@ -43,6 +44,7 @@ pub mod island_of_ireland;
 pub mod snapshots;
 pub mod tfl;
 pub mod tocs;
+pub mod transit;
 
 /// A boxed, sendable future borrowing for `'a`.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -172,6 +174,11 @@ pub fn registry_with(options: snapshots::Options) -> Registry {
         registry.register(
             &v1("ioi-station-samples"),
             island_of_ireland::StationSamples,
+        ),
+        registry.register(&v1(common::transit::schema::TIMETABLE), transit::Timetable),
+        registry.register(
+            &v1(common::transit::schema::TIMETABLE_COMMIT),
+            transit::TimetableCommitHandler,
         ),
     ];
     for (schema, handler) in snapshots::handlers(options) {
@@ -444,6 +451,8 @@ mod tests {
                 "station-samples/1",
                 "tfl-line-status/1",
                 "tocs/1",
+                "transit-timetable/1",
+                "transit-timetable-commit/1",
             ]
         );
     }
