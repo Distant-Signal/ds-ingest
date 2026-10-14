@@ -111,7 +111,7 @@ soak and the two-release split of 5.2/5.3).
   `schedule_destination_departures_publish_keys`, and EXECUTE on
   `analyze_publish_keys(text)`, which it held only for the api's
   `/private` schedule publish routes; schedule-reference keeps its own
-  grants on them. The setup Job (post-upgrade) applies it in
+  grants on them. The setup Job applies it in
   `postgres-grants.sql` step 6, after `postgres-roles.sql`'s blanket
   grants; no migration. The wider narrowing of app's members stays 5.5.
 - **Local dev** (5.3b): `docker-compose.yml` runs the ingest-writer and
@@ -161,8 +161,8 @@ routes again anyway. Notes:
   it does not (its defaults are the release A ones). Its producers' OAuth
   env reads Secret keys only for `sink: http`, which nothing sets.
 - The publish-staging grants come back when the old chart's setup Job
-  (post-upgrade) reruns `postgres-roles.sql`. A `helm rollback` runs no
-  post-upgrade hook: then re-run the Job or `GRANT SELECT, INSERT,
+  (post-upgrade in that chart) reruns `postgres-roles.sql`. A `helm
+  rollback` runs no upgrade hook: then re-run the Job or `GRANT SELECT, INSERT,
   UPDATE, DELETE ON schedule_calling_points_full_publish_keys,
   schedule_destination_departures_publish_keys TO distant_signal_app;
   GRANT EXECUTE ON FUNCTION analyze_publish_keys(text) TO
@@ -431,11 +431,18 @@ startup needs exactly one backend beyond the probe's, which is closed
 before the pool connects (`ds_store::schema` test
 `the_gate_uses_one_backend`).
 
-**Why raising the limit by values does not help mid-rollout.** The role
-limits are set by the `postgres-roles` setup Job, a `post-install,
-post-upgrade` hook. Helm runs it only after the upgrade's resources are
-applied, and with `--wait` (or a GitOps health gate) only after they are
-Ready. An upgrade stuck on a pod that cannot connect never reaches it.
+**Why raising the limit by values did not help mid-rollout.** The role
+limits are set by the `postgres-roles` setup Job, then a `post-install,
+post-upgrade` hook. Helm ran it only after the upgrade's resources were
+applied, and with `--wait` (or a GitOps health gate) only after they were
+Ready. An upgrade stuck on a pod that cannot connect never reached it.
+Since 2026-10-14 (the same deadlock with grants: a migration's new
+`transit_*` tables, the ingest-writer's schema gate) the Job is a
+`pre-upgrade` hook after the migrate Job, so a raised limit applies before
+the pods roll and a new upgrade carrying it unsticks a stuck one
+(docs/postgres-app-role.md "Hook order"). It stays post-upgrade without
+`migrate.job` and for the one upgrade that adds a key to the chart's
+Secret; then the below still applies.
 
 **To unstick a stuck rollout**, one of:
 
@@ -1270,7 +1277,7 @@ The diff against `db-grants.yaml` is in §4.1. Code and chart:
 **Ranma, two releases:**
 
 1. **Narrow.** Release the chart with the narrowed `db-grants.yaml`. The
-   setup Job (post-upgrade) applies it. Nothing restarts. Watch for 7
+   setup Job (pre-upgrade) applies it. Nothing restarts. Watch for 7
    days:
    - `kubectl logs` of every DB service for SQLSTATE `42501`;
    - `observe-role-usage.py` (read-only), which must show no verb outside
