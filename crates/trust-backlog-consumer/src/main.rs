@@ -145,22 +145,9 @@ async fn connect_database(
 ) -> anyhow::Result<sqlx::PgPool> {
     let url = &config.database_url;
     ds_store::corpus::init_fallback_from_env()?;
-    common::startup::retry_until_ready(
-        "Postgres",
-        common::startup::CONNECT_BACKOFF,
-        Some(progress),
-        || async {
-            use sqlx::Connection;
-            sqlx::PgConnection::connect(url.expose())
-                .await?
-                .close()
-                .await
-        },
-    )
-    .await;
     ds_store::pool::register_metrics();
     let pool = ds_store::pool::PoolSettings::from_env(APPLICATION_NAME, DEFAULT_MAX_CONNECTIONS)?
-        .connect(url.expose())
+        .connect_until_ready(url.expose(), Some(progress))
         .await?;
     ds_store::schema::wait_for_schema(
         &pool,
@@ -473,7 +460,7 @@ where
                 "operation" => "post_rejected"
             )
             .increment(1);
-            if let Err(reject_err) = feed.reject_batch(&err.to_string()).await {
+            if let Err(reject_err) = feed.reject_batch(&format!("{err:#}")).await {
                 tracing::error!(error = ?reject_err, "failed to handle the rejected batch; it stays pending");
                 return Delivery::DeadLetterFailed;
             }
@@ -1168,6 +1155,38 @@ mod deliver_batch_tests {
             "{:?}",
             feed.rejected_batches
         );
+    }
+
+    /// A rejection under context layers -- `DataRejected` as the root, or
+    /// attached as a context itself -- is still a rejection, and the
+    /// dead-letter detail carries the whole chain, not just the outermost
+    /// context (which named the write but not why it was refused).
+    #[tokio::test]
+    async fn a_refused_batch_under_context_keeps_its_cause_in_the_detail() {
+        for wrap_as_context in [false, true] {
+            let mut feed = feed_with_one_batch().await;
+            let events = vec![event("0003", "good")];
+            let outcome =
+                deliver_batch(&mut feed, &events, &[], &sink::DB_OPERATIONS, async |_| {
+                    let err = if wrap_as_context {
+                        anyhow::anyhow!("SQLSTATE 23514")
+                            .context(common::ingest::DataRejected("bad row".to_string()))
+                    } else {
+                        anyhow::Error::from(common::ingest::DataRejected("bad row".to_string()))
+                    };
+                    Err(err.context("writing the backlog batch"))
+                })
+                .await;
+            assert_eq!(
+                outcome,
+                Delivery::Rejected,
+                "wrap_as_context={wrap_as_context}"
+            );
+            assert_eq!(feed.rejected_batches.len(), 1);
+            let detail = &feed.rejected_batches[0];
+            assert!(detail.contains("writing the backlog batch"), "{detail}");
+            assert!(detail.contains("data rejected: bad row"), "{detail}");
+        }
     }
 
     /// Malformed input is dead-lettered, and the rest of the batch is still

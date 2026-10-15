@@ -60,23 +60,10 @@ impl InternalReadArgs {
     ) -> anyhow::Result<sqlx::PgPool> {
         let url = &self.database_url;
         ds_store::corpus::init_fallback_from_env()?;
-        common::startup::retry_until_ready(
-            "Postgres",
-            common::startup::CONNECT_BACKOFF,
-            Some(progress),
-            || async {
-                use sqlx::Connection;
-                sqlx::PgConnection::connect(url.expose())
-                    .await?
-                    .close()
-                    .await
-            },
-        )
-        .await;
         ds_store::pool::register_metrics();
         let pool =
             ds_store::pool::PoolSettings::from_env(APPLICATION_NAME, DEFAULT_MAX_CONNECTIONS)?
-                .connect(url.expose())
+                .connect_until_ready(url.expose(), Some(progress))
                 .await?;
         ds_store::schema::wait_for_schema(
             &pool,

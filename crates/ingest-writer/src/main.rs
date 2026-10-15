@@ -46,22 +46,9 @@ async fn run() -> anyhow::Result<()> {
     let (ready, progress) = health_http::spawn_worker(&config.health);
     // INF-5: wait for Postgres instead of exiting into CrashLoopBackOff.
     // `/healthz` stays 503 until this returns; `/livez` stays 200.
-    common::startup::retry_until_ready(
-        "Postgres",
-        common::startup::CONNECT_BACKOFF,
-        Some(&progress),
-        || async {
-            use sqlx::Connection;
-            sqlx::PgConnection::connect(config.database_url.expose())
-                .await?
-                .close()
-                .await
-        },
-    )
-    .await;
     // ds_store's PoolSettings: common::pg's, plus the db_pool_* metrics.
     let pool = ds_store::pool::PoolSettings::from_env(APPLICATION_NAME, DEFAULT_MAX_CONNECTIONS)?
-        .connect(config.database_url.expose())
+        .connect_until_ready(config.database_url.expose(), Some(&progress))
         .await?;
     // The schema gate (spec §12.2, plan 1B.2): before readiness and before
     // any loop starts; exits after 15 minutes.
