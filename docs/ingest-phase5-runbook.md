@@ -6,11 +6,17 @@ This runbook prepares phase 5 of
 §13, §15.1, §6.4 and §16). It was written on 2026-10-08 against `main` at
 `dc2b4405`. File and line references are to that commit.
 
-**Status 2026-10-12: release B (phase 5's 5.1–5.3b, the HTTP sinks and
-the `/private` routes) is built, not deployed:
-[Release B](#release-b-phase-5-built-2026-10-12).** It ships around
-13 Oct after a production recheck. Steps 5.4, 5.4b (the deletions), 5.5,
-most of 5.6 and the rest of 5.7 remain. The prep that changes no default is (batch 53, 2026-10-08): 5.1's
+**Status 2026-10-14.** Release A went live on 2026-10-10 and release B
+(5.1–5.3b) on 2026-10-13, with 0 `/private` requests in the 3 days since.
+**Release C (5.4, 5.4b, the chart side of 5.6, 5.7) is built, not
+deployed: [Release C](#release-c-phase-5-built-2026-10-14).** It changes
+no grant. Left after it: **5.5**, blocked in production on phase 0b (the
+api, aggregator, enricher and notifier still connect as
+`distant_signal_app`; see [5.5 status](#55-status-2026-10-14-blocked-on-phase-0b)),
+then the `app` drop; Ranma's `allow-egress-same-namespace` (5.6); and
+release D's small follow-ups (the alert rules' `api` alternative, Q8's
+`INGEST_SINK`/`*_SOURCE` parsing). The earlier prep that changed no
+default (batch 53, 2026-10-08) was 5.1's
 `API_PRIVATE_ROUTES` fallback (routes stay on), Q1's dual-prefix alert
 rules, 5.4b's new backfill entry points (the api binaries stay, deprecated),
 Q3's enricher column target in `db-grants.yaml` (the enricher stays
@@ -42,6 +48,8 @@ caller-less routes (Q9) have been deleted ahead of phase 5 (§1.1).
 
 ## Contents
 
+- [Release C (phase 5): built 2026-10-14](#release-c-phase-5-built-2026-10-14)
+- [5.5 status (2026-10-14): blocked on phase 0b](#55-status-2026-10-14-blocked-on-phase-0b)
 - [Release B (phase 5): built 2026-10-12](#release-b-phase-5-built-2026-10-12)
 0. [Release A: every producer on its new sink](#0-release-a-every-producer-on-its-new-sink)
 1. [Entry criteria and the `/private` inventory](#1-entry-criteria-and-the-private-inventory)
@@ -49,6 +57,138 @@ caller-less routes (Q9) have been deleted ahead of phase 5 (§1.1).
 3. [The api's Redis client (5.4)](#3-the-apis-redis-client-54)
 4. [Final grants (5.5) and NetworkPolicies (5.6)](#4-final-grants-55-and-networkpolicies-56)
 5. [Risks and decisions](#5-risks-and-decisions)
+
+## Release C (phase 5): built 2026-10-14
+
+Release B went live on 2026-10-13 and has had 0 `/private` requests since.
+Release C is the code and chart half of what was left: **5.4, 5.4b, the
+chart side of 5.6 and 5.7**, plus Q1's metric rename. **It revokes no
+Postgres privilege** (the setup Job is pre-upgrade, so a revoke would hit
+release B's pods while they still serve: "Hook order" in
+`docs/postgres-app-role.md`); 5.5 is not in it.
+
+### What changes
+
+- **api** (5.4): no Redis client. `AppState.redis`, `REDIS_URL` /
+  `REDIS_PASSWORD` (`ServiceArguments`), the `redis` dependency and
+  `common`'s `redis` feature, and `unavailable.rs`'s `RedisError` branch
+  are gone. Nothing else in the api used Redis: rate limiting is
+  in-process, every cache (JWKS, trip-planner graph, CRS-line index, line
+  matcher) is in-process, sessions and locks are Postgres, readiness
+  checks Postgres only, and the chatbot, SSE and notifier paths never had
+  a Redis call (the notifier is its own service). So no Redis use is left
+  to keep, and no ACL user to narrow: the `api` user is deleted outright.
+- **Redis ACL**: `files/redis-users.acl.tpl` no longer lists `api`;
+  `redis.acl.clients.api` is gone from values (a leftover key, on or off,
+  is ignored, even with `defaultUser: off`). **The ACL ConfigMap changes,
+  so this release restarts Redis once** (`checksum/redis-acl`, about 4 s
+  of AOF load; every stream client reconnects and retries as it does for
+  any Redis restart). If Ranma's values put a Reloader annotation on
+  Redis, Reloader may restart it as well; either way it is one Recreate
+  rollout of Redis per ConfigMap change. `crates/common/tests/redis_acl.rs`
+  checks the user is gone. Dropping the user in the same release as the
+  client is safe, unlike a Postgres revoke: release B's api builds a lazy
+  `redis::Client` (it parses the URL and never opens a socket) and, with
+  `/private/incidents` gone, nothing outside its tests calls the XADD, so
+  the old api pods still serving during the rollout never authenticate as
+  `api`.
+- **NetworkPolicies** (5.6): the api's egress drops Redis and Redis's
+  ingress drops the api. CI checks both.
+- **Metrics** (Q1): every `api_*` name `ds-store` emitted is `store_*`
+  (`store_corpus_last_delivered_at_seconds`, `store_corpus_comparison_*`,
+  `store_incident_removal_inference_total`,
+  `store_incidents_marked_removed_total`,
+  `store_incidents_without_resolved_place`, `store_trust_event_backlog_*`,
+  `store_train_reasons_rejected_rows_total`,
+  `store_schedule_publish_{staged_mismatch,rows}_total`). The schedule
+  publish counters lose their api/store switch. The alert rules already
+  sum over `(api|store)` and keep doing so in this release.
+- **api image** (5.4b): `backfill_trains`, `backfill_incident_lines`,
+  `backfill_line_train_summaries` and `replay_uidless_movements` are gone
+  (with the `api::data::{legacy_backfill,incident_line_backfill}` shims).
+  Their replacements shipped in the phase 5 prep: `ds-migrate
+  backfill-trains` / `backfill-line-train-summaries` (api image, schema
+  owner) and `writer-maintenance replay-uidless-movements` /
+  `backfill-incident-lines` (ingest-writer image, writer and incidents
+  roles). Nothing in the chart, CI, the docs or the Ranma notes ran the old
+  ones.
+- **Local dev**: compose's api no longer depends on Redis.
+- **Tooling**: `observe-role-usage.py` reads the list-form grants (it
+  crashed on the enricher's `incidents` row).
+
+### Deploy (Ranma)
+
+1. **Before:** any Grafana panel on a renamed metric (`distant_signal_api_`
+   + `corpus_`, `incident_`, `incidents_`, `trust_event_backlog_`,
+   `train_reasons_` or `schedule_publish_`) moves to the
+   `{__name__=~"distant_signal_(api|store)_…"}` form (the repo has no
+   dashboards).
+2. **Values** (`clusters/mine-bringer/apps/distant-signal.yaml`): delete
+   `redis.acl.clients.api` (ignored if left).
+3. Release the chart and the images together. Restarts: Redis (once, the
+   ACL file, via `checksum/redis-acl` or Reloader; every stream client
+   reconnects and retries for the ~4 s it is down), the api (env), and
+   every pod whose image changed.
+4. **Checks:**
+   - `kubectl exec deploy/distant-signal-redis -- redis-cli --user ds-admin
+     --pass … CLIENT LIST` shows no `user=api`, and `ACL LOG` stays empty;
+   - the api pod has no `REDIS_*` env;
+   - `XINFO STREAM incident-text-changed` still gains entries (from
+     poller-incidents) and the enricher's group lag stays near 0;
+   - `distant_signal_store_incident_removal_inference_total` and
+     `distant_signal_store_corpus_last_delivered_at_seconds` are scraped;
+     `DistantSignalIncidentSnapshotsMissing`, `…CorpusStale` and
+     `…SchedulePublishStagedMismatch` stay quiet;
+   - the api image has no `backfill_*` or `replay_*` binary.
+5. **After a few clean days:** drop `api-password` from the
+   `distant-signal-redis-users` SealedSecret. That Secret change makes
+   Reloader restart Redis (and every client that mounts the Secret) once
+   more, so batch it with the next password rotation. Until then the key
+   is harmless.
+
+### Ranma, after (5.6)
+
+The chart now lists every in-namespace flow of its own components in
+their egress policies (production has `networkPolicy.egress.enabled` on:
+every chart component below has an `Ingress Egress` policy). On
+2026-10-14 `allow-egress-same-namespace` admits egress from every pod but
+the two exporters to every pod. The pods it still matters for are the
+ones without a chart egress policy: the `postgres-backup` CronJob (pg_dump
+to `distant-signal-postgres:5432`), the pgBackRest CronJobs (component
+`pgbackrest`) and the one-off `pgbackrest-full-initial` Job, and the Helm
+test pod (to the api). Narrow it in its own Ranma change after release C,
+in a quiet hour:
+
+```yaml
+# clusters/mine-bringer/apps/netpol-distant-signal.yaml
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: NotIn
+        values: [postgres-exporter, redis-exporter]
+      - key: app.kubernetes.io/component
+        operator: NotIn
+        values: [api, frontend, aggregator, enricher, notifier, postgres, redis,
+                 schedulefeed, schedulefeed-sftp, trust-consumer, trust-backlog-consumer,
+                 full-coverage-consumer, movement-relay, ingest-writer, migrate,
+                 postgres-roles, api-maintenance, poller-stations, poller-incidents,
+                 poller-ldbws, poller-tfl, poller-tocs, poller-irish-rail-gtfs,
+                 poller-irish-rail-live, poller-nir-stations, poller-transit-schedule]
+  egress:
+    - to:
+        - podSelector: {}
+```
+
+(`NotIn` also matches pods without the label, such as `postgres-backup`.)
+Then a day of `kubectl logs` with no new connection error in any
+component, the frontend rendering, the backup and pgBackRest runs green.
+If that holds, scope the rule's `to:` to `distant-signal-postgres` (5432)
+and the api (8080), the only targets those pods use. Update the flow
+comment (lines ~24–40): the api's in-namespace clients are the frontend
+and the Helm test; Redis's are the stream services (not the api);
+Postgres's include the direct-write producers. Rollback: restore the
+previous rule.
 
 ## Release B (phase 5): built 2026-10-12
 
@@ -1071,6 +1211,11 @@ and deletes the HTTP wiring as listed below.
 
 ### 5.4 Delete the api's Redis client
 
+**Done in release C (2026-10-14)**, with Q1's rename; see
+[Release C](#release-c-phase-5-built-2026-10-14). The list below is what it
+removed. The next release (D) drops the `api` alternative from the alert
+rules.
+
 The full use list is in §3.
 
 **Code:**
@@ -1172,6 +1317,15 @@ alone. The repo has no Grafana dashboards; any panel lives in Ranma-Config.
 
 ### 5.4b Move the api's writing binaries out of the api image
 
+**Done in release C (2026-10-14):** the four binaries, the two shims and
+their `gen-rust-dockerfiles.py` entries are deleted; the api image ships
+`api`, `corpus_compare`, `maintenance` and `ds-migrate` (the runtime
+stage's `COPY` lines too: `gen-rust-dockerfiles.py --check` now fails on a
+`COPY` of a binary the image does not build). Nothing in the
+chart, CI, the docs or the Ranma notes ran the old binaries. CI's
+per-service step runs `writer-maintenance`'s preflight test as the
+incidents role (it already ran as the writer, which it refuses).
+
 Decided (Q2): these binaries must never run with api credentials, because
 they write tables the narrowed api role cannot write. Move them before
 5.5.
@@ -1230,6 +1384,66 @@ sources, the two shims and their `SERVICES` entries in
 
 **Rollback:** revert the commit. The binaries are run by hand, so nothing
 in production changes until someone runs one.
+
+### 5.5 status (2026-10-14): blocked on phase 0b
+
+**Production does not meet 5.5's entry criterion.** A read-only check on
+2026-10-14 (`pg_stat_activity`, role memberships, and
+`observe-role-usage.py --from-file` over `pg_stat_statements`, reset
+2026-10-03):
+
+- the api, aggregator, enricher and notifier connect as
+  `distant_signal_app` (`postgresql.roles.perService.<svc>.connect` is off
+  for all four); their own roles exist (members of app) but have run **0
+  statements**, so there is no 7-day report to narrow from;
+- the writer already connects as `distant_signal_writer` and is **not** a
+  member of app (narrow since the 2026-10-08 security review, M1), so the
+  plan's "the writer is observed too" correction no longer applies; its
+  report shows nothing used outside its grants;
+- every other per-service role (incidents, stations, schedule_ingest,
+  schedule_reference, trust_*, the read-only ones) is on its own role with
+  no "used, not granted" table apart from the two read views
+  (`ingest_custom_line_stations`, `ingest_active_tracked_trains`), which
+  the report does not model (they are granted).
+
+Narrowing a role nothing connects as would change nothing, and narrowing
+blind would turn the first `connect: true` into a permission failure. So
+5.5 goes in this order:
+
+1. **Ranma: phase 0b** for the four services, one per values change (each
+   restarts that service once; no grant changes): set
+   `postgresql.roles.perService.{api,aggregator,enricher,notifier}.connect:
+   true`, with each role's password sealed in its own
+   `mint-sealed-secret.sh` run (one run per role). Check `pg_stat_activity`
+   shows the service as its role, and `DistantSignalDbRoleNearConnectionLimit`
+   stays quiet (the api's pool drops to `perService.api.maxConnections`,
+   16; production's peak is 6).
+2. **7 days later:** `observe-role-usage.py` (read-only, `--from-file` as in
+   its docstring). Fix `db-grants.yaml` for anything "used, not granted".
+3. **Release D (narrowing):** `status: narrow` for api, aggregator,
+   enricher and notifier in `db-grants.yaml`, the regenerated
+   `postgres-grants.sql`, and **the per-service test suites ported first**.
+   A local run with the four roles narrowed (2026-10-14) failed 312 api
+   and 114 ds-store DB tests (run as the api role), almost all of them
+   because the tests seed fixtures (incidents, stations, samples, schedule
+   products, movement events) through the role's own pool. Move every
+   fixture write to the owner pool (`MIGRATION_DATABASE_URL`, as
+   `ds_store::test_support::schedule_fixture_pool` and poller-incidents'
+   tests already do) and run the reads as the role; the same for the
+   aggregator, notifier and enricher suites (the enricher's
+   `UPDATE incidents SET summary/description/first_seen_at` fixtures, see
+   above). Revoke-wise this release is safe to ship on its own: the
+   services' code does not change, so the pre-upgrade setup Job narrows
+   roles whose pods already run the same code.
+4. **Release E, 7 days after D** (Q5): drop `distant_signal_app` once
+   `pg_stat_activity` has shown no `usename = 'distant_signal_app'` for 7
+   days. `perService.*.connect` becomes always-on, `postgresql.roles.app`
+   and the default `databaseEnv` fallback go, `postgres-roles.sql` /
+   `db-grants.sql.tpl` revoke every membership then `REASSIGN OWNED` /
+   `DROP OWNED BY distant_signal_app` and `DROP ROLE IF EXISTS`, and
+   `docs/postgres-app-role.md` is rewritten for per-service roles. Ranma
+   then deletes `postgresql.roles.app` and the `distant-signal-postgres-app`
+   SealedSecret.
 
 ### 5.5 Final grants
 
@@ -1319,8 +1533,11 @@ holds no binary that writes outside the api's grants.
 
 **Partly done in release B (2026-10-12):** the api's ingress no longer
 lists the producers, the workers lost their api and token-URL egress, and
-the postgres/redis ingress no longer depend on the sink switches. The
-api's Redis egress (5.4) and Ranma's `allow-egress-same-namespace` remain.
+the postgres/redis ingress no longer depend on the sink switches.
+**Release C (2026-10-14)** drops the api's Redis egress and Redis's api
+ingress (5.4), with CI checks for both. The chart side of 5.6 is then
+complete; only Ranma's `allow-egress-same-namespace` remains (deploy notes
+under [Release C](#release-c-phase-5-built-2026-10-14), "Ranma, after").
 
 The diff against `templates/networkpolicy.yaml` is in §4.2. Chart only,
 plus Ranma's comments.
@@ -1353,6 +1570,13 @@ plus Ranma's comments.
 
 ### 5.7 Docs
 
+**Done (2026-10-14)** apart from the spec's final marker: every item below
+was updated in releases B and C. The remaining `/private` mentions outside
+`docs/superpowers/` are history ("release B removed ..."), the
+`api-changelog.md` entries, and the migrations' comments. The spec stays
+`partly` in `docs/superpowers/README.md` until 5.5's narrowing and the
+`app` drop ship.
+
 - the README architecture section; `DESIGN.md`'s `/private` section;
 - `charts/distant-signal/README.md`, regenerated with
   `uv run scripts/chart-values-doc.py`;
@@ -1368,6 +1592,9 @@ Check with `chart-values-doc.py check`, plus `command grep -rn
 '/private' --exclude-dir=superpowers` coming back empty apart from history.
 
 ## 3. The api's Redis client (5.4)
+
+**Removed in release C (2026-10-14).** The table below is the use list
+it was checked against; no non-ingest use existed.
 
 `crates/api` uses Redis in exactly one place.
 
