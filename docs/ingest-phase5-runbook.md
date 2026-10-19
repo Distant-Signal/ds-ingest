@@ -8,8 +8,8 @@ This runbook prepares phase 5 of
 
 **Status 2026-10-14.** Release A went live on 2026-10-10 and release B
 (5.1–5.3b) on 2026-10-13, with 0 `/private` requests in the 3 days since.
-**Release C (5.4, 5.4b, the chart side of 5.6, 5.7) is built, not
-deployed: [Release C](#release-c-phase-5-built-2026-10-14).** It changes
+**Release C (5.4, 5.4b, the chart side of 5.6, 5.7) is live since
+2026-10-15 (Helm v256): [Release C](#release-c-phase-5-built-2026-10-14).** It changes
 no grant. Left after it: **5.5**, blocked in production on phase 0b (the
 api, aggregator, enricher and notifier still connect as
 `distant_signal_app`; see [5.5 status](#55-status-2026-10-14-blocked-on-phase-0b)),
