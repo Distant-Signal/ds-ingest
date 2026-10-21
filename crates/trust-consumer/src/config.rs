@@ -19,15 +19,6 @@ pub(crate) use movement_feed::MovementFeedBackend;
 /// connection of its own (Deploy C, PL-15a).
 #[derive(Debug, Parser)]
 pub(crate) struct Config {
-    /// `INGEST_SINK`: only `db` (ingest architecture plan 3b.3, decision
-    /// D1): each batch's train events and forward signals go to Postgres
-    /// in one transaction, as the `trust_consumer` role (`sink.rs`).
-    /// Release B (ingest phase 5, docs/ingest-phase5-runbook.md) removed
-    /// `http`, so an old `INGEST_SINK=http` fails at startup instead of
-    /// being ignored; the next release drops the variable.
-    #[arg(long, env = "INGEST_SINK", default_value = "db", value_parser = ["db"])]
-    pub ingest_sink: String,
-
     /// Postgres, for the sink and the reads: one URL and one pool for
     /// both, as the `trust_consumer` role. Pool size and timeouts come from
     /// the shared `DATABASE_*` variables (`common::pg`); the default pool
@@ -172,11 +163,6 @@ pub(crate) struct Config {
     /// suspect, without a rebuild.
     #[arg(long, env, default_value_t = true)]
     pub trust_timestamp_correction_enabled: bool,
-
-    /// `TRACKED_TRAINS_SOURCE` and `STANOX_CRS_SOURCE` (ingest architecture
-    /// plan 4.4; their database is `database_url`): see `reads.rs`.
-    #[command(flatten)]
-    pub reads: crate::reads::InternalReadArgs,
 }
 
 impl Config {
@@ -247,28 +233,22 @@ pub(crate) mod tests {
         );
     }
 
-    /// Release B (ingest phase 5): the sink is `db` only; `http` is
-    /// refused at startup rather than ignored, and `DATABASE_URL` must not
-    /// be empty.
+    /// `DATABASE_URL` must not be empty, nor appear in `Debug`.
     #[test]
-    fn the_sink_is_db_only_and_needs_a_database_url() {
+    fn the_sink_needs_a_database_url() {
         let config = parse(&[]).unwrap();
-        assert_eq!(config.ingest_sink, "db");
         config.validate().unwrap();
         assert!(
             !format!("{config:?}").contains(":pw@"),
             "the database URL must not appear in Debug output"
         );
-        assert_eq!(parse(&["--ingest-sink", "db"]).unwrap().ingest_sink, "db");
-        for retired in ["http", "http+shadow", "stream"] {
-            assert!(parse(&["--ingest-sink", retired]).is_err(), "{retired}");
-        }
         let empty = parse(&["--database-url", ""]).unwrap();
         assert!(empty.validate().is_err(), "an empty DATABASE_URL");
     }
 
-    /// The names the chart sets (`DATABASE_URL`) or an old values file may
-    /// still set (`INGEST_SINK`).
+    /// The names the chart sets (`DATABASE_URL`). Release D (ingest phase
+    /// 5, Q8) removed `INGEST_SINK`, `TRACKED_TRAINS_SOURCE` and
+    /// `STANOX_CRS_SOURCE`: nothing reads them.
     #[test]
     fn the_settings_read_the_chart_s_env_names() {
         use clap::CommandFactory;
@@ -280,7 +260,16 @@ pub(crate) mod tests {
                 .and_then(|arg| arg.get_env())
                 .map(|env| env.to_string_lossy().into_owned())
         };
-        assert_eq!(env("ingest_sink").as_deref(), Some("INGEST_SINK"));
         assert_eq!(env("database_url").as_deref(), Some("DATABASE_URL"));
+        for arg in command.get_arguments() {
+            let name = arg.get_env().map(|env| env.to_string_lossy().into_owned());
+            assert!(
+                !matches!(
+                    name.as_deref(),
+                    Some("INGEST_SINK" | "TRACKED_TRAINS_SOURCE" | "STANOX_CRS_SOURCE")
+                ),
+                "{name:?} was removed in release D"
+            );
+        }
     }
 }

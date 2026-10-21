@@ -2,7 +2,7 @@
 //! role `DATABASE_URL` is: CI runs it as the superuser and, in the
 //! per-service step, as the narrow read-only `full_coverage_ro` role
 //! itself (plan 4.7), so the schema gate and every query
-//! `POPULATION_SOURCE=db` and `STANOX_CRS_SOURCE=db` run are proven against
+//! the population and STANOX/CRS reads run are proven against
 //! exactly that role's `db-grants.yaml` grants. Read-only: it writes
 //! nothing, so it needs no fixtures.
 

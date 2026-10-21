@@ -86,7 +86,7 @@ pub(crate) fn register_db_write_metrics() {
     ds_store::writes::register(&[DB_WRITE_OPERATION]);
 }
 
-/// `INGEST_SINK=db`: straight into Postgres, as the `trust_consumer` role
+/// The sink: straight into Postgres, as the `trust_consumer` role
 /// (D1). The events and their forward signals go in one transaction.
 pub(crate) struct DbSink {
     pub pool: PgPool,

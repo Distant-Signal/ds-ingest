@@ -14,25 +14,11 @@ const APPLICATION_NAME: &str = "distant-signal-full-coverage-consumer";
 /// STANOX/CRS reload are the only users, one query at a time each.
 const DEFAULT_MAX_CONNECTIONS: u32 = 2;
 
-/// The retired `*_SOURCE` switches and the database the reads use.
-/// Release B (ingest phase 5, docs/ingest-phase5-runbook.md) removed their
-/// `http` value: each accepts only `db` (the default), so an old `http`
-/// fails at startup instead of being ignored. The next release drops both
-/// variables.
+/// The database the reads use. Release D (ingest phase 5,
+/// docs/ingest-phase5-runbook.md) removed the `POPULATION_SOURCE` and
+/// `STANOX_CRS_SOURCE` switches, which accepted only `db` since release B.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct InternalReadArgs {
-    /// `POPULATION_SOURCE`: only `db`, one version query per cycle, then a
-    /// fetch of only the changed pairs
-    /// (`ds_store::reads::list_population_versions`).
-    #[arg(long, env, default_value = "db", value_parser = ["db"])]
-    pub population_source: String,
-
-    /// `STANOX_CRS_SOURCE`: only `db`, `stanox_crs`
-    /// (`ds_store::reads::list_stanox_crs`, with the api's CORPUS fallback
-    /// setting, `CORPUS_FALLBACK_ENABLED`).
-    #[arg(long, env, default_value = "db", value_parser = ["db"])]
-    pub stanox_crs_source: String,
-
     /// Postgres, as the `full_coverage_ro` role. Pool size and timeouts come
     /// from the shared `DATABASE_*` variables (`common::pg`); the default
     /// pool is 2 (spec §6.6, role limit 3).
@@ -115,28 +101,24 @@ mod tests {
         )
     }
 
-    /// Release B: both sources are `db` only (`http` fails at startup), and
-    /// the database URL must not be empty.
+    /// The database URL must not be empty, nor appear in `Debug`.
     #[test]
-    fn the_sources_are_db_only_and_need_a_database_url() {
+    fn the_reads_need_a_database_url() {
         let config = parse(&[]).unwrap();
-        assert_eq!(config.reads.population_source, "db");
-        assert_eq!(config.reads.stanox_crs_source, "db");
         config.reads.validate().unwrap();
         assert!(
             !format!("{config:?}").contains(":pw@"),
             "the database URL must not appear in Debug output"
         );
-        for flag in ["--population-source", "--stanox-crs-source"] {
-            assert!(parse(&[flag, "db"]).is_ok(), "{flag} db");
-            assert!(parse(&[flag, "http"]).is_err(), "{flag} http");
-        }
         let empty = parse(&["--database-url", ""]).unwrap();
         assert!(empty.reads.validate().is_err(), "an empty DATABASE_URL");
     }
 
+    /// `DATABASE_URL`, and no retired switch: release D (ingest phase 5,
+    /// Q8) removed `INGEST_SINK`, `POPULATION_SOURCE` and
+    /// `STANOX_CRS_SOURCE`.
     #[test]
-    fn the_sources_read_their_env_names() {
+    fn the_reads_read_their_env_names() {
         use clap::CommandFactory;
         let command = Config::command();
         let env = |id: &str| {
@@ -146,14 +128,16 @@ mod tests {
                 .and_then(|arg| arg.get_env())
                 .map(|env| env.to_string_lossy().into_owned())
         };
-        assert_eq!(
-            env("population_source").as_deref(),
-            Some("POPULATION_SOURCE")
-        );
-        assert_eq!(
-            env("stanox_crs_source").as_deref(),
-            Some("STANOX_CRS_SOURCE")
-        );
         assert_eq!(env("database_url").as_deref(), Some("DATABASE_URL"));
+        for arg in command.get_arguments() {
+            let name = arg.get_env().map(|env| env.to_string_lossy().into_owned());
+            assert!(
+                !matches!(
+                    name.as_deref(),
+                    Some("INGEST_SINK" | "POPULATION_SOURCE" | "STANOX_CRS_SOURCE")
+                ),
+                "{name:?} was removed in release D"
+            );
+        }
     }
 }

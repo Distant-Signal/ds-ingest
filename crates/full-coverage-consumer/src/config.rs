@@ -93,15 +93,6 @@ pub(crate) struct Config {
     #[arg(long, env)]
     pub redis_username: Option<String>,
 
-    /// `INGEST_SINK`: only `stream` (ingest architecture plan 3a.8; see
-    /// `sink.rs`): each stats write is `XADD`ed to `ds:ingest:full-coverage`,
-    /// on this Redis as this user. Release B (ingest phase 5,
-    /// docs/ingest-phase5-runbook.md) removed `http` and `http+shadow`, so
-    /// an old value fails at startup instead of being ignored; the next
-    /// release drops the variable.
-    #[arg(long, env = "INGEST_SINK", default_value = "stream", value_parser = ["stream"])]
-    pub ingest_sink: String,
-
     /// See `trust-consumer/src/config.rs`'s identical field.
     #[arg(long, env, default_value_t = 30)]
     pub redis_autoclaim_min_idle_secs: u64,
@@ -115,8 +106,8 @@ pub(crate) struct Config {
     #[command(flatten)]
     pub windowed: WindowedStatsArgs,
 
-    /// `POPULATION_SOURCE`, `STANOX_CRS_SOURCE` and their `DATABASE_URL`
-    /// (ingest architecture plan 4.3): see `reads.rs`.
+    /// The reads' `DATABASE_URL` (ingest architecture plan 4.3): see
+    /// `reads.rs`.
     #[command(flatten)]
     pub reads: crate::reads::InternalReadArgs,
 }
@@ -307,7 +298,6 @@ pub(crate) mod tests {
             redis_url: String::new(),
             redis_password: None,
             redis_username: None,
-            ingest_sink: "stream".to_string(),
             redis_autoclaim_min_idle_secs: 30,
             redis_gap_check_secs: 60,
             windowed: WindowedStatsArgs {
@@ -319,8 +309,6 @@ pub(crate) mod tests {
                 line_membership: LineMembershipMode::Legacy,
             },
             reads: crate::reads::InternalReadArgs {
-                population_source: "db".to_string(),
-                stanox_crs_source: "db".to_string(),
                 database_url: common::secret::Secret::new("postgres://nobody@127.0.0.1:1/none"),
             },
         }
@@ -392,29 +380,6 @@ pub(crate) mod tests {
         );
         assert_eq!(config.windowed.full_coverage_recent_window_minutes, 60);
         assert_eq!(config.windowed.full_coverage_grace_minutes, 10);
-        assert_eq!(config.ingest_sink, "stream");
-    }
-
-    /// Release B (ingest phase 5): the sink is `stream` only; `http` and
-    /// `http+shadow` are refused at startup rather than ignored.
-    #[test]
-    fn the_sink_is_stream_only() {
-        let lines_dir = common::manifest_dir!().join("../../lines");
-        let parse = |sink: &str| {
-            Config::try_parse_from([
-                "full-coverage-consumer",
-                "--database-url",
-                "postgres://nobody@127.0.0.1:1/none",
-                "--lines-dir",
-                lines_dir.to_str().unwrap(),
-                "--ingest-sink",
-                sink,
-            ])
-        };
-        assert_eq!(parse("stream").unwrap().ingest_sink, "stream");
-        for retired in ["http", "http+shadow", "db"] {
-            assert!(parse(retired).is_err(), "{retired}");
-        }
     }
 
     /// R-101 / Deploy C: an explicit `--movement-feed-backend kafka` (or

@@ -51,21 +51,13 @@ pub(crate) struct Config {
     #[arg(long, env, default_value_t = 60)]
     pub redis_gap_check_secs: u64,
 
-    /// Where each batch goes: only `db` (ingest architecture plan 3b.1,
-    /// spec R1), which writes and reads Postgres directly
-    /// (`ds_store::backlog::ingest_trust_event_backlog`,
+    /// Postgres, as the `trust_backlog` role: each batch is written and
+    /// read there directly (ingest architecture plan 3b.1, spec R1;
+    /// `ds_store::backlog::ingest_trust_event_backlog`,
     /// `ds_store::backlog::reasons::upsert_reasons`,
-    /// `ds_store::reference::list_stanox_crs`) as the `trust_backlog` role.
-    /// See `sink.rs`. `http` (the api's `/private` routes) was removed in
-    /// release B (ingest phase 5, docs/ingest-phase5-runbook.md), so an old
-    /// `INGEST_SINK=http` fails at startup; the next release drops the
-    /// variable.
-    #[arg(long, env, default_value = "db", value_parser = ["db"])]
-    pub ingest_sink: String,
-
-    /// Postgres, as the `trust_backlog` role. Pool size and timeouts come
-    /// from the shared `DATABASE_*` variables (`common::pg`); the default
-    /// pool is 3 (spec §6.6, role limit 4).
+    /// `ds_store::reference::list_stanox_crs`; see `sink.rs`). Pool size and
+    /// timeouts come from the shared `DATABASE_*` variables (`common::pg`);
+    /// the default pool is 3 (spec §6.6, role limit 4).
     #[arg(long, env, hide_env_values = true)]
     pub database_url: common::secret::Secret,
 
@@ -179,12 +171,10 @@ mod tests {
         )
     }
 
-    /// Release B: the sink is `db`, by default and only; it needs a
-    /// `DATABASE_URL`, which `Debug` hides.
+    /// The sink needs a `DATABASE_URL`, which `Debug` hides.
     #[test]
-    fn the_sink_is_db_and_needs_a_database_url() {
+    fn the_sink_needs_a_database_url() {
         let config = parse(&[]).unwrap();
-        assert_eq!(config.ingest_sink, "db");
         config.validate().unwrap();
         assert!(
             !format!("{config:?}").contains(":pw@"),
@@ -194,15 +184,10 @@ mod tests {
             parse(&["--database-url", ""]).unwrap().validate().is_err(),
             "an empty DATABASE_URL"
         );
-        for removed in ["http", "http+shadow", "stream"] {
-            assert!(
-                parse(&["--ingest-sink", removed]).is_err(),
-                "{removed} must be refused at startup"
-            );
-        }
     }
 
     /// The chart sets these names (templates/trust-backlog-consumer-deployment.yaml).
+    /// Release D (ingest phase 5, Q8) removed `INGEST_SINK`.
     #[test]
     fn the_new_settings_read_the_chart_s_env_names() {
         use clap::CommandFactory;
@@ -214,8 +199,13 @@ mod tests {
                 .and_then(|arg| arg.get_env())
                 .map(|env| env.to_string_lossy().into_owned())
         };
-        assert_eq!(env("ingest_sink").as_deref(), Some("INGEST_SINK"));
         assert_eq!(env("database_url").as_deref(), Some("DATABASE_URL"));
+        assert!(
+            command
+                .get_arguments()
+                .all(|arg| arg.get_env().is_none_or(|env| env != "INGEST_SINK")),
+            "INGEST_SINK was removed in release D"
+        );
         assert_eq!(
             env("trust_event_backlog_retention_days").as_deref(),
             Some("TRUST_EVENT_BACKLOG_RETENTION_DAYS")

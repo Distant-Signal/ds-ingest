@@ -54,7 +54,6 @@ async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     common::logging::init("trust-backlog-consumer");
     let config = Config::parse();
-    common::metrics::ingest_sink_info(&config.ingest_sink);
     config.validate()?;
     if config.metrics.metrics_enabled {
         common::metrics::install(config.metrics_port)?;

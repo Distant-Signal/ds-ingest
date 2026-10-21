@@ -27,8 +27,8 @@
 //! The first connection is retried for up to
 //! `BACKFILL_CONNECT_DEADLINE_SECS` (default 120), then exits 1.
 //!
-//! Both are idempotent and refuse the api's role. The old api binaries
-//! still work, deprecated, until phase 5 step 5.4b deletes them.
+//! Both are idempotent and refuse the api's role. Release C (phase 5 step
+//! 5.4b) deleted the old api binaries.
 //!
 //! Exit status 0 on success, 1 on any error (logged as one line).
 

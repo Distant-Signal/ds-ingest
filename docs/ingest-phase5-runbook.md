@@ -6,16 +6,18 @@ This runbook prepares phase 5 of
 §13, §15.1, §6.4 and §16). It was written on 2026-10-08 against `main` at
 `dc2b4405`. File and line references are to that commit.
 
-**Status 2026-10-14.** Release A went live on 2026-10-10 and release B
+**Status 2026-10-21.** Release A went live on 2026-10-10 and release B
 (5.1–5.3b) on 2026-10-13, with 0 `/private` requests in the 3 days since.
 **Release C (5.4, 5.4b, the chart side of 5.6, 5.7) is live since
 2026-10-15 (Helm v256): [Release C](#release-c-phase-5-built-2026-10-14).** It changes
-no grant. Left after it: **5.5**, blocked in production on phase 0b (the
+no grant. **Release D's small follow-ups (the alert rules' `api`
+alternative, Q1; Q8's `INGEST_SINK`/`*_SOURCE` parsing) are built
+(2026-10-21, DS-94) and ship with the next ordinary release, ahead of the
+narrowing: [Release D cleanup](#release-d-cleanup-built-2026-10-21).** Left
+after it: **5.5**, blocked in production on phase 0b (the
 api, aggregator, enricher and notifier still connect as
 `distant_signal_app`; see [5.5 status](#55-status-2026-10-14-blocked-on-phase-0b)),
-then the `app` drop; Ranma's `allow-egress-same-namespace` (5.6); and
-release D's small follow-ups (the alert rules' `api` alternative, Q8's
-`INGEST_SINK`/`*_SOURCE` parsing). The earlier prep that changed no
+then the `app` drop; and Ranma's `allow-egress-same-namespace` (5.6). The earlier prep that changed no
 default (batch 53, 2026-10-08) was 5.1's
 `API_PRIVATE_ROUTES` fallback (routes stay on), Q1's dual-prefix alert
 rules, 5.4b's new backfill entry points (the api binaries stay, deprecated),
@@ -48,6 +50,7 @@ caller-less routes (Q9) have been deleted ahead of phase 5 (§1.1).
 
 ## Contents
 
+- [Release D cleanup: built 2026-10-21](#release-d-cleanup-built-2026-10-21)
 - [Release C (phase 5): built 2026-10-14](#release-c-phase-5-built-2026-10-14)
 - [5.5 status (2026-10-14): blocked on phase 0b](#55-status-2026-10-14-blocked-on-phase-0b)
 - [Release B (phase 5): built 2026-10-12](#release-b-phase-5-built-2026-10-12)
@@ -57,6 +60,64 @@ caller-less routes (Q9) have been deleted ahead of phase 5 (§1.1).
 3. [The api's Redis client (5.4)](#3-the-apis-redis-client-54)
 4. [Final grants (5.5) and NetworkPolicies (5.6)](#4-final-grants-55-and-networkpolicies-56)
 5. [Risks and decisions](#5-risks-and-decisions)
+
+## Release D cleanup: built 2026-10-21
+
+Release C has been live since 2026-10-15. These are the two follow-ups it
+left (Q1 and Q8's second halves). They change no grant, no Redis ACL and
+no NetworkPolicy, so they need neither phase 0b nor a quiet hour; the
+5.5 narrowing (["Release D (narrowing)"](#55-status-2026-10-14-blocked-on-phase-0b))
+follows separately.
+
+### What changes
+
+- **Alert rules** (Q1): `DistantSignalCorpusStale`,
+  `DistantSignalSchedulePublishStagedMismatch`,
+  `DistantSignalIncidentRemovalStalled` (its
+  `distant_signal:incident_removal_inference:increase` recording rule) and
+  `DistantSignalIncidentSnapshotsMissing` read only the `store_` name
+  (`distant_signal_store_…{namespace=…}`), not `{__name__=~"distant_signal_(api|store)_…"}`.
+  Evidence: Prometheus on 2026-10-21 had no `distant_signal_api_{corpus,incident,incidents,trust_event_backlog,train_reasons,schedule_publish}_*`
+  series at all over the last 5 days, and every `store_` one is scraped.
+  `scripts/alert-rules-tests/` now feed `store_` series, and
+  `store-prefix.yaml` checks that a leftover `api_` series neither fires
+  nor suppresses an alert.
+- **Binaries** (Q8): no crate reads `INGEST_SINK`,
+  `TRACKED_TRAINS_SOURCE`, `STANOX_CRS_SOURCE`, `POPULATION_SOURCE` or
+  `SAMPLE_STATIONS_SOURCE` any more (poller-incidents, -stations, -ldbws,
+  -tfl, -tocs, the three island-of-Ireland pollers, trust-consumer,
+  trust-backlog-consumer, full-coverage-consumer, schedule-ingest,
+  schedule-reference). A leftover variable is ignored, not refused. With
+  them go `distant_signal_ingest_sink_info` and
+  `distant_signal_internal_reads_source_info` (`common::metrics`), which
+  only reported those settings; nothing alerted or graphed on them.
+- **Chart**: the island-of-Ireland pollers no longer render
+  `INGEST_SINK=stream`. The preflight no longer checks the retired
+  `ingest.sink` / `internalReads.source` keys (a leftover one is ignored);
+  it still refuses a writer stream in `shadow`.
+- **Comments**: `ds-migrate` and `writer-maintenance` no longer say the old
+  api binaries work "until 5.4b" (release C deleted them).
+
+### Ranma
+
+Checked against Ranma-Config `main` (827520e, 2026-10-21): its DS values
+set no `INGEST_SINK` or `*_SOURCE` (no `extraEnv` entry either) and no
+retired `ingest.sink` / `internalReads.source` key, and the live
+Deployments carry neither variable. **Nothing has to be removed first.**
+Optional tidy-up, any time after this release: three Grafana panels in
+`clusters/mine-bringer/apps/distant-signal.yaml` (corpus age,
+`trust_event_backlog_uid_inferred_total`,
+`schedule_publish_staged_mismatch_total`) still query
+`{__name__=~"distant_signal_(api|store)_…"}`; they keep working, and can
+become plain `distant_signal_store_…`.
+
+**Checks:** the four alerts above stay quiet;
+`ALERTS{alertname=~"DistantSignal(CorpusStale|SchedulePublishStagedMismatch|IncidentRemovalStalled|IncidentSnapshotsMissing)"}`
+is empty; every producer starts (no clap error about an unknown setting:
+there is none, a leftover variable is simply unread).
+
+**Rollback:** revert and redeploy; the old rules and binaries accept the
+same environment.
 
 ## Release C (phase 5): built 2026-10-14
 
@@ -1065,7 +1126,7 @@ this step, never before.
 
 **Done in release B (2026-10-12)**, in one release with 5.2. Q8's first
 half: `INGEST_SINK` and `*_SOURCE` accept only the new value; the next
-release removes them. The chart values are already removed (a
+release removes them (**done in the release D cleanup, 2026-10-21**). The chart values are already removed (a
 non-target value fails the render).
 
 Each producer collapses to its new path. **Decided (Q8):** `INGEST_SINK`
@@ -1266,7 +1327,7 @@ those names.
 
 The next release drops the `api` alternative. The alert-rules tests
 (`scripts/alert-rules-tests/`) cover both names during the transition and
-only `store_` afterwards.
+only `store_` afterwards. **Done in the release D cleanup (2026-10-21).**
 
 **Prepared (2026-10-08): the rules already match both prefixes**, so the
 rename itself is a code-only change in `ds-store`. The full inventory of
@@ -1833,14 +1894,14 @@ already follow these answers.
 
 | # | Question | Decision |
 |---|---|---|
-| Q1 | `ds-store` still emits `api_*` metric names (corpus, incident removal, TRUST backlog, train reasons) from the producers' pods. Rename them or keep them? | **Rename them to `store_*` in phase 5 (5.4).** For one release, each alert takes the `or` over both names (a `(api\|store)` regex). Grafana panels change in the same release |
+| Q1 | `ds-store` still emits `api_*` metric names (corpus, incident removal, TRUST backlog, train reasons) from the producers' pods. Rename them or keep them? | **Rename them to `store_*` in phase 5 (5.4).** For one release, each alert takes the `or` over both names (a `(api\|store)` regex). Grafana panels change in the same release. *Renamed in release C; the `api` alternative dropped in the release D cleanup (2026-10-21).* |
 | Q2 | The api binaries that write (`backfill_incident_lines`, `backfill_line_train_summaries`, `replay_uidless_movements`, `backfill_trains`) cannot run as the narrowed api role. Where do they go? | **Move them out of the api image (step 5.4b)** into `ds-migrate` or writer-role maintenance tooling, so they never run with api credentials |
 | Q3 | Extend `gen-db-grants.py` so a role can hold table-level SELECT and column-level UPDATE on the same table (the enricher on `incidents`)? | **Yes**: extend `gen-db-grants.py` and `db-grants.yaml` (5.5) |
 | Q4 | Under `API_PRIVATE_ROUTES=false`, answer 404 or 410? | **A counted 404**: a fallback route that answers 404 and increments a counter (5.1) |
 | Q5 | Drop `distant_signal_app` in the narrowing release, or later? | **7 days after the narrowing**, in its own release |
 | Q6 | Should Ranma also narrow `allow-egress-same-namespace`? | **Yes, in phase 5** (5.6): Ranma narrows or removes it once every flow is accounted for |
 | Q7 | Wait for one CORPUS load on the `db` sink before starting? | **No.** Phase 5 does not wait for a real CORPUS load; the deployed config and the 2d tests are enough |
-| Q8 | After 5.3, remove `INGEST_SINK` and `*_SOURCE` at once? | **Keep them one release**, accepting only the new value and refusing `http` (and `http+shadow`) at startup with a clear error. Remove them in the next release |
+| Q8 | After 5.3, remove `INGEST_SINK` and `*_SOURCE` at once? | **Keep them one release**, accepting only the new value and refusing `http` (and `http+shadow`) at startup with a clear error. Remove them in the next release. *Removed in the release D cleanup (2026-10-21).* |
 | Q9 | Delete the caller-less routes early, outside phase 5? | **Yes, done now** (§1.2): the four GETs and the six island-of-Ireland pairs are deleted |
 | Q10 | How does local docker-compose keep working after 5.3? | **Local dev mirrors production** (step 5.3b): compose runs the ingest-writer, and the producers use the `db`/`stream` sinks against local Postgres and Redis |
 

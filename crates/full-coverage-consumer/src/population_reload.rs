@@ -94,7 +94,7 @@ impl CycleOutcome {
 }
 
 /// Where a reload cycle gets each `(line, date)` population
-/// (`POPULATION_SOURCE`, ingest architecture spec §11.1, plan 4.3). The
+/// (ingest architecture spec §11.1, plan 4.3). The
 /// cycle around it -- the rotation, the abort after
 /// [`ABORT_AFTER_FAILURES`], the carried-over snapshots, the metrics -- is
 /// the same for every source.
