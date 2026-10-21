@@ -4,7 +4,7 @@
 //! | Loop | Lock ([`common::advisory_locks`]) | Body | Interval env (default) |
 //! |---|---|---|---|
 //! | schedule-match | `SCHEDULE_MATCH_SWEEP` | [`ds_store::loops::schedule_match`] | `SCHEDULE_MATCH_INTERVAL_SECS` (300) |
-//! | reconciliation | `RECONCILIATION_SWEEP` | [`ds_store::loops::reconciliation`] | `RECONCILIATION_SWEEP_INTERVAL_SECS` (300), grace `SCHEDULE_ENRICHMENT_GRACE_MINUTES` (30) |
+//! | reconciliation | `RECONCILIATION_SWEEP` | [`ds_store::loops::reconciliation`] (also finishes trains still `en_route` two days after their service date) | `RECONCILIATION_SWEEP_INTERVAL_SECS` (300), grace `SCHEDULE_ENRICHMENT_GRACE_MINUTES` (30) |
 //! | backlog-match | `BACKLOG_MATCH_SWEEP` | [`ds_store::loops::backlog_match`] | `BACKLOG_MATCH_SWEEP_INTERVAL_SECS` (300) |
 //! | CORPUS crosswalk | `CORPUS_CROSSWALK` | [`ds_store::loops::corpus_crosswalk_comparing`] (the rebuild check, the freshness gauge, and the CORPUS comparison after each new delivery) | `INGEST_WRITER_CORPUS_CROSSWALK_INTERVAL_SECS` (600) |
 //! | train-event outbox | `TRAIN_EVENT_OUTBOX` | [`ds_store::loops::train_event_outbox`] | `INGEST_WRITER_TRAIN_EVENT_OUTBOX_INTERVAL_SECS` (5) |
