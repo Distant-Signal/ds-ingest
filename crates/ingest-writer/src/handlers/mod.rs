@@ -43,6 +43,7 @@ use crate::observed::Observed;
 pub mod island_of_ireland;
 pub mod snapshots;
 pub mod tfl;
+pub mod tfl_stops;
 pub mod tocs;
 pub mod transit;
 
@@ -168,6 +169,7 @@ pub fn registry_with(options: snapshots::Options) -> Registry {
     let mut registry = Registry::new();
     let mut registered = vec![
         registry.register(&v1("tfl-line-status"), tfl::TflLineStatus),
+        registry.register(&v1(common::tfl_stops::SCHEMA), tfl_stops::TflStops),
         registry.register(&v1("tocs"), tocs::Tocs),
         registry.register(&v1("ioi-stations"), island_of_ireland::Stations),
         registry.register(&v1("ioi-lines"), island_of_ireland::Lines),
@@ -454,6 +456,7 @@ mod tests {
                 "station-full-coverage-samples/1",
                 "station-samples/1",
                 "tfl-line-status/1",
+                "tfl-stops/1",
                 "tocs/1",
                 "transit-situations/1",
                 "transit-timetable/1",

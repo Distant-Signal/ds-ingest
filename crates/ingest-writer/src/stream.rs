@@ -101,7 +101,7 @@ impl StreamSpec {
 /// The ingest streams (spec §7.1; D1: no `train-events`). Each
 /// island-of-Ireland poller has its own stream, so its ACL user can produce
 /// only its own schemas (2026-10-08 security review, H1).
-pub const STREAMS: [StreamSpec; 8] = [
+pub const STREAMS: [StreamSpec; 9] = [
     StreamSpec {
         name: "station-samples",
         stream: streams::STATION_SAMPLES,
@@ -120,6 +120,13 @@ pub const STREAMS: [StreamSpec; 8] = [
         name: "tfl",
         stream: streams::TFL,
         schemas: &["tfl-line-status"],
+    },
+    // poller-tfl's daily stops job (TfL stop lookup, 2026-10-20), off by
+    // default.
+    StreamSpec {
+        name: "tfl-stops",
+        stream: streams::TFL_STOPS,
+        schemas: &[common::tfl_stops::SCHEMA],
     },
     StreamSpec {
         name: "reference",
@@ -515,7 +522,7 @@ mod tests {
         assert_eq!(modes, StreamModes::default());
         assert_eq!(
             modes.to_string(),
-            "station-samples:off,full-coverage:off,tfl:off,reference:off,ioi-gtfs:off,ioi-nir:off,ioi-live:off,transit-metrolink:off"
+            "station-samples:off,full-coverage:off,tfl:off,tfl-stops:off,reference:off,ioi-gtfs:off,ioi-nir:off,ioi-live:off,transit-metrolink:off"
         );
 
         let modes: StreamModes = " station-samples:apply, full-coverage : apply,tfl:off"
@@ -578,7 +585,7 @@ mod tests {
         let modes: StreamModes = "tfl:apply".parse().unwrap();
         assert_eq!(modes.uncovered(&Registry::new()), ["tfl: tfl-line-status"]);
         // Plans 3a.6 and 3c.1: every stream is covered.
-        let modes: StreamModes = "station-samples:apply,full-coverage:apply,tfl:apply,reference:apply,ioi-gtfs:apply,ioi-nir:apply,ioi-live:apply,transit-metrolink:apply"
+        let modes: StreamModes = "station-samples:apply,full-coverage:apply,tfl:apply,tfl-stops:apply,reference:apply,ioi-gtfs:apply,ioi-nir:apply,ioi-live:apply,transit-metrolink:apply"
             .parse()
             .unwrap();
         assert!(modes.uncovered(&crate::handlers::registry()).is_empty());
