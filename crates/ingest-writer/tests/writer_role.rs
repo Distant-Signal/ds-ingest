@@ -73,7 +73,7 @@ async fn every_writer_loop_runs_as_the_writer_role() {
         return;
     };
     let user = format!("writer-role-{}", rand_suffix());
-    sqlx::query("INSERT INTO users (id, email, name) VALUES ($1, $1 || '@example.com', $1)")
+    sqlx::query("INSERT INTO users (id, name) VALUES ($1, $1)")
         .bind(&user)
         .execute(&api)
         .await
