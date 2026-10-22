@@ -458,6 +458,7 @@ mod tests {
                 "tfl-line-status/1",
                 "tfl-stops/1",
                 "tocs/1",
+                "tracked-stop-boards/1",
                 "transit-situations/1",
                 "transit-timetable/1",
                 "transit-timetable-commit/1",

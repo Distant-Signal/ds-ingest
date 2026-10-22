@@ -1,5 +1,5 @@
 //! The snapshot handlers (plan 3a.6, spec §7.4 and §7.8): `station-samples/1`
-//! on `ds:ingest:station-samples`, and `full-coverage-stats/1`,
+//! and `tracked-stop-boards/1` on `ds:ingest:station-samples`, and `full-coverage-stats/1`,
 //! `full-coverage-window-stats/1` and `station-full-coverage-samples/1` on
 //! `ds:ingest:full-coverage`.
 //!
@@ -183,6 +183,10 @@ pub fn handlers(options: Options) -> Vec<(SchemaId, Arc<dyn SchemaHandler>)> {
     vec![
         (schema("station-samples"), Arc::new(station_samples())),
         (
+            schema(common::TRACKED_STOP_BOARDS_SCHEMA),
+            Arc::new(tracked_stop_boards()),
+        ),
+        (
             schema("full-coverage-stats"),
             Arc::new(full_coverage_stats()),
         ),
@@ -212,6 +216,31 @@ pub fn station_samples() -> Snapshot<StationSample> {
         write: |conn, rows, _, _| {
             Box::pin(async move {
                 samples::upsert_station_samples_on(conn, rows, Some(&STATION_SAMPLES_GUARD)).await
+            })
+        },
+        options: Options::default(),
+        rows: PhantomData,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tracked-stop-boards/1 → tracked_stop_boards, on polled_at (pre-departure
+// prediction phase 1, DS-127). poller-ldbws's tracked-stop lane sends them on
+// the station-samples stream.
+
+static TRACKED_STOP_BOARDS_GUARD: LazyLock<String> =
+    LazyLock::new(|| guard("tracked_stop_boards", "polled_at"));
+
+/// `tracked-stop-boards/1`.
+pub fn tracked_stop_boards() -> Snapshot<common::TrackedStopBoard> {
+    Snapshot {
+        source: sources::TRACKED_STOP_BOARDS,
+        observe: |row, observed| row.polled_at = observed.observed_at(Some(row.polled_at)),
+        validate: no_validation,
+        write: |conn, rows, _, _| {
+            Box::pin(async move {
+                samples::upsert_tracked_stop_boards_on(conn, rows, Some(&TRACKED_STOP_BOARDS_GUARD))
+                    .await
             })
         },
         options: Options::default(),
@@ -339,6 +368,7 @@ mod tests {
     #[test]
     fn the_guards_name_each_table_s_observed_time() {
         assert!(STATION_SAMPLES_GUARD.contains("station_samples.polled_at"));
+        assert!(TRACKED_STOP_BOARDS_GUARD.contains("tracked_stop_boards.polled_at"));
         assert!(STATION_FULL_COVERAGE_GUARD.contains("station_full_coverage_samples.resolved_at"));
         assert!(FULL_COVERAGE_STATS_GUARD.contains("full_coverage_line_stats.source_updated_at"));
         assert!(FULL_COVERAGE_WINDOW_GUARD.contains("full_coverage_line_window_stats.computed_at"));
