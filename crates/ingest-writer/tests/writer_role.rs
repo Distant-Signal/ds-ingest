@@ -236,3 +236,109 @@ async fn no_service_role_can_set_role_into_its_memberships() {
         eprintln!("no DATABASE_URL_<ROLE> set: run under test-postgres-roles.py; nothing checked");
     }
 }
+
+/// DS-144: a schedule match the writer's loops run gives the train its
+/// route and, on the same transaction, the NULL codes of the train legs
+/// and the NULL pins saved before it had one. The writer is narrow, so
+/// this needs its column grants on `journey_legs` and
+/// `train_subscriptions` (db-grants.yaml).
+#[tokio::test]
+#[ignore = "requires the per-service roles: run under scripts/test-postgres-roles.py --mode per-service"]
+async fn the_writer_fills_a_matched_route_into_routeless_legs_and_pins() {
+    let (Some(writer), Some(api)) = (
+        pool("DATABASE_URL_WRITER").await,
+        pool("DATABASE_URL_API").await,
+    ) else {
+        eprintln!(
+            "DATABASE_URL_WRITER/_API not set: run under scripts/test-postgres-roles.py \
+             --mode per-service; nothing checked"
+        );
+        return;
+    };
+    let suffix = rand_suffix();
+    let user = format!("writer-fill-{suffix}");
+    let uid = format!("WF{suffix}");
+    let date: chrono::NaiveDate = "2026-09-06".parse().unwrap();
+    sqlx::query("INSERT INTO users (id, name) VALUES ($1, $1)")
+        .bind(&user)
+        .execute(&api)
+        .await
+        .unwrap();
+    let trains_id = ds_store::trains::find_or_create_train(&api, &uid, date)
+        .await
+        .unwrap();
+    let sub: i64 = sqlx::query_scalar(
+        "INSERT INTO train_subscriptions (user_id, trains_id, service_date, resolution_status) \
+         VALUES ($1, $2, $3, 'resolved') RETURNING id",
+    )
+    .bind(&user)
+    .bind(trains_id)
+    .bind(date)
+    .fetch_one(&api)
+    .await
+    .unwrap();
+    let journey: i64 =
+        sqlx::query_scalar("INSERT INTO journeys (user_id) VALUES ($1) RETURNING id")
+            .bind(&user)
+            .fetch_one(&api)
+            .await
+            .unwrap();
+    let leg: i64 = sqlx::query_scalar(
+        "INSERT INTO journey_legs \
+             (journey_id, leg_order, service_date, train_subscription_id, match_mode) \
+         VALUES ($1, 1, $2, $3, 'manual') RETURNING id",
+    )
+    .bind(journey)
+    .bind(date)
+    .bind(sub)
+    .fetch_one(&api)
+    .await
+    .unwrap();
+
+    let departure: chrono::DateTime<chrono::Utc> = "2026-09-06T12:00:00Z".parse().unwrap();
+    ds_store::trains::find_or_create_train_with_schedule_match(
+        &writer,
+        &uid,
+        date,
+        Some("ZXA"),
+        Some(departure),
+        Some("ZXD"),
+        "line-writer-fill",
+        &serde_json::json!(["ZXA", "ZXD"]),
+        &[],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let leg_codes: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT origin_crs, destination_crs FROM journey_legs WHERE id = $1")
+            .bind(leg)
+            .fetch_one(&api)
+            .await
+            .unwrap();
+    assert_eq!(
+        leg_codes,
+        (Some("ZXA".to_string()), Some("ZXD".to_string()))
+    );
+    let pins: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT pin_origin_crs, pin_destination_crs FROM train_subscriptions WHERE id = $1",
+    )
+    .bind(sub)
+    .fetch_one(&api)
+    .await
+    .unwrap();
+    assert_eq!(pins, (Some("ZXA".to_string()), Some("ZXD".to_string())));
+
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(&user)
+        .execute(&api)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM trains WHERE id = $1")
+        .bind(trains_id)
+        .execute(&api)
+        .await
+        .unwrap();
+}
