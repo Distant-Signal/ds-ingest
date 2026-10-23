@@ -671,7 +671,7 @@ now rolls out without overlap by default:
 | Workload | Rollout | Computed per-service limit |
 |---|---|---|
 | trust-backlog-consumer, trust-consumer, full-coverage-consumer, enricher | `<component>.updateStrategy`, default `Recreate` (was the implicit surge) | (replicas + maxSurge) × pool + 1 |
-| aggregator, notifier, ingest-writer, schedulefeed (schedule-ingest, schedule-reference), every poller (stations, incidents, ldbws, ...) | fixed `Recreate`, as before | pool + 1 (writer: pool + its lock session) |
+| aggregator, notifier, ingest-writer, schedulefeed (schedule-ingest, schedule-reference), every poller (stations, incidents, ldbws, ...) | fixed `Recreate`, as before | pool + 1 (writer: pool + its lock session + 1) |
 | api | `api.strategy.type` (RollingUpdate keeps maxSurge 1, maxUnavailable 0) | (replicas + 1) × pool + 2 + the api-maintenance pool, as before |
 
 `Recreate` waits until the old pod has terminated before creating the new
