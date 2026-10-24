@@ -14,10 +14,11 @@ no grant. **Release D's small follow-ups (the alert rules' `api`
 alternative, Q1; Q8's `INGEST_SINK`/`*_SOURCE` parsing) are built
 (2026-10-21, DS-94) and ship with the next ordinary release, ahead of the
 narrowing: [Release D cleanup](#release-d-cleanup-built-2026-10-21).** Left
-after it: **5.5**, blocked in production on phase 0b (the
-api, aggregator, enricher and notifier still connect as
-`distant_signal_app`; see [5.5 status](#55-status-2026-10-14-blocked-on-phase-0b)),
-then the `app` drop; and Ranma's `allow-egress-same-namespace` (5.6). The earlier prep that changed no
+after it: **5.5**. Phase 0b is done (the four services connect as their
+own roles since 2026-10-21); the narrowing's code prerequisites are built
+(2026-10-23, DS-118) and its steps start 2026-10-28:
+[Release D (narrowing)](#release-d-narrowing-prepared-2026-10-23-ds-118).
+Then the `app` drop; and Ranma's `allow-egress-same-namespace` (5.6). The earlier prep that changed no
 default (batch 53, 2026-10-08) was 5.1's
 `API_PRIVATE_ROUTES` fallback (routes stay on), Q1's dual-prefix alert
 rules, 5.4b's new backfill entry points (the api binaries stay, deprecated),
@@ -50,6 +51,7 @@ caller-less routes (Q9) have been deleted ahead of phase 5 (§1.1).
 
 ## Contents
 
+- [Release D (narrowing): prepared 2026-10-23 (DS-118)](#release-d-narrowing-prepared-2026-10-23-ds-118)
 - [Release D cleanup: built 2026-10-21](#release-d-cleanup-built-2026-10-21)
 - [Release C (phase 5): built 2026-10-14](#release-c-phase-5-built-2026-10-14)
 - [5.5 status (2026-10-14): blocked on phase 0b](#55-status-2026-10-14-blocked-on-phase-0b)
@@ -60,6 +62,207 @@ caller-less routes (Q9) have been deleted ahead of phase 5 (§1.1).
 3. [The api's Redis client (5.4)](#3-the-apis-redis-client-54)
 4. [Final grants (5.5) and NetworkPolicies (5.6)](#4-final-grants-55-and-networkpolicies-56)
 5. [Risks and decisions](#5-risks-and-decisions)
+
+## Release D (narrowing): prepared 2026-10-23 (DS-118)
+
+Release D narrows the api, aggregator, enricher and notifier roles (5.5
+step 3): `status: narrow` in `db-grants.yaml`, so each one leaves
+`distant_signal_app` and keeps only its own grants. The 7-day phase 0b
+soak ends **2026-10-28 07:58 UTC** (the DS-102 connect flips finished
+2026-10-21 07:58). This section records what the code needed first, and the
+exact steps for the 28th.
+
+### The audit (2026-10-23)
+
+Two sources. First, every non-test write the four services can make,
+including those reached through `ds_store`, read against their
+`db-grants.yaml` rows. Second, their DB suites run with the four roles
+narrowed: `scripts/test-postgres-roles.py --mode per-service --narrow
+api,aggregator,enricher,notifier`, a new flag that renders the narrowing
+into a scratch `postgres-grants.sql`.
+
+Almost every failure of that run was a test fixture written through the
+role's own pool:
+
+| Suite | Failed |
+|---|---|
+| api | 374 |
+| ds-store (as the api) | 121 |
+| aggregator | 32 |
+| notifier | 55 |
+| enricher | 17 |
+
+The gaps in production code:
+
+1. **api: the backlog replay wrote the shared train state.** The api holds
+   only `S` on `train_movement_events` and `train_current_state`.
+   - What: `replay_backlog_history`'s `INSERT INTO train_movement_events`
+     and its `INSERT … ON CONFLICT DO UPDATE` of `train_current_state`
+     (`ds_store::tracking::upsert_train_event`), plus their sequences.
+   - Called by `attempt_backlog_match` / `attempt_backlog_match_by_uid` on:
+     - `POST /Train/track` and `POST /Journeys` (pin legs);
+     - `enrich_shared_train`, which runs on `POST /Train/by-uid/…/track`,
+       on known-train journey legs, on the leg-train route and on
+       `/Journeys/itinerary`.
+2. **api: the completion check updated `train_current_state`** (DS-125).
+   - After the replay:
+     `complete_subscription_train_on_known_destination_arrival`.
+   - After every schedule match:
+     `find_or_create_train_with_schedule_match` called
+     `complete_on_known_destination_arrival`. So every schedule-match route
+     was affected, the read-triggered `GET /Train/by-uid/{uid}/{date}` too.
+3. **aggregator: its archive's row lock on `trains`.**
+   - What: `SELECT … FOR UPDATE OF t` (`archive.rs` `delete_batch`, and the
+     `archive_and_prune_trains` path).
+   - Postgres needs `UPDATE` on at least one column for any row lock.
+     `DELETE` is not enough, which was checked against Postgres 16, and the
+     aggregator held only `SD`. The `db-grants.yaml` comment said
+     otherwise.
+4. **api: the background loops** (`API_BACKGROUND_LOOPS`).
+   - They write the shared train state, the outbox, `notifier_forward_queue`
+     and the CORPUS crosswalk.
+   - They are off in production (`api.backgroundLoops: false` since 1B),
+     and they must stay off with a narrowed api: the writer runs them.
+
+The rest is within the grants:
+
+- **The api's direct SQL** writes only its personal tables and
+  `tfl_arrivals_cache`. That includes the maintenance CronJob and the
+  journey break sweep.
+- **The api's ds_store writes on `trains`, legs and subscriptions**:
+  `find_or_create_train`, the schedule match's `trains` route columns,
+  `fill_route_into_subscribers`, `mark_train_resolved` and
+  `bind_subscription_unless_other_train`. The api's `trains SIUD` and
+  personal grants cover them.
+- **The enricher**: its five `incidents` columns and
+  `enricher_llm_batches`.
+- **The notifier**: its state tables, the template sweep, the auto-match
+  (`trains` SIU, the `train_subscriptions` columns, legs) and
+  `journey_breaks` (`notified_at`, `notified_severity`).
+
+### The fixes (DS-118, built 2026-10-23)
+
+- **The api's replay goes to the writer.** It uses the existing
+  train-event outbox, the path trust-consumer's subscription-changing
+  events already take.
+  - `ds_store::backlog::matching::ReplayWrite::Outbox` queues the derived
+    events, in order and in one transaction, in `train_event_outbox`.
+  - The writer's `train_event_outbox` loop (5 s) applies them with the
+    same `upsert_train_event_on`, then completes the subscription's train
+    if its last event is the arrival at its known destination.
+  - The api's track routes use `attempt_backlog_match_via` /
+    `attempt_backlog_match_by_uid_via` with `Outbox`. The writer's
+    backlog-match sweep still writes directly (`Direct`).
+  - Grant: the api gets `INSERT` on `train_event_outbox (tracked_train_id,
+    dedup_key, event)` (with its sequence). Its existing `SELECT` covers the
+    `ON CONFLICT` target.
+  - While trust-consumer sees a pending row for the subscription, it queues
+    that subscription's live events behind it, so the order is kept.
+- **The schedule match no longer completes the train itself.**
+  `complete_tracked_trains_on_known_destination_arrival` runs instead. It
+  is one set-based `UPDATE` over the tracked trains of service dates the
+  stale-`en_route` net has not reached yet, and the writer runs it after
+  its schedule-match sweep's matches and on every reconciliation tick
+  (5 min).
+- **The aggregator** gets `UPDATE (id)` on `trains`. It never sets `id`,
+  so the grant is no wider than the `DELETE` it already holds. It covers
+  the archive's row lock.
+- **The api's own loop runner** registers the outbox loop too, under the
+  writer's advisory lock. An install with `API_BACKGROUND_LOOPS` on and no
+  writer loops (the chart default) therefore still applies the api's
+  replays. That needs the api's role observed.
+
+What the user sees:
+
+- `POST /Train/track` still answers `schedule_matched` from its synchronous
+  schedule match, which writes only `trains`, legs and subscriptions.
+- `enrich_shared_train` still schedule-matches in the request, from the
+  replay's origin departure, which it reads from the backlog itself.
+- The replayed movement history, the `resolved` status and the
+  completion appear when the outbox loop applies them, at most one tick
+  (5 s) later. Before, they appeared in the same request.
+- A schedule match the api makes after a terminus `ARRIVAL` was already
+  stored (no replay involved) now completes on the next reconciliation
+  tick instead of at once.
+
+**CI** (`ci.yml`, "Release D's narrowed roles"): `--narrow
+api,aggregator,enricher,notifier` runs these as the narrowed roles, with
+fixtures written as the owner:
+
+- `ds-store`'s `the_api_queues_its_replay_for_the_writer`. With the api
+  narrowed (`DS_TEST_NARROWED_ROLES`), it also checks that a direct replay
+  and the completion `UPDATE` are refused (42501).
+- The api's `post_track_by_uid_backfills_schedule_and_movement_data_from_the_backlog`,
+  end to end through the router, then the outbox applied as the writer.
+- The aggregator's `archive::tests`.
+
+`scripts/tests/test_postgres_roles_narrow.py` pins the rendering.
+
+### Steps
+
+Before the 28th (code; no grant changes):
+
+1. **Ship DS-118** in an ordinary release. It changes no grant that takes
+   effect while the roles are observed, and it needs nothing from Ranma.
+   - Check it reached prod: within 5 s of a by-uid track of a train that
+     has already run, `train_event_outbox` holds and then drains rows for
+     that subscription.
+   - `DistantSignalTrainEventOutboxStuck` stays quiet.
+
+On or after **2026-10-28 07:58 UTC**:
+
+2. **Ranma: the role-usage report** (read-only), per 5.5 step 2:
+   `observe-role-usage.py --from-file`, with the `kubectl exec … psql`
+   capture in its docstring.
+   - Expected "used, not granted": the api's `train_movement_events` I and
+     `train_current_state` I/U, from before DS-118 was deployed
+     (`pg_stat_statements` counts accumulate since the 2026-10-03 reset).
+   - Confirm those `calls` stop growing: take two captures a few hours
+     apart, both after the deploy.
+   - The aggregator's `trains` U (its row lock) is granted from DS-118 on.
+   - Anything else listed there is a new gap. Fix it in DS before step 3.
+3. **DS: the release D change**, one PR:
+   - `status: narrow`, `phase: "5"` for `api`, `aggregator`, `enricher` and
+     `notifier` in `db-grants.yaml` (§4.1's diff, without the writer, which
+     is narrow already);
+   - `uv run scripts/gen-db-grants.py render`;
+   - in `ci.yml`'s per-service step, `--observe
+     api,aggregator,enricher,notifier`, until their suites write fixtures as
+     the owner. The narrowed step keeps proving their runtime paths;
+   - CI green: the narrowed step, the per-service step, and `gen-db-grants.py
+     check` against the migrated database.
+4. **Ranma: release the chart** with it, at any hour.
+   - The pre-upgrade setup Job revokes the four memberships and grants
+     their own rows. No pod restarts.
+   - Prerequisites, already true in Ranma-Config `4fb1bc2` (2026-10-23):
+     `api.backgroundLoops: false`, `ingestWriter.loops.enabled: true`,
+     `apiMaintenance.enabled: true` and `perService.<svc>.connect: true`
+     for all four. **Do not set `api.backgroundLoops: true` while the api
+     is narrow.**
+5. **Ranma: check, then watch for 7 days.**
+   - psql as each role. The negative checks in "Ranma, two releases"
+     below, plus these:
+     - as the api, `INSERT INTO train_movement_events (trains_id) SELECT 1
+       WHERE false` and `UPDATE train_current_state SET status = status
+       WHERE false` must fail;
+     - as the aggregator, `SELECT id FROM trains LIMIT 0 FOR UPDATE` must
+       succeed, while `UPDATE trains SET origin_crs = origin_crs WHERE
+       false` must fail.
+   - For 7 days:
+     - `kubectl logs` of the four services for SQLSTATE 42501;
+     - `DistantSignalTrainEventOutboxStuck` and
+       `DistantSignalDbRoleNearConnectionLimit` quiet;
+     - a by-uid track of a train that has already run still shows its
+       history within seconds.
+   - Then remove the interim `connectionLimit` overrides (DS-97) once the
+     per-role counts are confirmed.
+6. **Release E** (Q5), 7 days after step 4: drop `distant_signal_app`, as
+   5.5 step 4 below describes.
+
+**Rollback** of step 4: re-release the previous `db-grants.yaml` (the four
+roles `observed`). The setup Job re-grants the memberships idempotently;
+nothing restarts. DS-118's code is safe either way: the outbox path also
+works for an observed api.
 
 ## Release D cleanup: built 2026-10-21
 
@@ -1484,6 +1687,11 @@ blind would turn the first `connect: true` into a permission failure. So
 3. **Release D (narrowing):** `status: narrow` for api, aggregator,
    enricher and notifier in `db-grants.yaml`, the regenerated
    `postgres-grants.sql`, and **the per-service test suites ported first**.
+   (2026-10-23, DS-118: the audit, the code fixes and the exact steps are in
+   [Release D (narrowing)](#release-d-narrowing-prepared-2026-10-23-ds-118).
+   Instead of porting every suite first, CI's narrowed step runs the
+   runtime paths as the narrowed roles, and the full suites run with
+   `--observe` until their fixtures move to the owner.)
    A local run with the four roles narrowed (2026-10-14) failed 312 api
    and 114 ds-store DB tests (run as the api role), almost all of them
    because the tests seed fixtures (incidents, stations, samples, schedule
