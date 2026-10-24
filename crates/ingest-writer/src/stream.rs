@@ -122,12 +122,12 @@ pub const STREAMS: [StreamSpec; 9] = [
         stream: streams::TFL,
         schemas: &["tfl-line-status"],
     },
-    // poller-tfl's daily stops job (TfL stop lookup, 2026-10-20), off by
-    // default.
+    // poller-tfl's daily stops job (TfL stop lookup, 2026-10-20) and its
+    // route-sequences job (DS-151), both off by default.
     StreamSpec {
         name: "tfl-stops",
         stream: streams::TFL_STOPS,
-        schemas: &[common::tfl_stops::SCHEMA],
+        schemas: &[common::tfl_stops::SCHEMA, common::tfl_routes::SCHEMA],
     },
     StreamSpec {
         name: "reference",
