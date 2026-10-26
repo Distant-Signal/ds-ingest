@@ -3,10 +3,11 @@
 //! pattern, `trips` trips in two parts, today's service, one rail link)
 //! and the database handles.
 //!
-//! The feeds are network `metrolink`, the one transit network this build
-//! knows: under the writer's own role, its `ingest_freshness` row policy
-//! admits only `transit-metrolink-*` sources. The tests clean every
-//! metrolink row up through `MIGRATION_DATABASE_URL` (the owner, under
+//! The feeds are network `metrolink` unless retargeted
+//! ([`Feed::on_network`], [`Db::for_network`]; Nottingham NET's `net`):
+//! under the writer's own role, its `ingest_freshness` row policy admits
+//! only the compiled-in networks' `transit-<network>-*` sources. The tests
+//! clean the network's rows up through `MIGRATION_DATABASE_URL` (the owner, under
 //! scripts/test-postgres-roles.py), since the writer may not delete
 //! `transit_networks` or freshness rows. So run them on a test database
 //! only, with `--test-threads=1`.
@@ -199,16 +200,36 @@ impl Feed {
         };
         Self { parts, commit }
     }
+
+    /// The same feed as network `network`'s (its parts and commit name
+    /// it; the rows are unchanged, which the writer does not check against
+    /// a network).
+    #[allow(dead_code, reason = "used by transit_handlers.rs only")]
+    pub(crate) fn on_network(mut self, network: &str) -> Self {
+        let id = NetworkId::parse(network).unwrap();
+        for (part, _) in &mut self.parts {
+            part.network = id.clone();
+        }
+        self.commit.network = id;
+        self
+    }
 }
 
 pub(crate) struct Db {
     pub(crate) pool: PgPool,
     /// Cleanup as the owner (`MIGRATION_DATABASE_URL`) when set.
     pub(crate) admin: PgPool,
+    /// The network whose rows this handle reads and cleans up.
+    pub(crate) network: &'static str,
 }
 
 impl Db {
     pub(crate) async fn new() -> Self {
+        Self::for_network(NETWORK).await
+    }
+
+    /// A handle for `network`'s rows (cleaned up first).
+    pub(crate) async fn for_network(network: &'static str) -> Self {
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(2)
@@ -223,12 +244,16 @@ impl Db {
                 .expect("connect MIGRATION_DATABASE_URL"),
             Err(_) => pool.clone(),
         };
-        let db = Self { pool, admin };
+        let db = Self {
+            pool,
+            admin,
+            network,
+        };
         db.cleanup().await;
         db
     }
 
-    /// Deletes every metrolink row (and the test dedup keys).
+    /// Deletes every row of the network (and the test dedup keys).
     pub(crate) async fn cleanup(&self) {
         for sql in [
             "DELETE FROM transit_feed_versions WHERE network = $1",
@@ -242,7 +267,7 @@ impl Db {
             "DELETE FROM ingest_dedup WHERE key LIKE '%transit-test-%' AND $1 <> ''",
         ] {
             sqlx::query(sql)
-                .bind(NETWORK)
+                .bind(self.network)
                 .execute(&self.admin)
                 .await
                 .unwrap_or_else(|err| panic!("{sql}: {err}"));
@@ -254,7 +279,7 @@ impl Db {
         sqlx::query_as(
             "SELECT active_feed_version, activated_at FROM transit_networks WHERE network = $1",
         )
-        .bind(NETWORK)
+        .bind(self.network)
         .fetch_optional(&self.pool)
         .await
         .unwrap()
@@ -265,7 +290,7 @@ impl Db {
         sqlx::query_as(
             "SELECT feed_version, state FROM transit_feed_versions WHERE network = $1 ORDER BY 1",
         )
-        .bind(NETWORK)
+        .bind(self.network)
         .fetch_all(&self.pool)
         .await
         .unwrap()
@@ -276,7 +301,7 @@ impl Db {
         sqlx::query_scalar(
             "SELECT count(*) FROM transit_trips WHERE network = $1 AND feed_version = $2",
         )
-        .bind(NETWORK)
+        .bind(self.network)
         .bind(version)
         .fetch_one(&self.pool)
         .await
@@ -285,8 +310,9 @@ impl Db {
 
     pub(crate) async fn freshness(&self) -> Option<DateTime<Utc>> {
         sqlx::query_scalar(
-            "SELECT fetched_at FROM ingest_freshness WHERE source = 'transit-metrolink-timetable'",
+            "SELECT fetched_at FROM ingest_freshness WHERE source = 'transit-' || $1 || '-timetable'",
         )
+        .bind(self.network)
         .fetch_optional(&self.pool)
         .await
         .unwrap()

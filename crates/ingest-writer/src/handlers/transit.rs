@@ -369,7 +369,23 @@ mod tests {
             stream_network(streams::TRANSIT_METROLINK),
             Some(NetworkId::parse("metrolink").unwrap())
         );
-        assert_eq!(stream_network("ds:ingest:transit-net"), None);
+        // Nottingham NET (NET design §7) is compiled in; an unknown
+        // network's stream carries none.
+        assert_eq!(
+            stream_network(streams::TRANSIT_NET),
+            Some(NetworkId::parse("net").unwrap())
+        );
+        assert_eq!(stream_network("ds:ingest:transit-supertram"), None);
+        assert!(poisoned(
+            pin_network(
+                &entry(
+                    streams::TRANSIT_NET,
+                    &part("metrolink", TimetableRows::Stops(vec![]))
+                ),
+                &NetworkId::parse("metrolink").unwrap()
+            ),
+            NETWORK_NOT_FOR_STREAM
+        ));
         assert_eq!(stream_network(streams::TFL), None);
         let metrolink = part("metrolink", TimetableRows::Stops(vec![stop("9400ZZMAPIC")]));
         let other = part("net", TimetableRows::Stops(vec![stop("9400ZZMAPIC")]));

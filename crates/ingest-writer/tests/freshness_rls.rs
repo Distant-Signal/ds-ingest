@@ -99,6 +99,10 @@ fn transit_sources() -> Vec<String> {
         })
         .collect();
     assert!(sources.contains(&"transit-metrolink-situations".to_owned()));
+    // Nottingham NET (NET design §8): both sources, though only the
+    // timetable has a producer today.
+    assert!(sources.contains(&"transit-net-timetable".to_owned()));
+    assert!(sources.contains(&"transit-net-situations".to_owned()));
     sources
 }
 
