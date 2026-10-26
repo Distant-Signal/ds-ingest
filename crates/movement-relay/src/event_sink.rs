@@ -414,6 +414,7 @@ mod tests {
             .map(|arg| match arg {
                 redis::Arg::Simple(bytes) => String::from_utf8(bytes.to_vec()).unwrap(),
                 redis::Arg::Cursor => "<cursor>".to_string(),
+                _ => "<arg>".to_string(),
             })
             .collect()
     }
@@ -524,7 +525,7 @@ mod tests {
                 .keys
                 .into_iter()
                 .flat_map(|k| k.ids)
-                .map(|id| redis::from_redis_value::<String>(&id.map["payload"]).unwrap())
+                .map(|id| redis::from_redis_value_ref::<String>(&id.map["payload"]).unwrap())
                 .collect()
         }
 

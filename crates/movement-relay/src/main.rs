@@ -669,11 +669,11 @@ async fn group_info_field(
         let mut value: Option<i64> = None;
         let mut it = fields.into_iter();
         while let (Some(k), Some(v)) = (it.next(), it.next()) {
-            let k: String = redis::from_redis_value(&k)?;
+            let k: String = redis::from_redis_value(k)?;
             if k == "name" {
-                name = redis::from_redis_value(&v).ok();
+                name = redis::from_redis_value(v).ok();
             } else if k == field {
-                value = redis::from_redis_value(&v).ok();
+                value = redis::from_redis_value(v).ok();
             }
         }
         if name.as_deref() == Some(group) {

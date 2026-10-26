@@ -39,7 +39,7 @@ health-http = { path = "../health-http" }
 ingest-stream = { path = "../ingest-stream" }
 # The writer's own gauges (`telemetry`: ingest_freshness).
 metrics = "0.24"
-redis ={ version = "0.27", features = ["tokio-comp", "connection-manager"] }
+redis ={ version = "1.8", features = ["tokio-comp", "connection-manager"] }
 serde = { version = "1.0.228", features = ["derive"] }
 # `raw_value`: the payload of rejected rows for the dead-letter stream.
 serde_json = { version = "1.0.149", features = ["raw_value"] }

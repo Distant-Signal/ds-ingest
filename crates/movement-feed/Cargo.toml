@@ -13,7 +13,7 @@ clap = { version = "4.6.6", features = ["derive"] }
 common = { path = "../common", features = ["redis"] }
 health-http = { path = "../health-http" }
 metrics = "0.24"
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.8", features = ["tokio-comp", "connection-manager"] }
 tracing = "0.1.44"
 
 [dev-dependencies]

@@ -781,7 +781,7 @@ fn split_deliverable_and_malformed(
         if let Some(payload) = entry
             .map
             .get("payload")
-            .and_then(|v| redis::from_redis_value::<String>(v).ok())
+            .and_then(|v| redis::from_redis_value_ref::<String>(v).ok())
         {
             entries.push((entry.id, payload));
         } else {
@@ -789,8 +789,8 @@ fn split_deliverable_and_malformed(
                 .map
                 .iter()
                 .map(|(k, v)| {
-                    let v =
-                        redis::from_redis_value::<String>(v).unwrap_or_else(|_| format!("{v:?}"));
+                    let v = redis::from_redis_value_ref::<String>(v)
+                        .unwrap_or_else(|_| format!("{v:?}"));
                     format!("{k}={v}")
                 })
                 .collect();
@@ -1438,7 +1438,7 @@ fn flat_fields(
     let mut map = std::collections::HashMap::new();
     let mut it = values.iter();
     while let (Some(k), Some(v)) = (it.next(), it.next()) {
-        let k: String = redis::from_redis_value(k)?;
+        let k: String = redis::from_redis_value_ref(k)?;
         map.insert(k, v.clone());
     }
     Ok(map)
@@ -1456,7 +1456,7 @@ fn find_group_fields(
             redis::Value::Map(pairs) => {
                 let mut map = std::collections::HashMap::new();
                 for (k, v) in pairs {
-                    map.insert(redis::from_redis_value::<String>(k)?, v.clone());
+                    map.insert(redis::from_redis_value_ref::<String>(k)?, v.clone());
                 }
                 map
             }
@@ -1464,7 +1464,7 @@ fn find_group_fields(
         };
         let name: Option<String> = fields
             .get("name")
-            .and_then(|v| redis::from_redis_value(v).ok());
+            .and_then(|v| redis::from_redis_value_ref(v).ok());
         if name.as_deref() == Some(group) {
             return Ok(Some(fields));
         }
@@ -1473,11 +1473,11 @@ fn find_group_fields(
 }
 
 fn optional_string(value: &redis::Value) -> anyhow::Result<Option<String>> {
-    Ok(redis::from_redis_value::<Option<String>>(value)?)
+    Ok(redis::from_redis_value_ref::<Option<String>>(value)?)
 }
 
 fn optional_u64(value: &redis::Value) -> anyhow::Result<Option<u64>> {
-    Ok(redis::from_redis_value::<Option<u64>>(value)?)
+    Ok(redis::from_redis_value_ref::<Option<u64>>(value)?)
 }
 
 /// `XINFO STREAM`'s reply is itself a flat array of alternating field
@@ -1488,7 +1488,7 @@ fn optional_u64(value: &redis::Value) -> anyhow::Result<Option<u64>> {
 fn find_stream_first_entry_id(stream_info: &[redis::Value]) -> anyhow::Result<Option<String>> {
     let mut it = stream_info.iter();
     while let (Some(k), Some(v)) = (it.next(), it.next()) {
-        let k: String = redis::from_redis_value(k)?;
+        let k: String = redis::from_redis_value_ref(k)?;
         if k != "first-entry" {
             continue;
         }
@@ -1498,7 +1498,7 @@ fn find_stream_first_entry_id(stream_info: &[redis::Value]) -> anyhow::Result<Op
         let Some(id_value) = entry.first() else {
             return Ok(None);
         };
-        let id: String = redis::from_redis_value(id_value)?;
+        let id: String = redis::from_redis_value_ref(id_value)?;
         return Ok(Some(id));
     }
     Ok(None)
@@ -1530,6 +1530,7 @@ mod split_deliverable_and_malformed_tests {
         redis::streams::StreamId {
             id: id.to_string(),
             map,
+            ..Default::default()
         }
     }
 
@@ -1764,7 +1765,7 @@ mod restore_group_position_tests {
     #[tokio::test]
     async fn an_unreachable_redis_leaves_the_check_for_the_next_read() {
         let mut conn = FakeConn::new([Err(redis::RedisError::from((
-            redis::ErrorKind::IoError,
+            redis::ErrorKind::Io,
             "connection refused",
         )))]);
         let mut last = Some("250-1".to_string());
@@ -1969,7 +1970,7 @@ mod redis_tests {
                 entry
                     .map
                     .iter()
-                    .map(|(k, v)| (k.clone(), redis::from_redis_value(v).unwrap()))
+                    .map(|(k, v)| (k.clone(), redis::from_redis_value_ref(v).unwrap()))
                     .collect()
             })
             .collect()
@@ -3215,7 +3216,7 @@ mod outage_tests {
     }
 
     fn upstream_addr() -> String {
-        match direct_redis_url().into_connection_info().unwrap().addr {
+        match direct_redis_url().into_connection_info().unwrap().addr() {
             redis::ConnectionAddr::Tcp(host, port) => format!("{host}:{port}"),
             other => panic!("this test needs a TCP REDIS_URL, got {other:?}"),
         }
