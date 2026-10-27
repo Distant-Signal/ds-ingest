@@ -971,6 +971,7 @@ mod deliver_batch_tests {
             delay_minutes: None,
             dedup_key: dedup_key.to_string(),
             gbtt_timestamp: None,
+            platform: None,
         }
     }
 

@@ -417,6 +417,8 @@ mod tests {
             toc_id: None,
             variation_status: Some(status.to_string()),
             timetable_variation: Some(variation.to_string()),
+            event_source: None,
+            platform: None,
         }
     }
 

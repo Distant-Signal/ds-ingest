@@ -282,6 +282,8 @@ mod tests {
             toc_id: None,
             variation_status: Some("ON TIME".to_string()),
             timetable_variation: None,
+            event_source: None,
+            platform: None,
         }
     }
 

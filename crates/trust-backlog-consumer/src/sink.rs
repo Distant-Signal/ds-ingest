@@ -189,6 +189,7 @@ mod db_tests {
             delay_minutes: None,
             dedup_key: format!("{tag}-{key}"),
             gbtt_timestamp: None,
+            platform: None,
         }
     }
 
