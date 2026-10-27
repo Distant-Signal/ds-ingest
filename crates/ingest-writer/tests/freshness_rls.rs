@@ -106,6 +106,97 @@ fn transit_sources() -> Vec<String> {
     sources
 }
 
+/// Every source the writer records (`ds_store::freshness::record_ingest`
+/// from its handlers). A new one belongs here (the `sources::ALL` lists
+/// join automatically) and in db-grants.yaml's writer allow-list.
+fn writer_sources() -> Vec<String> {
+    let sources: Vec<String> = [
+        "tfl",
+        "tocs",
+        common::tfl_stops::FRESHNESS_SOURCE,
+        common::tfl_routes::FRESHNESS_SOURCE,
+    ]
+    .into_iter()
+    .chain(ds_store::samples::sources::ALL.iter().copied())
+    .chain(
+        ds_store::samples::island_of_ireland::sources::ALL
+            .iter()
+            .copied(),
+    )
+    .map(str::to_owned)
+    .chain(transit_sources())
+    .collect();
+    // The tracked-stop-boards/1 handler records it after applying the rows
+    // (DS-127); without it every tracked-stop entry dead-letters.
+    assert!(sources.contains(&ds_store::samples::sources::TRACKED_STOP_BOARDS.to_owned()));
+    sources
+}
+
+/// `role`'s `ingest_freshness` `command` row policy expression in the
+/// rendered postgres-grants.sql: the row policies' `VALUES` rows carry an
+/// expression, unlike the column grants' rows (`''` there).
+fn rendered_policy<'a>(sql: &'a str, role: &str, command: &str) -> &'a str {
+    let key = format!("('ingest_freshness', '{role}', '{command}', '");
+    sql.lines()
+        .filter_map(|line| line.trim_start().strip_prefix(key.as_str()))
+        .find(|rest| !rest.starts_with('\''))
+        .unwrap_or_else(|| panic!("no {role} {command} row policy on ingest_freshness"))
+}
+
+/// Without a database: every source each producer records is in its
+/// RESTRICTIVE allow-list as rendered from db-grants.yaml (the file the
+/// grants job applies; `gen-db-grants.py check` keeps it in step), so a
+/// new source cannot ship without its grant.
+#[test]
+fn each_producer_records_only_allow_listed_sources() {
+    let sql = include_str!("../../../charts/distant-signal/files/postgres-grants.sql");
+    let producers = [
+        ("writer", writer_sources()),
+        ("stations", vec!["stations".to_owned()]),
+        ("incidents", vec!["incidents".to_owned()]),
+    ];
+    for (role, sources) in producers {
+        for command in ["INSERT", "UPDATE"] {
+            let policy = rendered_policy(sql, role, command);
+            for source in &sources {
+                assert!(
+                    policy.contains(&format!("''{source}''")),
+                    "{role} records {source:?} but its ingest_freshness {command} \
+                     policy (db-grants.yaml row_policies) does not allow it"
+                );
+            }
+        }
+    }
+}
+
+/// The writer may record `tracked-stop-boards`: the tracked-stop-boards/1
+/// handler does after applying each entry's rows, and a refusal (42501,
+/// Poison) dead-letters every tracked-stop part.
+#[tokio::test]
+#[ignore = "requires the per-service roles: run under scripts/test-postgres-roles.py --mode per-service"]
+async fn the_writer_records_tracked_stop_boards() {
+    let Some(writer) = pool("DATABASE_URL_WRITER").await else {
+        eprintln!(
+            "DATABASE_URL_WRITER not set: run under scripts/test-postgres-roles.py \
+             --mode per-service; nothing checked"
+        );
+        return;
+    };
+    // Twice in one transaction: the insert, then the upsert onto its row.
+    // Rolled back, so the real row never moves.
+    let mut tx = writer.begin().await.unwrap();
+    for _ in 0..2 {
+        ds_store::freshness::record_ingest(
+            &mut tx,
+            ds_store::samples::sources::TRACKED_STOP_BOARDS,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    tx.rollback().await.unwrap();
+}
+
 #[tokio::test]
 #[ignore = "requires the per-service roles: run under scripts/test-postgres-roles.py --mode per-service"]
 async fn each_producer_writes_only_its_own_freshness_rows() {
@@ -144,24 +235,8 @@ async fn each_producer_writes_only_its_own_freshness_rows() {
     tx.commit().await.unwrap();
 
     // Each narrow role: its own source(s) succeed ...
-    let transit = transit_sources();
-    let writer_sources: Vec<&str> = [
-        "tfl",
-        "tocs",
-        common::tfl_stops::FRESHNESS_SOURCE,
-        common::tfl_routes::FRESHNESS_SOURCE,
-        ds_store::samples::sources::STATION_SAMPLES,
-        ds_store::samples::sources::FULL_COVERAGE_STATS,
-        ds_store::samples::sources::FULL_COVERAGE_WINDOW_STATS,
-        ds_store::samples::sources::STATION_FULL_COVERAGE_SAMPLES,
-        ds_store::samples::island_of_ireland::sources::STATIONS_GTFS,
-        ds_store::samples::island_of_ireland::sources::LINES_GTFS,
-        ds_store::samples::island_of_ireland::sources::STATIONS_NIR,
-        ds_store::samples::island_of_ireland::sources::LINES_NIR,
-    ]
-    .into_iter()
-    .chain(transit.iter().map(String::as_str))
-    .collect();
+    let writer_sources = writer_sources();
+    let writer_sources: Vec<&str> = writer_sources.iter().map(String::as_str).collect();
     let own: [(&str, &PgPool, &[&str]); 3] = [
         ("stations", &stations, &["stations"]),
         ("incidents", &incidents, &["incidents"]),

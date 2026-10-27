@@ -1,4 +1,4 @@
-//! The four snapshot handlers against a live database (plan 3a.6), through
+//! The snapshot handlers against a live database (plan 3a.6), through
 //! [`WriterHandler`] in `apply` mode with the real registry. One test per
 //! handler, each checking:
 //!
@@ -26,6 +26,7 @@ use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use common::{
     FullCoverageLineStatsRow, FullCoverageWindowCounts, FullCoverageWindowKind,
     FullCoverageWindowStatsRow, SampleStats, StationFullCoverageSample, StationSample,
+    TrackedStopBoard,
 };
 use ingest_stream::{Envelope, Handled, Handler, HandlerError, SchemaId, StreamEntry};
 use ingest_writer::handlers::registry;
@@ -275,6 +276,78 @@ async fn station_samples_apply_once_in_order_clamped_with_freshness() {
         "ZQA,ZQB",
     )
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// tracked-stop-boards/1 (DS-127), on the station-samples stream
+
+type TrackedRow = (DateTime<Utc>, serde_json::Value);
+
+async fn tracked_rows(pool: &PgPool, train_uid: &str) -> Vec<TrackedRow> {
+    sqlx::query_as(
+        "SELECT polled_at, departures FROM tracked_stop_boards WHERE train_uid = $1 ORDER BY crs",
+    )
+    .bind(train_uid)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+fn tracked_board(train_uid: &str, polled_at: DateTime<Utc>, delay: &str) -> TrackedStopBoard {
+    TrackedStopBoard {
+        train_uid: train_uid.to_owned(),
+        service_date: NaiveDate::from_ymd_opt(2026, 10, 26).unwrap(),
+        crs: "ZQA".to_owned(),
+        polled_at,
+        departures: station_sample("ZQA", polled_at, delay).departures,
+    }
+}
+
+/// The handler applies the rows and records `tracked-stop-boards`
+/// freshness in one transaction. As the writer role, a freshness source
+/// missing from its RLS allow-list fails that with 42501 (Poison), so every
+/// tracked-stop entry dead-letters (db-grants.yaml `row_policies`).
+#[tokio::test]
+#[ignore = "requires a live database; run with DATABASE_URL set and --ignored"]
+async fn tracked_stop_boards_apply_once_in_order_with_freshness() {
+    let db = Db::new().await;
+    let source = ds_store::samples::sources::TRACKED_STOP_BOARDS;
+    let schema = common::TRACKED_STOP_BOARDS_SCHEMA;
+    // A train uid of this run's own: no earlier rows to move back.
+    let uid = format!("Z{}", &db.run[..5]);
+    db.reset_freshness(source).await;
+
+    let t1 = now_ms() - TimeDelta::minutes(10);
+    let entry = db.entry(SAMPLES, schema, "t1", t1, &[tracked_board(&uid, t1, "1")]);
+    let applied = db.apply(&entry).await;
+    assert!(matches!(applied, Ok(Handled::Applied)), "{applied:?}");
+    assert!(matches!(db.apply(&entry).await, Ok(Handled::Duplicate)));
+    let rows = tracked_rows(&db.pool, &uid).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, t1);
+    assert_eq!(db.freshness(source).await, Some(t1));
+
+    // A newer board, then an older one applied late: no change, and
+    // freshness stays at the newer produced_at.
+    let t2 = t1 + TimeDelta::minutes(5);
+    let newer = db.entry(SAMPLES, schema, "t2", t2, &[tracked_board(&uid, t2, "3")]);
+    assert!(matches!(db.apply(&newer).await, Ok(Handled::Applied)));
+    let after_newer = tracked_rows(&db.pool, &uid).await;
+    let older_at = t1 + TimeDelta::minutes(1);
+    let older = db.entry(
+        SAMPLES,
+        schema,
+        "t1b",
+        older_at,
+        &[tracked_board(&uid, older_at, "9")],
+    );
+    assert!(matches!(db.apply(&older).await, Ok(Handled::Applied)));
+    assert_eq!(tracked_rows(&db.pool, &uid).await, after_newer);
+    assert_eq!(after_newer[0].0, t2);
+    assert_eq!(db.freshness(source).await, Some(t2));
+
+    db.cleanup("DELETE FROM tracked_stop_boards WHERE train_uid = $1", &uid)
+        .await;
 }
 
 /// A row the database refuses (a CRS too long for `bpchar(3)`, 22001) fails
