@@ -1,0 +1,29 @@
+{
+ "destination": {
+  "name": "Consumer.example.VirtualTopic.PushPort-v18",
+  "destinationType": "queue"
+ },
+ "messageID": "ID:fixture-2",
+ "type": null,
+ "priority": 4,
+ "redelivered": false,
+ "messageType": "bytes",
+ "deliveryMode": 1,
+ "bytes": "{\"ts\":\"2099-01-01T07:00:00+00:00\",\"version\":\"18.0\",\"uR\":{\"updateOrigin\":\"CIS\",\"schedule\":{\"rid\":\"209901018799001\",\"uid\":\"Z99001\",\"trainId\":\"2Z01\",\"rsid\":\"NT999900\",\"ssd\":\"2099-01-01\",\"toc\":\"NT\",\"status\":\"P\",\"trainCat\":\"OO\",\"isPassengerSvc\":\"true\",\"OR\":{\"tpl\":\"LEEDS\",\"act\":\"TB\",\"plat\":\"12\",\"ptd\":\"09:00\",\"wtd\":\"09:00\"},\"PP\":{\"tpl\":\"COLTONJ\",\"wtp\":\"09:20:30\"},\"IP\":{\"tpl\":\"YORK\",\"act\":\"T \",\"plat\":\"3\",\"pta\":\"09:30\",\"ptd\":\"09:32\",\"wta\":\"09:29:30\",\"wtd\":\"09:32\",\"can\":\"true\"},\"DT\":{\"tpl\":\"SCARBRO\",\"act\":\"TF\",\"plat\":\"1\",\"pta\":\"10:15\",\"wta\":\"10:15\"},\"cancelReason\":{\"\":\"104\",\"tiploc\":\"YORK\"}}}}",
+ "replyTo": null,
+ "correlationID": null,
+ "expiration": 4070937660000,
+ "text": null,
+ "map": null,
+ "properties": {
+  "Username": {
+   "string": "fixture",
+   "propertyType": "string"
+  },
+  "PushPortSequence": {
+   "string": "2",
+   "propertyType": "string"
+  }
+ },
+ "timestamp": 4070937660000
+}

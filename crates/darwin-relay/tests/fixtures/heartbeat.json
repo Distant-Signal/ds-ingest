@@ -1,0 +1,29 @@
+{
+ "destination": {
+  "name": "Consumer.example.VirtualTopic.PushPort-v18",
+  "destinationType": "queue"
+ },
+ "messageID": "ID:fixture-4",
+ "type": null,
+ "priority": 4,
+ "redelivered": false,
+ "messageType": "bytes",
+ "deliveryMode": 1,
+ "bytes": "{\"ts\":\"2099-01-01T09:01:00+00:00\",\"version\":\"18.0\",\"FailureResp\":{\"code\":\"HBOK\"}}",
+ "replyTo": null,
+ "correlationID": null,
+ "expiration": 4070937660000,
+ "text": null,
+ "map": null,
+ "properties": {
+  "Username": {
+   "string": "fixture",
+   "propertyType": "string"
+  },
+  "PushPortSequence": {
+   "string": "4",
+   "propertyType": "string"
+  }
+ },
+ "timestamp": 4070937660000
+}

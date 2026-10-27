@@ -101,12 +101,17 @@ impl StreamSpec {
 /// The ingest streams (spec §7.1; D1: no `train-events`). Each
 /// island-of-Ireland poller has its own stream, so its ACL user can produce
 /// only its own schemas (2026-10-08 security review, H1).
-pub const STREAMS: [StreamSpec; 10] = [
+pub const STREAMS: [StreamSpec; 11] = [
     StreamSpec {
         name: "station-samples",
         stream: streams::STATION_SAMPLES,
-        // poller-ldbws's tracked-stop lane rides the same stream (DS-127).
-        schemas: &["station-samples", common::TRACKED_STOP_BOARDS_SCHEMA],
+        // poller-ldbws's tracked-stop lane rides the same stream (DS-127),
+        // and its arrivals sub-lane (DS-152).
+        schemas: &[
+            "station-samples",
+            common::TRACKED_STOP_BOARDS_SCHEMA,
+            common::TRACKED_STOP_ARRIVAL_BOARDS_SCHEMA,
+        ],
     },
     StreamSpec {
         name: "full-coverage",
@@ -159,6 +164,12 @@ pub const STREAMS: [StreamSpec; 10] = [
             common::transit::schema::TIMETABLE_COMMIT,
             common::transit::schema::SITUATIONS,
         ],
+    },
+    // darwin-relay's Darwin Push Port batches (DS-152), off by default.
+    StreamSpec {
+        name: "darwin",
+        stream: streams::DARWIN,
+        schemas: &[common::darwin::SCHEMA],
     },
     // Nottingham Express Transit (NET design §7): the same schemas, so
     // situations need no writer change if a source ever appears.
@@ -534,7 +545,7 @@ mod tests {
         assert_eq!(modes, StreamModes::default());
         assert_eq!(
             modes.to_string(),
-            "station-samples:off,full-coverage:off,tfl:off,tfl-stops:off,reference:off,ioi-gtfs:off,ioi-nir:off,ioi-live:off,transit-metrolink:off,transit-net:off"
+            "station-samples:off,full-coverage:off,tfl:off,tfl-stops:off,reference:off,ioi-gtfs:off,ioi-nir:off,ioi-live:off,transit-metrolink:off,darwin:off,transit-net:off"
         );
 
         let modes: StreamModes = " station-samples:apply, full-coverage : apply,tfl:off"

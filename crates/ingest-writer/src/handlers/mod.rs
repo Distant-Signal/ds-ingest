@@ -40,6 +40,7 @@ use sqlx::PgConnection;
 
 use crate::observed::Observed;
 
+pub mod darwin;
 pub mod island_of_ireland;
 pub mod snapshots;
 pub mod tfl;
@@ -175,6 +176,7 @@ pub fn registry_with(options: snapshots::Options) -> Registry {
             &v1(common::tfl_routes::SCHEMA),
             tfl_line_routes::TflLineRoutes,
         ),
+        registry.register(&v1(common::darwin::SCHEMA), darwin::DarwinPushport),
         registry.register(&v1("tocs"), tocs::Tocs),
         registry.register(&v1("ioi-stations"), island_of_ireland::Stations),
         registry.register(&v1("ioi-lines"), island_of_ireland::Lines),
@@ -453,6 +455,7 @@ mod tests {
         assert_eq!(
             registry().schemas(),
             [
+                "darwin-pushport/1",
                 "full-coverage-stats/1",
                 "full-coverage-window-stats/1",
                 "ioi-lines/1",
@@ -464,6 +467,7 @@ mod tests {
                 "tfl-line-status/1",
                 "tfl-stops/1",
                 "tocs/1",
+                "tracked-stop-arrival-boards/1",
                 "tracked-stop-boards/1",
                 "transit-situations/1",
                 "transit-timetable/1",

@@ -1,0 +1,29 @@
+{
+ "destination": {
+  "name": "Consumer.example.VirtualTopic.PushPort-v18",
+  "destinationType": "queue"
+ },
+ "messageID": "ID:fixture-3",
+ "type": null,
+ "priority": 4,
+ "redelivered": false,
+ "messageType": "bytes",
+ "deliveryMode": 1,
+ "bytes": "{\"ts\":\"2099-01-01T06:00:00+00:00\",\"version\":\"18.0\",\"uR\":{\"updateOrigin\":\"CIS\",\"association\":[{\"tiploc\":\"YORK\",\"category\":\"NP\",\"main\":{\"rid\":\"209901018799001\",\"wta\":\"09:30\",\"pta\":\"09:30\"},\"assoc\":{\"rid\":\"209901018799002\",\"wtd\":\"09:42:30\",\"ptd\":\"09:43\"}},{\"tiploc\":\"YORK\",\"category\":\"VV\",\"isCancelled\":\"true\",\"main\":{\"rid\":\"209901018799004\",\"wta\":\"08:00\",\"wtd\":\"08:10\"},\"assoc\":{\"rid\":\"209901018799005\",\"wtd\":\"08:12\"}},{\"tiploc\":\"YORK\",\"category\":\"XX\",\"main\":{\"rid\":\"209901018799006\"},\"assoc\":{\"rid\":\"209901018799007\"}}],\"deactivated\":{\"rid\":\"209901018799003\"}}}",
+ "replyTo": null,
+ "correlationID": null,
+ "expiration": 4070937660000,
+ "text": null,
+ "map": null,
+ "properties": {
+  "Username": {
+   "string": "fixture",
+   "propertyType": "string"
+  },
+  "PushPortSequence": {
+   "string": "3",
+   "propertyType": "string"
+  }
+ },
+ "timestamp": 4070937660000
+}

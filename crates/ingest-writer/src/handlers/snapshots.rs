@@ -1,5 +1,6 @@
-//! The snapshot handlers (plan 3a.6, spec §7.4 and §7.8): `station-samples/1`
-//! and `tracked-stop-boards/1` on `ds:ingest:station-samples`, and `full-coverage-stats/1`,
+//! The snapshot handlers (plan 3a.6, spec §7.4 and §7.8): `station-samples/1`,
+//! `tracked-stop-boards/1` and `tracked-stop-arrival-boards/1` on
+//! `ds:ingest:station-samples`, and `full-coverage-stats/1`,
 //! `full-coverage-window-stats/1` and `station-full-coverage-samples/1` on
 //! `ds:ingest:full-coverage`.
 //!
@@ -187,6 +188,10 @@ pub fn handlers(options: Options) -> Vec<(SchemaId, Arc<dyn SchemaHandler>)> {
             Arc::new(tracked_stop_boards()),
         ),
         (
+            schema(common::TRACKED_STOP_ARRIVAL_BOARDS_SCHEMA),
+            Arc::new(tracked_stop_arrival_boards()),
+        ),
+        (
             schema("full-coverage-stats"),
             Arc::new(full_coverage_stats()),
         ),
@@ -241,6 +246,35 @@ pub fn tracked_stop_boards() -> Snapshot<common::TrackedStopBoard> {
             Box::pin(async move {
                 samples::upsert_tracked_stop_boards_on(conn, rows, Some(&TRACKED_STOP_BOARDS_GUARD))
                     .await
+            })
+        },
+        options: Options::default(),
+        rows: PhantomData,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tracked-stop-arrival-boards/1 → tracked_stop_arrival_boards, on polled_at
+// (pre-departure prediction phase 3, DS-152). poller-ldbws's arrivals lane
+// sends them on the station-samples stream.
+
+static TRACKED_STOP_ARRIVAL_BOARDS_GUARD: LazyLock<String> =
+    LazyLock::new(|| guard("tracked_stop_arrival_boards", "polled_at"));
+
+/// `tracked-stop-arrival-boards/1`.
+pub fn tracked_stop_arrival_boards() -> Snapshot<common::TrackedStopArrivalBoard> {
+    Snapshot {
+        source: sources::TRACKED_STOP_ARRIVAL_BOARDS,
+        observe: |row, observed| row.polled_at = observed.observed_at(Some(row.polled_at)),
+        validate: no_validation,
+        write: |conn, rows, _, _| {
+            Box::pin(async move {
+                samples::upsert_tracked_stop_arrival_boards_on(
+                    conn,
+                    rows,
+                    Some(&TRACKED_STOP_ARRIVAL_BOARDS_GUARD),
+                )
+                .await
             })
         },
         options: Options::default(),

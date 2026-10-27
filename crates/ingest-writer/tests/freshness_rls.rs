@@ -115,6 +115,7 @@ fn writer_sources() -> Vec<String> {
         "tocs",
         common::tfl_stops::FRESHNESS_SOURCE,
         common::tfl_routes::FRESHNESS_SOURCE,
+        common::darwin::FRESHNESS_SOURCE,
     ]
     .into_iter()
     .chain(ds_store::samples::sources::ALL.iter().copied())

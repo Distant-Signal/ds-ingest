@@ -1,0 +1,29 @@
+{
+ "destination": {
+  "name": "Consumer.example.VirtualTopic.PushPort-v18",
+  "destinationType": "queue"
+ },
+ "messageID": "ID:fixture-1",
+ "type": null,
+ "priority": 4,
+ "redelivered": false,
+ "messageType": "bytes",
+ "deliveryMode": 1,
+ "bytes": "{\"ts\":\"2099-01-01T09:01:00.1+00:00\",\"version\":\"18.0\",\"uR\":{\"updateOrigin\":\"TD\",\"requestSource\":\"fixture\",\"requestID\":\"0000000000000001\",\"TS\":{\"rid\":\"209901018799001\",\"uid\":\"Z99001\",\"ssd\":\"2099-01-01\",\"LateReason\":{\"\":\"104\",\"tiploc\":\"LEEDS\",\"near\":\"true\"},\"Location\":[{\"tpl\":\"LEEDS\",\"wtd\":\"09:00\",\"ptd\":\"09:00\",\"dep\":{\"et\":\"09:03\",\"src\":\"Darwin\"},\"plat\":{\"platsrc\":\"A\",\"conf\":\"true\",\"\":\"12\"},\"length\":\"4\"},{\"tpl\":\"COLTONJ\",\"wtp\":\"09:20:30\",\"pass\":{\"at\":\"09:21\",\"src\":\"TD\"},\"plat\":\"UM\",\"suppr\":\"true\"},{\"tpl\":\"YORK\",\"wta\":\"09:29:30\",\"pta\":\"09:30\",\"arr\":{\"et\":\"09:33\",\"delayed\":\"true\",\"src\":\"Darwin\"},\"plat\":{\"platsup\":\"true\",\"cisPlatsup\":\"true\",\"platsrc\":\"P\",\"\":\"5\"}}]}}}",
+ "replyTo": null,
+ "correlationID": null,
+ "expiration": 4070937660000,
+ "text": null,
+ "map": null,
+ "properties": {
+  "Username": {
+   "string": "fixture",
+   "propertyType": "string"
+  },
+  "PushPortSequence": {
+   "string": "1",
+   "propertyType": "string"
+  }
+ },
+ "timestamp": 4070937660000
+}
