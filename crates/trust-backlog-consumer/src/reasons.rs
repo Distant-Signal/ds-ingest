@@ -15,8 +15,13 @@ use trust_schema::schema::TrustMessage;
 
 use crate::process::{ProcessorState, service_date_for_instant};
 
-/// The reason carried by `message`, or `None` when it is not a `0002` or
-/// `0006` or carries no (non-blank) reason code.
+/// The `train_reasons` row `message` makes, or `None` when it is not a
+/// `0002` Cancellation, `0005` Reinstatement or `0006` Change of Origin.
+///
+/// A message without a (non-blank) reason code is still kept, with an empty
+/// `reason_code` (DS-181): its location and time are what tell a cancelled
+/// train from a part-cancelled one, and a newer uncoded cancellation must
+/// replace an older coded one. A `0005` never carries a code.
 pub(crate) fn reason_message(
     message: &TrustMessage,
     state: &ProcessorState,
@@ -40,9 +45,17 @@ pub(crate) fn reason_message(
             o.loc_stanox.clone(),
             o.dep_timestamp.as_deref(),
         ),
+        TrustMessage::Reinstatement(r) => (
+            &r.train_id,
+            "0005",
+            None,
+            None,
+            r.loc_stanox.clone(),
+            r.reinstatement_timestamp.as_deref(),
+        ),
         _ => return None,
     };
-    let reason_code = reason_code.map(str::trim).filter(|c| !c.is_empty())?;
+    let reason_code = reason_code.map(str::trim).unwrap_or_default();
     let event_at = common::trust_timestamp::parse_trust_epoch_millis_pair(
         None,
         raw_timestamp,
@@ -70,7 +83,7 @@ pub(crate) fn reason_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trust_schema::schema::{Cancellation, ChangeOfOrigin};
+    use trust_schema::schema::{Cancellation, ChangeOfOrigin, Reinstatement};
 
     fn today() -> NaiveDate {
         "2026-09-05".parse().unwrap()
@@ -112,16 +125,33 @@ mod tests {
     }
 
     #[test]
-    fn a_cancellation_without_a_code_yields_nothing() {
+    fn a_cancellation_without_a_code_keeps_its_location_with_an_empty_code() {
         let state = ProcessorState::default();
-        assert_eq!(
-            reason_message(&cancellation(None), &state, today(), received_at()),
-            None
-        );
-        assert_eq!(
-            reason_message(&cancellation(Some("  ")), &state, today(), received_at()),
-            None
-        );
+        for code in [None, Some("  ")] {
+            let reason = reason_message(&cancellation(code), &state, today(), received_at())
+                .expect("an uncoded cancellation is still stored");
+            assert_eq!(reason.msg_type, "0002");
+            assert_eq!(reason.reason_code, "");
+            assert_eq!(reason.loc_stanox.as_deref(), Some("87702"));
+        }
+    }
+
+    #[test]
+    fn a_reinstatement_is_stored_with_its_location_and_time() {
+        let state = ProcessorState::default();
+        let message = TrustMessage::Reinstatement(Reinstatement {
+            train_id: "722N71MW27".to_string(),
+            dep_timestamp: Some("1790507000000".to_string()),
+            // 2026-09-27 10:00:00 as TRUST's local-as-UTC epoch millis.
+            reinstatement_timestamp: Some("1790503200000".to_string()),
+            loc_stanox: Some("87703".to_string()),
+        });
+        let reason = reason_message(&message, &state, today(), received_at()).unwrap();
+        assert_eq!(reason.msg_type, "0005");
+        assert_eq!(reason.reason_code, "");
+        assert_eq!(reason.canx_type, None);
+        assert_eq!(reason.loc_stanox.as_deref(), Some("87703"));
+        assert!(reason.event_at.is_some());
     }
 
     #[test]

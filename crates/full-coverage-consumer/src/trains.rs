@@ -444,6 +444,7 @@ mod tests {
             train_id: "1A01MW27".to_string(),
             dep_timestamp: None,
             reinstatement_timestamp: None,
+            loc_stanox: None,
         });
         assert_eq!(s.current["C1"].cancel, None);
     }

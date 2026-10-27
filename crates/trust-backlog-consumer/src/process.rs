@@ -1431,6 +1431,7 @@ mod tests {
             // 2026-09-27 01:59:30, raw TRUST epoch millis.
             dep_timestamp: Some("1790474370000".to_string()),
             reinstatement_timestamp: None,
+            loc_stanox: None,
         });
         let mut state = ProcessorState::default();
         let mut key_on = |day: &str| {
@@ -1707,6 +1708,7 @@ mod tests {
                 train_id: "221832406".to_string(),
                 dep_timestamp: Some("1790836380000".to_string()),
                 reinstatement_timestamp: Some(at.to_string()),
+                loc_stanox: None,
             })
         };
         let sequence = [
@@ -1746,6 +1748,7 @@ mod tests {
             train_id: "221832406".to_string(),
             dep_timestamp: None,
             reinstatement_timestamp: None,
+            loc_stanox: None,
         });
         let mut state = ProcessorState::default();
         let result = process_message(
@@ -1777,6 +1780,7 @@ mod tests {
             train_id: "999999999".to_string(),
             dep_timestamp: Some("1788568200000".to_string()),
             reinstatement_timestamp: None,
+            loc_stanox: None,
         });
         let mut state = ProcessorState::default();
         let result = process_message(
@@ -1805,6 +1809,7 @@ mod tests {
             train_id: "999999999".to_string(),
             dep_timestamp: Some("1788568200000".to_string()),
             reinstatement_timestamp: None,
+            loc_stanox: None,
         });
         let result = process_message(
             &reinstatement,

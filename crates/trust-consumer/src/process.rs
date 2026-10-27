@@ -2006,6 +2006,7 @@ mod tests {
             // 2026-09-27 01:59:30, raw TRUST epoch millis.
             dep_timestamp: Some("1790474370000".to_string()),
             reinstatement_timestamp: None,
+            loc_stanox: None,
         });
         let reference = reference_with_one_pending(1, "WAT", "2026-09-27T01:00:00Z");
         let mut state = ProcessorState::default();
@@ -2049,6 +2050,7 @@ mod tests {
                 train_id: "221832406".to_string(),
                 dep_timestamp: Some("1790836380000".to_string()),
                 reinstatement_timestamp: Some(at.to_string()),
+                loc_stanox: None,
             })
         };
         let reference = reference_with_one_pending(1, "WAT", "2026-09-27T01:00:00Z");
