@@ -127,6 +127,13 @@ const LIVE_READ_BATCH_COUNT: usize = 100;
 /// ignores for an explicit id.
 const LIVE_READ_BLOCK_MS: usize = 5000;
 
+/// What a `>` read actually blocks for: [`LIVE_READ_BLOCK_MS`], except in
+/// this crate's own tests. Their `redis_tests` read each test stream until
+/// it is empty, and each empty read waited the full 5 s; they add their
+/// entries before reading them, so none needs the wait. Other crates' tests
+/// (`connect_to_named_stream`) still get the production wait.
+const LIVE_BLOCK_MS: usize = if cfg!(test) { 100 } else { LIVE_READ_BLOCK_MS };
+
 // Every command is bounded by `common::redis_conn::RESPONSE_TIMEOUT`, so a
 // blocking read must return well within it or a quiet stream would look
 // like a dead connection.
@@ -1019,7 +1026,7 @@ impl RedisStreamMovementFeed {
                     // (and isolation reads one entry at a time, see
                     // `isolating`).
                     .count(count)
-                    .block(if replaying_pel { 0 } else { LIVE_READ_BLOCK_MS }),
+                    .block(if replaying_pel { 0 } else { LIVE_BLOCK_MS }),
             )
             .await?;
 
