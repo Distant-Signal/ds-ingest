@@ -16,7 +16,9 @@ alternative, Q1; Q8's `INGEST_SINK`/`*_SOURCE` parsing) are built
 narrowing: [Release D cleanup](#release-d-cleanup-built-2026-10-21).** Left
 after it: **5.5**. Phase 0b is done (the four services connect as their
 own roles since 2026-10-21); the narrowing's code prerequisites are built
-(2026-10-23, DS-118) and its steps start 2026-10-28:
+(2026-10-23, DS-118). The 7-day role-usage report came back clean and the
+release D change (step 3) is done (2026-10-28, DS-118); Ranma's release of
+it is next:
 [Release D (narrowing)](#release-d-narrowing-prepared-2026-10-23-ds-118).
 Then the `app` drop; and Ranma's `allow-egress-same-namespace` (5.6). The earlier prep that changed no
 default (batch 53, 2026-10-08) was 5.1's
@@ -221,7 +223,31 @@ On or after **2026-10-28 07:58 UTC**:
      apart, both after the deploy.
    - The aggregator's `trains` U (its row lock) is granted from DS-118 on.
    - Anything else listed there is a new gap. Fix it in DS before step 3.
-3. **DS: the release D change**, one PR:
+
+   **Done 2026-10-28.** No unexpected write for the four roles. The report
+   listed three statements as "used, not granted", all false positives:
+   - the notifier's `UPDATE push_subscriptions SET last_pushed_at`: covered
+     by its column grant `U (last_pushed_at)`;
+   - the aggregator's archive lock (`SELECT … FOR UPDATE OF t` on
+     `trains`): covered by `U (id)`;
+   - the same statement as a `train_subscriptions` U: its `NOT EXISTS`
+     subquery reads that table, which the lock does not touch.
+
+   Known limitations of `observe-role-usage.py` behind them:
+   - it gave a `FOR UPDATE/SHARE` clause's U to every table the statement
+     reads, subqueries included, and ignored `OF`. Fixed 2026-10-28
+     (DS-118): only the locking query level's FROM items, narrowed to the
+     `OF` list, by table name or alias
+     (`scripts/tests/test_observe_role_usage.py`);
+   - it compares grants per table, not per column: a column grant counts as
+     the whole table verb, and a statement's columns are not read. The
+     current `db-grants.yaml` covers the first two flags at table level
+     (the notifier's grant arrived 2026-10-24, DS-153's device list; the
+     aggregator's with DS-118), so a report run against an older copy of
+     the file flags them. In the other direction, a write to a column
+     outside a column grant is not flagged: the narrowed CI suites and the
+     production 42501 watch are the proof there.
+3. **DS: the release D change**, one PR. **Done 2026-10-28 (DS-118)**:
    - `status: narrow`, `phase: "5"` for `api`, `aggregator`, `enricher` and
      `notifier` in `db-grants.yaml` (§4.1's diff, without the writer, which
      is narrow already);
@@ -231,6 +257,15 @@ On or after **2026-10-28 07:58 UTC**:
      the owner. The narrowed step keeps proving their runtime paths;
    - CI green: the narrowed step, the per-service step, and `gen-db-grants.py
      check` against the migrated database.
+   - The rendered `postgres-grants.sql`: the four roles move from
+     `observed` (app members, no rows of their own) to `narrow`, and get
+     their own rows: the api 103 tables (`SIUD` on its personal tables and
+     `tfl_arrivals_cache`, `trains`/`train_subscriptions` `SIUD`,
+     `train_event_outbox` `I (tracked_train_id, dedup_key, event)`, `S`
+     elsewhere) and 13 sequences; the aggregator 31 tables (`trains`
+     `SD` + `U (id)`), 1 sequence; the notifier 35 tables, 4 sequences; the
+     enricher 3 tables (`incidents` `S` + `U` on the five extraction
+     columns, `enricher_llm_batches` `SID`).
 4. **Ranma: release the chart** with it, at any hour.
    - The pre-upgrade setup Job revokes the four memberships and grants
      their own rows. No pod restarts.
@@ -1691,7 +1726,8 @@ blind would turn the first `connect: true` into a permission failure. So
    [Release D (narrowing)](#release-d-narrowing-prepared-2026-10-23-ds-118).
    Instead of porting every suite first, CI's narrowed step runs the
    runtime paths as the narrowed roles, and the full suites run with
-   `--observe` until their fixtures move to the owner.)
+   `--observe` until their fixtures move to the owner. The change itself
+   is done, 2026-10-28.)
    A local run with the four roles narrowed (2026-10-14) failed 312 api
    and 114 ds-store DB tests (run as the api role), almost all of them
    because the tests seed fixtures (incidents, stations, samples, schedule
@@ -1777,10 +1813,14 @@ Per-role passwords: `mint-sealed-secret.sh` seals **one** value into every
 `--target` of a run. Run it once per role, never with several role
 targets at once, or every role gets the same password.
 
-**Negative checks (Ranma):** `psql` as each role:
+**Negative checks (Ranma):** `psql` as each role, each statement in its
+own `BEGIN; … ROLLBACK;`:
 
-- `CREATE TABLE x (i int)`, `TRUNCATE stations`, `DELETE FROM users` and
+- `CREATE TABLE x (i int)`, `TRUNCATE stations` and
   `ALTER TABLE incidents ADD COLUMN y int` must all fail;
+- `DELETE FROM users WHERE false` must fail for every role but the api,
+  which owns `users` (`SIUD`): never run it as the api without the
+  `WHERE false`;
 - the api role: `UPDATE incidents SET summary = summary WHERE false` must
   fail;
 - the enricher: `UPDATE incidents SET summary = …` must fail, while
