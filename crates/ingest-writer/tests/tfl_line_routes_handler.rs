@@ -138,6 +138,7 @@ fn route(line: &str, direction: &str, name: &str, stops: &[&str]) -> TflLineRout
         direction: direction.into(),
         name: name.into(),
         stop_ids: stops.iter().map(|s| (*s).to_owned()).collect(),
+        step_seconds: None,
     }
 }
 
@@ -224,6 +225,50 @@ async fn a_snapshot_replaces_the_routes() {
     db.applied(&db.entry("empty", t2 + TimeDelta::hours(1), &[]))
         .await;
     assert_eq!(db.routes().await.len(), 1);
+
+    db.cleanup().await;
+}
+
+/// `(direction, route_index, step_seconds)`.
+type TimedRow = (String, i16, Option<Vec<Option<i32>>>);
+
+/// DS-206: each route's running times are written with it, a step without
+/// one as NULL; times that do not fit the stops are dropped, the route kept.
+#[tokio::test]
+#[ignore = "requires a live database (DATABASE_URL)"]
+async fn a_snapshot_writes_the_running_times() {
+    let db = Db::new().await;
+    db.setup().await;
+
+    let stops = ["940GZZTESTA", "940GZZTESTJ", "940GZZTESTE"];
+    let timed = TflLineRoute {
+        step_seconds: Some(vec![Some(150), None]),
+        ..route("testline", "outbound", "Test A ↔ Test End", &stops)
+    };
+    let misfit = TflLineRoute {
+        step_seconds: Some(vec![Some(150)]),
+        ..route("testline", "inbound", "Test End ↔ Test A", &stops)
+    };
+    let untimed = route("testline", "outbound", "Test B ↔ Test End", &stops[1..]);
+    let at = at_millis(Utc::now() - TimeDelta::hours(1));
+    db.applied(&db.entry("timed", at, &[timed, misfit, untimed]))
+        .await;
+
+    let rows: Vec<TimedRow> = sqlx::query_as(
+        "SELECT direction, route_index, step_seconds FROM tfl_line_routes \
+         ORDER BY direction, route_index",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("inbound".to_owned(), 0, None),
+            ("outbound".to_owned(), 0, Some(vec![Some(150), None])),
+            ("outbound".to_owned(), 1, None),
+        ]
+    );
 
     db.cleanup().await;
 }

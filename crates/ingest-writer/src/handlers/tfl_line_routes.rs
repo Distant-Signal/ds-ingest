@@ -9,7 +9,8 @@
 //! routes. A split one is poison (the producer never splits it). An empty
 //! snapshot, and one older than the stored routes, write nothing and are
 //! not errors. A route the store refuses before writing is left out and
-//! logged.
+//! logged, and so are running times (DS-206) that do not fit their route,
+//! which is written without them.
 
 use common::tfl_routes::TflLineRoute;
 use ingest_stream::{HandlerError, StreamEntry};
@@ -56,6 +57,13 @@ impl SchemaHandler for TflLineRoutes {
                     key = %entry.envelope.key,
                     invalid = ?replaced.invalid,
                     "left out TfL routes that are not valid rows"
+                );
+            }
+            if !replaced.untimed.is_empty() {
+                tracing::warn!(
+                    key = %entry.envelope.key,
+                    untimed = ?replaced.untimed,
+                    "wrote TfL routes without running times that do not fit their stops"
                 );
             }
             tracing::info!(
