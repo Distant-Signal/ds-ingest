@@ -30,7 +30,11 @@ RDM Push Port JSON topic (Kafka, SASL_SSL)
   Offsets are committed only once Redis has the entry: a restart re-reads
   at most one batch, and every stored row is guarded by its Darwin
   timestamp, so a duplicate changes nothing. A record that cannot be
-  decoded is logged, counted and skipped.
+  decoded is logged, counted and skipped. Unlike movement-relay it rolls
+  out with `Recreate`: the topic has one partition, so a surge pod can
+  wait forever for the assignment the old pod holds (build 833's stalled
+  rollout). The old pod stops first and the new one resumes from the
+  committed offset, a gap of seconds that loses nothing.
 - **ingest-writer** applies `darwin-pushport/1` (`ingestWriter.streams.darwin`)
   and records `ingest_freshness` source `darwin-pushport` at the batch's
   newest Darwin time.
