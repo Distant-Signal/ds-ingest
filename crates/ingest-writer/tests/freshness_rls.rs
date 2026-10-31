@@ -103,6 +103,10 @@ fn transit_sources() -> Vec<String> {
     // timetable has a producer today.
     assert!(sources.contains(&"transit-net-timetable".to_owned()));
     assert!(sources.contains(&"transit-net-situations".to_owned()));
+    // TfL (TfL design §9): the timetable has a producer, the situations
+    // source is listed for symmetry.
+    assert!(sources.contains(&"transit-tfl-timetable".to_owned()));
+    assert!(sources.contains(&"transit-tfl-situations".to_owned()));
     sources
 }
 

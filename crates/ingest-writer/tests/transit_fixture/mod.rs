@@ -111,6 +111,7 @@ impl Feed {
                     name: "Blue Line".to_owned(),
                     colour: Some("#0072bc".to_owned()),
                     sort_order: 1,
+                    mode: None,
                     directions: vec![TransitLineDirection {
                         direction: Direction::Outbound,
                         headsign: Some("Eccles".to_owned()),
