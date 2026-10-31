@@ -295,6 +295,7 @@ impl SchemaHandler for Situations {
                         network = snapshot.network.as_str(),
                         situations = applied.situations,
                         ended = applied.ended,
+                        purged = applied.purged,
                         lines = applied.lines,
                         history = applied.history,
                         pruned = applied.pruned,

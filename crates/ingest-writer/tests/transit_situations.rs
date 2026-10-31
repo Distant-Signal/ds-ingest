@@ -124,6 +124,17 @@ async fn situation_ids(db: &Db) -> Vec<String> {
         .unwrap()
 }
 
+async fn ended_at(db: &Db, id: &str) -> Option<DateTime<Utc>> {
+    sqlx::query_scalar(
+        "SELECT ended_at FROM transit_situations WHERE network = $1 AND situation_id = $2",
+    )
+    .bind(NETWORK)
+    .bind(id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap()
+}
+
 const MINOR_DELAYS: i64 = 9;
 const NO_REPORTED_DISRUPTION: i64 = 27;
 
@@ -181,19 +192,43 @@ async fn a_snapshot_writes_its_situations_and_the_line_statuses() {
     assert_eq!(situation_ids(&db).await, ["S1"]);
     assert_eq!(blue(&db).await, (MINOR_DELAYS, later, Some(later)));
 
-    // The situation ends: deleted, and the line returns to "No reported
-    // disruption" with one more history row.
+    // The situation ends: kept, marked ended (for its page), and the line
+    // returns to "No reported disruption" with one more history row.
     let end = later + TimeDelta::minutes(5);
     let ended = applied(apply(&db, &snapshot(Vec::new()), end).await);
     assert_eq!(ended.ended, 1);
+    assert_eq!(ended.purged, 0);
     assert_eq!(ended.history, 1);
-    assert!(situation_ids(&db).await.is_empty());
+    assert_eq!(situation_ids(&db).await, ["S1"]);
+    assert_eq!(ended_at(&db, "S1").await, Some(end));
     assert_eq!(blue(&db).await, (NO_REPORTED_DISRUPTION, end, Some(end)));
     assert_eq!(history(&db).await, [MINOR_DELAYS, NO_REPORTED_DISRUPTION]);
-    // ... and stays there without more history.
+    // ... and stays there without more history, its end time kept.
     let quiet = applied(apply(&db, &snapshot(Vec::new()), end + TimeDelta::minutes(5)).await);
     assert_eq!(quiet.history, 0);
+    assert_eq!(quiet.ended, 0);
+    assert_eq!(ended_at(&db, "S1").await, Some(end));
     assert_eq!(history(&db).await.len(), 2);
+
+    // Listed again: current again.
+    let back_at = end + TimeDelta::minutes(6);
+    let back = applied(apply(&db, &first, back_at).await);
+    assert_eq!(back.situations, 1);
+    assert_eq!(ended_at(&db, "S1").await, None);
+
+    // Ended for over a week: deleted.
+    let gone_at = back_at + TimeDelta::minutes(1);
+    applied(apply(&db, &snapshot(Vec::new()), gone_at).await);
+    sqlx::query(
+        "UPDATE transit_situations SET ended_at = ended_at - interval '8 days' WHERE network = $1",
+    )
+    .bind(NETWORK)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let purged = applied(apply(&db, &snapshot(Vec::new()), gone_at + TimeDelta::minutes(1)).await);
+    assert_eq!(purged.purged, 1);
+    assert!(situation_ids(&db).await.is_empty());
     db.cleanup().await;
 }
 
