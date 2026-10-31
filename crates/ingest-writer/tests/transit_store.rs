@@ -223,3 +223,75 @@ async fn an_inconsistent_feed_is_refused() {
     assert_eq!(db.freshness().await, None);
     db.cleanup().await;
 }
+
+/// `(analyze_count, reltuples)` of `transit_networks`: manual ANALYZEs only
+/// (autovacuum's count separately), and the row count the planner sees.
+/// ANALYZE reports to the shared statistics directly, so the count is
+/// current as soon as the analyzing transaction commits.
+async fn networks_analyzed(db: &Db) -> (i64, f32) {
+    sqlx::query_as(
+        "SELECT s.analyze_count, c.reltuples \
+         FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid \
+         WHERE s.relid = 'transit_networks'::regclass",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap()
+}
+
+/// DS-223: the activation that inserts a NEW network row analyzes
+/// `transit_networks` (as the writer's own role, through
+/// `analyze_transit_networks()`: on Postgres 16 a non-owner's plain ANALYZE
+/// only warns and skips), and a later activation of the same network,
+/// which only updates its row, does not.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL (a migrated database)"]
+async fn a_new_network_analyzes_transit_networks_and_a_reimport_does_not() {
+    let db = Db::new().await;
+    let t1 = now_millis() - TimeDelta::minutes(30);
+    let t2 = t1 + TimeDelta::minutes(10);
+    let (before, _) = networks_analyzed(&db).await;
+
+    let first = Feed::new("v1-aaaa", 'a', 3, t1);
+    stage_feed(&db, &first, t1, None).await;
+    assert_eq!(
+        commit_at(&db, &first.commit, t1).await,
+        CommitOutcome::Activated
+    );
+    let (analyzed, reltuples) = networks_analyzed(&db).await;
+    assert_eq!(
+        analyzed,
+        before + 1,
+        "inserting the network's row must ANALYZE transit_networks once"
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM transit_networks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a handful of networks, exact in f32"
+    )]
+    let rows = rows as f32;
+    assert!(
+        (reltuples - rows).abs() < 0.5,
+        "reltuples {reltuples} must be the {rows} rows (the ANALYZE was skipped for lack of \
+         ownership?)"
+    );
+
+    // A new feed version of the same network: activated, its row updated,
+    // and no ANALYZE.
+    let second = Feed::new("v2-bbbb", 'b', 4, t2);
+    stage_feed(&db, &second, t2, None).await;
+    assert_eq!(
+        commit_at(&db, &second.commit, t2).await,
+        CommitOutcome::Activated
+    );
+    assert_eq!(db.active().await.unwrap().0.as_deref(), Some("v2-bbbb"));
+    assert_eq!(
+        networks_analyzed(&db).await.0,
+        analyzed,
+        "re-importing a known network must not ANALYZE again"
+    );
+    db.cleanup().await;
+}
