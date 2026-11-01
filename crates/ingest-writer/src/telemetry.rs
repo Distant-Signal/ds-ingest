@@ -10,6 +10,17 @@
 //! - `distant_signal_ingest_stream_mode_info{stream, mode}`: 1 for each
 //!   stream's `INGEST_WRITER_STREAMS` mode (`off` included), so a
 //!   dashboard can show which streams this writer applies.
+//! - schedule-reference's alert inputs from Postgres (`CronJob` phase 4,
+//!   DS-241; docs/scheduled-jobs.md), read with the freshness rows by
+//!   [`export_schedule_reference`]: a `CronJob` run of schedule-reference
+//!   exits before Prometheus could scrape it, so its alerts read these.
+//!   - `distant_signal_schedule_reference_recorded_signal_timestamp_seconds{kind, product}`:
+//!     each `schedule_reference_signals` row's `recorded_at` (`seeded`,
+//!     `rejected`, `staged_mismatch`, `settled`);
+//!   - `distant_signal_schedule_reference_recorded_published_delivery_timestamp_seconds`:
+//!     the delivery time (its directory name) of the newest
+//!     `schedule_reference_publishes` row, as the in-pod
+//!     `..._last_published_delivery_timestamp_seconds` gauge reports it.
 
 use std::time::Duration;
 
@@ -23,8 +34,14 @@ use crate::stream::{STREAMS, StreamModes};
 pub const FRESHNESS_METRIC: &str = "ingest_freshness_timestamp_seconds";
 /// `ingest_stream_mode_info{stream, mode}`.
 pub const STREAM_MODE_INFO: &str = "ingest_stream_mode_info";
+/// `schedule_reference_recorded_signal_timestamp_seconds{kind, product}`.
+pub const SCHEDULE_REFERENCE_SIGNAL_METRIC: &str =
+    "schedule_reference_recorded_signal_timestamp_seconds";
+/// `schedule_reference_recorded_published_delivery_timestamp_seconds`.
+pub const SCHEDULE_REFERENCE_PUBLISHED_METRIC: &str =
+    "schedule_reference_recorded_published_delivery_timestamp_seconds";
 /// How often [`freshness_loop`] reads `ingest_freshness` (about a dozen
-/// rows).
+/// rows) and schedule-reference's rows (a few dozen).
 pub const FRESHNESS_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Sets `ingest_stream_mode_info` for every stream the writer knows.
@@ -54,6 +71,39 @@ pub async fn export_freshness(pool: &PgPool) -> sqlx::Result<usize> {
     Ok(rows.len())
 }
 
+/// Reads schedule-reference's signal rows and its newest completed publish
+/// and sets their gauges; the number of signal rows read. No completed
+/// publish (or an unparseable delivery name) leaves that gauge unset, as
+/// the in-pod one was before its first publish.
+pub async fn export_schedule_reference(pool: &PgPool) -> anyhow::Result<usize> {
+    use ds_store::schedule::reference_signals;
+    let rows = reference_signals::all(pool).await?;
+    for row in &rows {
+        metrics::gauge!(
+            metric_name(SCHEDULE_REFERENCE_SIGNAL_METRIC),
+            "kind" => row.kind.clone(),
+            "product" => row.product.clone()
+        )
+        .set(unix_seconds(row.recorded_at));
+    }
+    let delivery = ds_store::schedule::last_completed_schedule_reference_publish(pool).await?;
+    if let Some(at) = delivery
+        .as_deref()
+        .and_then(reference_signals::delivery_timestamp)
+    {
+        metrics::gauge!(metric_name(SCHEDULE_REFERENCE_PUBLISHED_METRIC)).set(seconds_f64(at));
+    }
+    Ok(rows.len())
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Unix seconds stay exact in an f64 for millions of years"
+)]
+const fn seconds_f64(at: i64) -> f64 {
+    at as f64
+}
+
 #[expect(
     clippy::cast_precision_loss,
     reason = "Unix milliseconds stay exact in an f64 until the year 287,396"
@@ -72,6 +122,12 @@ pub async fn freshness_loop(pool: PgPool) {
         interval.tick().await;
         if let Err(err) = export_freshness(&pool).await {
             tracing::warn!(error = ?err, "could not read ingest_freshness for its gauges; will retry");
+        }
+        if let Err(err) = export_schedule_reference(&pool).await {
+            tracing::warn!(
+                error = ?err,
+                "could not read schedule-reference's signals for their gauges; will retry"
+            );
         }
     }
 }
@@ -152,6 +208,67 @@ mod tests {
         assert!(
             rendered.contains(&series),
             "{series} missing from {rendered}"
+        );
+    }
+
+    /// Database-gated, like the freshness test: schedule-reference's signal
+    /// rows and its newest completed publish become the alerts' gauges.
+    /// Fixtures go in (and out) through `MIGRATION_DATABASE_URL` when set:
+    /// the narrow writer role only reads these tables.
+    #[tokio::test]
+    #[ignore = "needs DATABASE_URL (a migrated database)"]
+    async fn the_schedule_reference_gauges_follow_the_tables() {
+        use ds_store::schedule::reference_signals::{self, Signal};
+        let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+            .await
+            .unwrap();
+        let admin = match std::env::var("MIGRATION_DATABASE_URL") {
+            Ok(url) => PgPool::connect(&url).await.unwrap(),
+            Err(_) => pool.clone(),
+        };
+        let product = format!("telemetry-test-{}", std::process::id());
+        // Newer than any real row, so it is the newest completed publish.
+        let delivery = "29991231T235959Z";
+        reference_signals::record(&admin, Signal::Rejected, &product, Some(delivery))
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO schedule_reference_publishes (delivery, completed_at) \
+             VALUES ($1, '2999-12-31T23:59:59Z') ON CONFLICT (delivery) DO NOTHING",
+        )
+        .bind(delivery)
+        .execute(&admin)
+        .await
+        .unwrap();
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let read = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            export_schedule_reference(&pool).await
+        };
+        sqlx::query("DELETE FROM schedule_reference_signals WHERE product = $1")
+            .bind(&product)
+            .execute(&admin)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schedule_reference_publishes WHERE delivery = $1")
+            .bind(delivery)
+            .execute(&admin)
+            .await
+            .unwrap();
+        assert!(read.unwrap() >= 1);
+        let rendered = handle.render();
+        let signal = format!(
+            r#"distant_signal_schedule_reference_recorded_signal_timestamp_seconds{{kind="rejected",product="{product}"}}"#
+        );
+        assert!(
+            rendered.contains(&signal),
+            "{signal} missing from {rendered}"
+        );
+        let published = "distant_signal_schedule_reference_recorded_published_delivery_timestamp_seconds 32503679999";
+        assert!(
+            rendered.contains(published),
+            "{published} missing from {rendered}"
         );
     }
 }
