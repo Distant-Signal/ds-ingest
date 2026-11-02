@@ -1,8 +1,9 @@
 //! Row-level security on `ingest_freshness` (security review L4,
 //! 2026-10-08), as each role: the migration
 //! `20261009170000_ingest_freshness_rls.sql` (RLS on, plus a permissive
-//! policy for everyone) and each producer's RESTRICTIVE write policies from
-//! `postgres-grants.sql` (db-grants.yaml `row_policies`).
+//! policy for everyone) and each producer's RESTRICTIVE write policies
+//! (ds-store's db-grants.yaml `row_policies`, rendered into
+//! `postgres-grants.sql`).
 //!
 //! Needs the per-service roles, so it runs under
 //! `scripts/test-postgres-roles.py --mode per-service` (CI's per-service
@@ -137,39 +138,63 @@ fn writer_sources() -> Vec<String> {
     sources
 }
 
-/// `role`'s `ingest_freshness` `command` row policy expression in the
-/// rendered postgres-grants.sql: the row policies' `VALUES` rows carry an
-/// expression, unlike the column grants' rows (`''` there).
-fn rendered_policy<'a>(sql: &'a str, role: &str, command: &str) -> &'a str {
-    let key = format!("('ingest_freshness', '{role}', '{command}', '");
-    sql.lines()
-        .filter_map(|line| line.trim_start().strip_prefix(key.as_str()))
-        .find(|rest| !rest.starts_with('\''))
-        .unwrap_or_else(|| panic!("no {role} {command} row policy on ingest_freshness"))
+/// `role`'s `ingest_freshness` `writes` expression in db-grants.yaml's
+/// `row_policies`: either inline (`    stations: {writes: "..."}`) or a
+/// folded block (`    writer:` then `      writes: >-` and its lines).
+/// `gen-db-grants.py` renders it into both the INSERT and the UPDATE
+/// policy of postgres-grants.sql.
+fn write_policy(grants: &str, role: &str) -> String {
+    let lines: Vec<&str> = grants.lines().collect();
+    let policies = lines
+        .iter()
+        .position(|line| *line == "row_policies:")
+        .unwrap_or_else(|| panic!("db-grants.yaml has no row_policies"));
+    let table = policies
+        + lines[policies..]
+            .iter()
+            .position(|line| *line == "  ingest_freshness:")
+            .unwrap_or_else(|| panic!("row_policies has no ingest_freshness"));
+    let key = format!("    {role}:");
+    let at = table
+        + 1
+        + lines[table + 1..]
+            .iter()
+            .take_while(|line| line.is_empty() || line.starts_with("    "))
+            .position(|line| line.starts_with(&key))
+            .unwrap_or_else(|| panic!("no {role} row policy on ingest_freshness"));
+    let inline = lines[at][key.len()..].trim();
+    if !inline.is_empty() {
+        return inline.to_owned();
+    }
+    lines[at + 1..]
+        .iter()
+        .take_while(|line| line.starts_with("      "))
+        .map(|line| line.trim())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Without a database: every source each producer records is in its
-/// RESTRICTIVE allow-list as rendered from db-grants.yaml (the file the
-/// grants job applies; `gen-db-grants.py check` keeps it in step), so a
-/// new source cannot ship without its grant.
+/// RESTRICTIVE allow-list in ds-store's db-grants.yaml (which the grants
+/// job applies, rendered; `gen-db-grants.py check` keeps the rendering in
+/// step), so a new source cannot ship without its grant.
 #[test]
 fn each_producer_records_only_allow_listed_sources() {
-    let sql = include_str!("../../../charts/distant-signal/files/postgres-grants.sql");
+    let grants = ds_store::test_support::DB_GRANTS_YAML;
     let producers = [
         ("writer", writer_sources()),
         ("stations", vec!["stations".to_owned()]),
         ("incidents", vec!["incidents".to_owned()]),
     ];
     for (role, sources) in producers {
-        for command in ["INSERT", "UPDATE"] {
-            let policy = rendered_policy(sql, role, command);
-            for source in &sources {
-                assert!(
-                    policy.contains(&format!("''{source}''")),
-                    "{role} records {source:?} but its ingest_freshness {command} \
-                     policy (db-grants.yaml row_policies) does not allow it"
-                );
-            }
+        let policy = write_policy(grants, role);
+        assert!(policy.contains("source"), "{role}: {policy}");
+        for source in &sources {
+            assert!(
+                policy.contains(&format!("'{source}'")),
+                "{role} records {source:?} but its ingest_freshness write \
+                 policy (db-grants.yaml row_policies) does not allow it: {policy}"
+            );
         }
     }
 }

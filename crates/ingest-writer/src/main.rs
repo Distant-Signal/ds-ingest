@@ -24,8 +24,24 @@ const WATCHDOG_INTERVAL: Duration = Duration::from_secs(10);
 /// shutdown, inside the pod's 30 s termination grace.
 const STREAM_SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 
+/// What `--print-config-defaults` prints (`ds_runtime::service_args`).
+fn config_defaults() -> ds_runtime::service_args::ConfigDefaults {
+    // Every budgeted ingest stream with the MAXLEN it is trimmed to: the
+    // chart's ingestStreamBacklog and ingestStreamStalled alerts must name
+    // exactly these.
+    let streams: serde_json::Map<String, serde_json::Value> = ingest_stream::budget::INGEST_STREAMS
+        .iter()
+        .map(|decl| (decl.stream.to_owned(), decl.maxlen().into()))
+        .collect();
+    ds_runtime::service_args::ConfigDefaults::for_config::<Config>("ingest-writer")
+        .postgres_pool(DEFAULT_MAX_CONNECTIONS)
+        .db_role(ds_store::schema::DbRole::Writer.key())
+        .contract("ingest_stream_maxlen", streams)
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    ds_runtime::service_args::exit_if_print_config_defaults(config_defaults);
     ds_runtime::logging::exit_code(run().await)
 }
 

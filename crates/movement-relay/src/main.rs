@@ -19,8 +19,23 @@ use config::Config;
 use event_sink::{EventSink, RedisEventSink};
 use kafka_source::{KafkaRawSource, RawKafkaSource};
 
+/// What `--print-config-defaults` prints (`ds_runtime::service_args`).
+fn config_defaults() -> ds_runtime::service_args::ConfigDefaults {
+    // Liveness must be the dependency-free /livez: on /healthz (readiness:
+    // a confirmed Kafka partition assignment) the relay was SIGKILLed
+    // whenever it was unready for ~2 minutes.
+    ds_runtime::service_args::ConfigDefaults::for_config::<Config>("movement-relay").contract(
+        "probe_paths",
+        serde_json::json!({
+            "liveness": health_http::LIVEZ_PATH,
+            "readiness": health_http::HEALTHZ_PATH,
+        }),
+    )
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    ds_runtime::service_args::exit_if_print_config_defaults(config_defaults);
     ds_runtime::logging::exit_code(run().await)
 }
 
