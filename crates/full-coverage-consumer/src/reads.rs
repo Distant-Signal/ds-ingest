@@ -79,12 +79,7 @@ mod tests {
     use crate::config::Config;
 
     fn parse(extra: &[&str]) -> Result<Config, clap::Error> {
-        let lines_dir = common::manifest_dir!().join("../../lines");
-        let base = [
-            "full-coverage-consumer".to_owned(),
-            "--lines-dir".to_owned(),
-            lines_dir.display().to_string(),
-        ];
+        let base = ["full-coverage-consumer".to_owned()];
         // The test environment may set DATABASE_URL.
         let database = if extra.contains(&"--database-url") {
             vec![]

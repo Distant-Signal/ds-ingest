@@ -116,9 +116,6 @@ COPY --from=builder /usr/local/bin/ingest-writer /usr/local/bin/ingest-writer
 #   kubectl run ... --image=<this image> --command -- \
 #     /usr/local/bin/writer-maintenance replay-uidless-movements
 COPY --from=builder /usr/local/bin/writer-maintenance /usr/local/bin/writer-maintenance
-# The line catalogue (`LINES_DIR`, default /app/lines): the sweeps build
-# their CRS-to-line index from it.
-COPY --chown=ingest-writer:ingest-writer lines/ /app/lines/
 
 # Numeric, for the chart's runAsNonRoot admission check.
 USER 1000:1000

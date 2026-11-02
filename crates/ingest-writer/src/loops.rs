@@ -82,13 +82,10 @@ mod tests {
 
     #[tokio::test]
     async fn registers_the_canary_and_the_five_train_loops() {
-        let lines = common::manifest_dir!().join("../../lines");
         let config = Config::try_parse_from([
             "ingest-writer",
             "--database-url",
             "postgres://writer@localhost/db",
-            "--lines-dir",
-            lines.to_str().unwrap(),
         ])
         .unwrap();
         let pool = sqlx::postgres::PgPoolOptions::new()

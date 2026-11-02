@@ -6,8 +6,7 @@
 //!
 //! ```text
 //!   DATABASE_URL=<writer role> writer-maintenance replay-uidless-movements [--since RFC3339]
-//!   DATABASE_URL=<incidents role> LINES_DIR=/app/lines \
-//!     writer-maintenance backfill-incident-lines
+//!   DATABASE_URL=<incidents role> writer-maintenance backfill-incident-lines
 //! ```
 //!
 //! - `replay-uidless-movements` (formerly the api's
@@ -65,8 +64,9 @@ enum Command {
     /// Recompute `incidents.affected_lines` from the line catalogue (as the
     /// `incidents` role).
     BackfillIncidentLines {
-        /// The line catalogue: the deployed image's.
-        #[arg(long, env = "LINES_DIR", default_value = "/app/lines")]
+        /// The line catalogue: the one built into the binary
+        /// (`ds_lines::EMBEDDED`), or a directory.
+        #[arg(long, env = "LINES_DIR", default_value = ds_lines::EMBEDDED)]
         lines_dir: String,
     },
 }
@@ -143,7 +143,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         }
         Command::BackfillIncidentLines { lines_dir } => {
             // The catalogue first: an empty one would clear every row.
-            let lines = common::config::parse_lines(&lines_dir)?;
+            let lines = ds_lines::parse_lines(&lines_dir)?;
             anyhow::ensure!(
                 !lines.is_empty(),
                 "no line definitions found in {lines_dir} -- refusing to run, since an empty \
