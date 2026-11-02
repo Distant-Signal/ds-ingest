@@ -1641,8 +1641,8 @@ stay, deprecated.**
 
 | Old api binary | New entry point | Image | Connects as | Logic |
 |---|---|---|---|---|
-| `backfill_trains` | `ds-migrate backfill-trains` | api (ds-migrate ships there) | `MIGRATION_DATABASE_URL` (the schema owner), else `DATABASE_URL` | `ds_store::migrate::legacy_backfill` (moved from `api::data`) |
-| `backfill_line_train_summaries` | `ds-migrate backfill-line-train-summaries [--force] [--lines-dir]` | api | same | `ds_store::schedule::summaries::backfill_all` |
+| `backfill_trains` | `ds-migrate backfill-trains` | ds-migrate (its own image since repo split phase 3; until then the api's) | `MIGRATION_DATABASE_URL` (the schema owner), else `DATABASE_URL` | `ds_store::migrate::legacy_backfill` (moved from `api::data`) |
+| `backfill_line_train_summaries` | `ds-migrate backfill-line-train-summaries [--force] [--lines-dir]` | ds-migrate | same | `ds_store::schedule::summaries::backfill_all` |
 | `replay_uidless_movements` | `writer-maintenance replay-uidless-movements [--since]` | ingest-writer | `DATABASE_URL`: the writer role | `ds_store::backlog::replay_uidless_backlog` |
 | `backfill_incident_lines` | `writer-maintenance backfill-incident-lines` | ingest-writer | `DATABASE_URL`: the **`incidents` role** (it holds `UPDATE` on `incidents`; the writer does not, and no grant was added) | `ds_store::incidents::line_backfill` (moved from `api::data`) |
 
