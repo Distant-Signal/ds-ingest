@@ -4,7 +4,7 @@ This runbook prepares phase 5 of
 [the ingest architecture plan](superpowers/plans/2026-10-06-ingest-architecture-plan.md)
 (spec: [design](superpowers/specs/2026-10-06-ingest-architecture-design.md),
 §13, §15.1, §6.4 and §16). It was written on 2026-10-08 against `main` at
-`dc2b4405`. File and line references are to that commit.
+`8e42554e`. File and line references are to that commit.
 
 **Status 2026-10-21.** Release A went live on 2026-10-10 and release B
 (5.1–5.3b) on 2026-10-13, with 0 `/private` requests in the 3 days since.
@@ -592,7 +592,7 @@ soak and the two-release split of 5.2/5.3).
 ### Rollback
 
 **The previous chart and the previous images together** (the release A
-chart, b6c26a99's images). The release A chart still defaults every
+chart, 7261d25e's images). The release A chart still defaults every
 producer to db/stream, so nothing calls `/private`; its api serves the
 routes again anyway. Notes:
 
@@ -846,7 +846,7 @@ the above clean and every `/private` route, GETs included, at 0.
 
 ### 0.5 Rollout deadlock
 
-**What happened** (2026-10-10 04:21 UTC, deploying b6c26a99).
+**What happened** (2026-10-10 04:21 UTC, deploying 7261d25e).
 trust-backlog-consumer ran 1 replica with the Deployment default rollout
 (RollingUpdate, maxSurge 1, maxUnavailable 0), and its role
 `distant_signal_trust_backlog` had the computed CONNECTION LIMIT 4 (pool 3
@@ -987,7 +987,7 @@ the enricher, and Helm v238 then succeeded.
 (`crates/api/src/routes/ingest.rs`) and `samples::router()`
 (`/sample-stations`, `crates/api/src/routes/samples.rs`).
 
-- **At `dc2b4405`:** 29 paths and 44 path-and-method pairs. The spec's
+- **At `8e42554e`:** 29 paths and 44 path-and-method pairs. The spec's
   27/44 predates `/tiploc-locations` and `/schedule-services`.
 - **Since the Q9 cleanup (2026-10-08): 26 paths and 34 pairs.** Ten pairs
   that no code called and production never saw were deleted ahead of
@@ -1925,7 +1925,7 @@ change in the api's environment: it loses `REDIS_URL`, and
 
 ### 4.1 `charts/distant-signal/files/db-grants.yaml`
 
-Against `dc2b4405`. The YAML already holds the design-target grants for
+Against `8e42554e`. The YAML already holds the design-target grants for
 the five observed roles. They have no effect today because the roles
 inherit everything from `distant_signal_app`. The diff is mostly
 `status`:

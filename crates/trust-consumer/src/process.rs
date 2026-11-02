@@ -567,7 +567,7 @@ pub(crate) struct PendingActivation {
 /// An Activation's origin date (`tp_origin_timestamp`, `YYYY-MM-DD`), when
 /// it parses and is within one day of the rail day the Activation was
 /// observed on -- the same plausibility rule `trust-backlog-consumer`
-/// applies to the same field (97ccd3ea). `None` otherwise, in which case
+/// applies to the same field (9433d646). `None` otherwise, in which case
 /// `api` keeps its old behaviour and keys the train on the subscription's
 /// own `service_date`.
 fn activation_origin_date(raw: Option<&str>, activation_rail_day: NaiveDate) -> Option<NaiveDate> {
