@@ -1,5 +1,5 @@
 use clap::Parser;
-use common::config::{LineCatalogue, parse_lines};
+use ds_lines::{LineCatalogue, parse_lines};
 
 /// Which transport this crate's `MovementFeed` uses -- now defined once in
 /// `movement_feed`, re-exported here so every existing
@@ -45,7 +45,7 @@ pub(crate) struct Config {
     // Static line catalogue, same value_parser pattern as aggregator's
     // own --lines-dir (needed to build the reverse tiploc->line index,
     // Task 9).
-    #[arg(long = "lines-dir", env = "LINES_DIR", default_value = "/app/lines", value_parser = parse_lines)]
+    #[arg(long = "lines-dir", env = "LINES_DIR", default_value = ds_lines::EMBEDDED, value_parser = parse_lines)]
     pub lines: LineCatalogue,
 
     #[arg(long, env, default_value = "0.0.0.0:8082")]
@@ -359,14 +359,10 @@ pub(crate) mod tests {
     /// never Kafka directly.
     #[test]
     fn movement_feed_backend_defaults_to_redis_stream_when_unset() {
-        let lines_dir = common::manifest_dir!().join("../../lines");
-
         let config = Config::try_parse_from([
             "full-coverage-consumer",
             "--database-url",
             "postgres://nobody@127.0.0.1:1/none",
-            "--lines-dir",
-            lines_dir.to_str().unwrap(),
         ])
         .expect("minimal required args should parse");
 
@@ -388,14 +384,11 @@ pub(crate) mod tests {
     /// value) still parses.
     #[test]
     fn an_explicit_kafka_backend_fails_startup() {
-        let lines_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lines");
         let parse = |backend: &str| {
             Config::try_parse_from([
                 "full-coverage-consumer",
                 "--database-url",
                 "postgres://nobody@127.0.0.1:1/none",
-                "--lines-dir",
-                lines_dir.to_str().unwrap(),
                 "--movement-feed-backend",
                 backend,
             ])

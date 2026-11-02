@@ -125,13 +125,10 @@ async fn every_writer_loop_runs_as_the_writer_role() {
     .await
     .unwrap();
 
-    let lines = common::manifest_dir!().join("../../lines");
     let config = Config::try_parse_from([
         "ingest-writer",
         "--database-url",
         "postgres://writer@localhost/db",
-        "--lines-dir",
-        lines.to_str().unwrap(),
     ])
     .unwrap();
     let mut runner = LoopRunner::new(writer.clone(), LockSession::new(writer.clone(), "t"));

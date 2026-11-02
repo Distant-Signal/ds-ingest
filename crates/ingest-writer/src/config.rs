@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use clap::Parser;
-use common::config::{LineCatalogue, parse_lines};
+use ds_lines::{LineCatalogue, parse_lines};
 use ds_runtime::secret::Secret;
 
 use crate::stream::StreamModes;
@@ -19,10 +19,10 @@ pub struct Config {
     #[arg(long, env, hide_env_values = true)]
     pub database_url: Secret,
 
-    /// Directory of line-catalogue TOML files, loaded once at startup (the
-    /// same default as the api's). The schedule-match and reconciliation
+    /// The line catalogue, loaded once at startup: the embedded one by
+    /// default (the same default as the api's), or a directory. The schedule-match and reconciliation
     /// sweeps build their CRS-to-line index from it, as the api does.
-    #[arg(long = "lines-dir", env = "LINES_DIR", default_value = "/app/lines", value_parser = parse_lines)]
+    #[arg(long = "lines-dir", env = "LINES_DIR", default_value = ds_lines::EMBEDDED, value_parser = parse_lines)]
     pub lines: LineCatalogue,
 
     /// Run the background loops (`ingestWriter.loops.enabled`). **Off by
@@ -260,14 +260,13 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// The embedded line catalogue (the default) and a database URL,
+    /// plus `extra`.
     fn args(extra: &[&str]) -> Vec<String> {
-        let lines = common::manifest_dir!().join("../../lines");
         let mut args = vec![
             "ingest-writer".to_owned(),
             "--database-url".to_owned(),
             "postgres://writer@localhost/db".to_owned(),
-            "--lines-dir".to_owned(),
-            lines.to_str().unwrap().to_owned(),
         ];
         args.extend(extra.iter().map(ToString::to_string));
         args

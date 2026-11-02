@@ -104,7 +104,8 @@ RUN apt-get update \
     && useradd --system --no-create-home --shell /usr/sbin/nologin --uid 1000 --gid 1000 trust-consumer
 
 COPY --from=builder /usr/local/bin/trust-consumer /usr/local/bin/trust-consumer
-COPY --chown=trust-consumer:trust-consumer reference-data/ /app/reference-data/
+# The --stanox-crs-file startup default (crates/trust-consumer/src/config.rs).
+COPY --chown=trust-consumer:trust-consumer crates/trust-consumer/reference-data/stanox-crs.csv /app/reference-data/stanox-crs.csv
 
 # Numeric USER, not the `trust-consumer` name useradd created above: Kubernetes'
 # runAsNonRoot admission check (this chart's podSecurityContext sets

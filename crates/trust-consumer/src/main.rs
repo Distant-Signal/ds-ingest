@@ -614,16 +614,16 @@ mod tests {
     use super::*;
     use crate::feed::FakeMovementFeed;
 
-    /// The real, checked-in `reference-data/stanox-crs.csv`, mirroring
+    /// The real, checked-in `crates/trust-consumer/reference-data/stanox-crs.csv`, mirroring
     /// `process.rs`'s own test fixture of the same name -- these tests
     /// depend on the real STANOX `"87212"` translating to `"WAT"` to match
     /// `one_pending_pin`'s pin.
     static TEST_STANOX_CRS: LazyLock<std::sync::RwLock<stanox_crs::StanoxCrsTable>> =
         LazyLock::new(|| {
-            let path = common::manifest_dir!().join("../../reference-data/stanox-crs.csv");
+            let path = common::manifest_dir!().join("reference-data/stanox-crs.csv");
             std::sync::RwLock::new(
                 stanox_crs::StanoxCrsTable::from_file(&path)
-                    .expect("reference-data/stanox-crs.csv should parse"),
+                    .expect("crates/trust-consumer/reference-data/stanox-crs.csv should parse"),
             )
         });
 
@@ -1321,7 +1321,7 @@ mod redis_outage_tests {
     }
 
     fn config(redis_url: &str) -> Config {
-        let stanox_crs_file = common::manifest_dir!().join("../../reference-data/stanox-crs.csv");
+        let stanox_crs_file = common::manifest_dir!().join("reference-data/stanox-crs.csv");
         Config::try_parse_from([
             "trust-consumer",
             "--database-url",

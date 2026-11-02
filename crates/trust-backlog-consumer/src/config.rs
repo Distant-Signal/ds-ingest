@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use clap::Parser;
-use common::config::{LineCatalogue, parse_lines};
+use ds_lines::{LineCatalogue, parse_lines};
 
 use crate::stanox_crs::StanoxCrsTable;
 
@@ -88,7 +88,7 @@ pub(crate) struct Config {
     /// docs/superpowers/plans/2026-09-05-schedule-first-train-tracking-plan.md's
     /// own equivalent index (see this plan's "Dependency on the
     /// schedule-first plan" section for the full reasoning).
-    #[arg(long = "lines-dir", env = "LINES_DIR", default_value = "/app/lines", value_parser = parse_lines)]
+    #[arg(long = "lines-dir", env = "LINES_DIR", default_value = ds_lines::EMBEDDED, value_parser = parse_lines)]
     pub lines: LineCatalogue,
 
     #[arg(long, env, default_value = "0.0.0.0:8083")]
@@ -152,14 +152,12 @@ mod tests {
     use super::Config;
 
     fn parse(extra: &[&str]) -> Result<Config, clap::Error> {
-        let stanox = common::manifest_dir!().join("../../reference-data/stanox-crs.csv");
-        let lines = common::manifest_dir!().join("../../lines");
+        let stanox =
+            common::manifest_dir!().join("../trust-consumer/reference-data/stanox-crs.csv");
         let mut base = vec![
             "trust-backlog-consumer".to_owned(),
             "--stanox-crs-file".to_owned(),
             stanox.display().to_string(),
-            "--lines-dir".to_owned(),
-            lines.display().to_string(),
         ];
         if !extra.contains(&"--database-url") {
             base.push("--database-url".to_owned());
