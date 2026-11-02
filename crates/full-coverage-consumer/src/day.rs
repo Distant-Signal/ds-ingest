@@ -116,7 +116,7 @@ impl DayState {
             let (rolled, unattributed) = trains.roll(next);
             for (msg_type, count) in unattributed {
                 metrics::counter!(
-                    common::metrics::metric_name("full_coverage_consumer_unattributed_total"),
+                    ds_runtime::metrics::metric_name("full_coverage_consumer_unattributed_total"),
                     "msg_type" => msg_type
                 )
                 .increment(count);
@@ -237,7 +237,7 @@ fn parse_counted(raw: &str) -> anyhow::Result<Vec<TrustMessage>> {
     let parsed = trust_schema::schema::parse_batch_detailed(raw)?;
     for failure in &parsed.failures {
         metrics::counter!(
-            common::metrics::metric_name("full_coverage_consumer_errors_total"),
+            ds_runtime::metrics::metric_name("full_coverage_consumer_errors_total"),
             "operation" => "parse_envelope",
             "msg_type" => failure.msg_type.clone()
         )
@@ -335,7 +335,7 @@ pub(crate) fn dispatch_message(
             );
             for (line_id, uid) in &result.matched_lines {
                 metrics::counter!(
-                    common::metrics::metric_name("full_coverage_consumer_events_matched_total"),
+                    ds_runtime::metrics::metric_name("full_coverage_consumer_events_matched_total"),
                     "line_id" => line_id.clone()
                 )
                 .increment(1);
@@ -356,7 +356,7 @@ pub(crate) fn dispatch_message(
                     derived,
                 );
                 if !matched_station {
-                    metrics::counter!(common::metrics::metric_name(
+                    metrics::counter!(ds_runtime::metrics::metric_name(
                         "full_coverage_consumer_station_buckets_dropped_total"
                     ))
                     .increment(1);

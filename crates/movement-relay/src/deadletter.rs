@@ -124,9 +124,9 @@ mod tests {
             std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
         }
 
-        async fn conn() -> common::redis_conn::RedisConn {
+        async fn conn() -> ds_runtime::redis_conn::RedisConn {
             let client = redis::Client::open(redis_url()).unwrap();
-            common::redis_conn::connect(&client).await.unwrap()
+            ds_runtime::redis_conn::connect(&client).await.unwrap()
         }
 
         fn unique_stream(name: &str) -> String {
@@ -137,7 +137,7 @@ mod tests {
             format!("relay-dl-test-{name}-{nanos}")
         }
 
-        async fn xadd_at(conn: &mut common::redis_conn::RedisConn, stream: &str, id: &str) {
+        async fn xadd_at(conn: &mut ds_runtime::redis_conn::RedisConn, stream: &str, id: &str) {
             let _: String = redis::cmd("XADD")
                 .arg(stream)
                 .arg(id)

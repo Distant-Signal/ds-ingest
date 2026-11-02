@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use common::config::{LineCatalogue, parse_lines};
-use common::secret::Secret;
+use ds_runtime::secret::Secret;
 
 use crate::stream::StreamModes;
 
@@ -14,7 +14,7 @@ use crate::stream::StreamModes;
 pub struct Config {
     /// The writer role's connection (`distant_signal_writer`, spec §6.6).
     /// Pool size and timeouts come from the shared `DATABASE_*` variables
-    /// (`common::pg`); the default pool is 6, plus one connection for the
+    /// (`ds_runtime::pg`); the default pool is 6, plus one connection for the
     /// loop locks.
     #[arg(long, env, hide_env_values = true)]
     pub database_url: Secret,
@@ -153,12 +153,12 @@ pub struct Config {
     pub metrics_port: u16,
 
     #[command(flatten)]
-    pub metrics: common::service_args::MetricsArgs,
+    pub metrics: ds_runtime::service_args::MetricsArgs,
 
     /// `/livez` (every loop making progress) and `/healthz` (also 503 until
     /// the database pool is up). SVC-08/INF-5.
     #[command(flatten)]
-    pub health: common::service_args::HealthArgs,
+    pub health: ds_runtime::service_args::HealthArgs,
 }
 
 impl Config {

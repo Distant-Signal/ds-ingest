@@ -3,7 +3,7 @@
 //! Secret).
 
 use clap::Parser;
-use common::secret::Secret;
+use ds_runtime::secret::Secret;
 
 #[derive(Debug, Parser)]
 #[expect(
@@ -76,9 +76,9 @@ pub(crate) struct Config {
     pub batch_max_records: usize,
 
     #[command(flatten)]
-    pub health: common::service_args::HealthArgs,
+    pub health: ds_runtime::service_args::HealthArgs,
     #[command(flatten)]
-    pub metrics: common::service_args::MetricsArgs,
+    pub metrics: ds_runtime::service_args::MetricsArgs,
     #[arg(long, env, default_value_t = 9095)]
     pub metrics_port: u16,
 }

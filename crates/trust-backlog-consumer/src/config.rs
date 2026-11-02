@@ -29,13 +29,13 @@ pub(crate) struct Config {
 
     /// Redis AUTH password (chart `redis.auth`, from a Secret). Unset or
     /// empty: no AUTH, `redis_url` is used as-is. Applied to `redis_url` by
-    /// `common::redis_auth::redis_url_with_password`, never logged.
+    /// `ds_runtime::redis_auth::redis_url_with_password`, never logged.
     #[arg(long, env, hide_env_values = true)]
-    pub redis_password: Option<common::secret::Secret>,
+    pub redis_password: Option<ds_runtime::secret::Secret>,
 
     /// Redis ACL user (chart `redis.acl`; ingest architecture phase 0c).
     /// Unset or empty: the `default` user, exactly as before. Combined with
-    /// `redis_password` by `common::redis_auth::redis_url_with_credentials`.
+    /// `redis_password` by `ds_runtime::redis_auth::redis_url_with_credentials`.
     #[arg(long, env)]
     pub redis_username: Option<String>,
 
@@ -56,10 +56,10 @@ pub(crate) struct Config {
     /// `ds_store::backlog::ingest_trust_event_backlog`,
     /// `ds_store::backlog::reasons::upsert_reasons`,
     /// `ds_store::reference::list_stanox_crs`; see `sink.rs`). Pool size and
-    /// timeouts come from the shared `DATABASE_*` variables (`common::pg`);
+    /// timeouts come from the shared `DATABASE_*` variables (`ds_runtime::pg`);
     /// the default pool is 3 (spec §6.6, role limit 4).
     #[arg(long, env, hide_env_values = true)]
-    pub database_url: common::secret::Secret,
+    pub database_url: ds_runtime::secret::Secret,
 
     /// STANOX->CRS translation table, loaded once at startup. Same file
     /// format/provenance as `trust-consumer`'s identical field --
@@ -100,13 +100,13 @@ pub(crate) struct Config {
     /// of this). A healthy iteration takes a few seconds (the `XREADGROUP`
     /// blocks for at most 5s); this is sized well above the worst
     /// legitimate one, every database call in it being bounded by the
-    /// pool's acquire and statement timeouts (`common::pg`).
+    /// pool's acquire and statement timeouts (`ds_runtime::pg`).
     #[arg(long, env, default_value_t = 300)]
     pub progress_stall_secs: u64,
     #[arg(long, env, default_value_t = 9096)]
     pub metrics_port: u16,
     #[command(flatten)]
-    pub metrics: common::service_args::MetricsArgs,
+    pub metrics: ds_runtime::service_args::MetricsArgs,
 
     /// Global kill switch for
     /// `common::trust_timestamp::parse_trust_epoch_millis_pair`'s

@@ -1,5 +1,5 @@
 //! darwin-relay's metrics, all `distant_signal_`-prefixed
-//! (`common::metrics::metric_name`). The chart's alerts read
+//! (`ds_runtime::metrics::metric_name`). The chart's alerts read
 //! [`LAST_MESSAGE`] (staleness) and [`CONSUMER_LAG`] (lag).
 
 #![expect(
@@ -8,7 +8,7 @@
 )]
 
 use chrono::{DateTime, Utc};
-use common::metrics::metric_name;
+use ds_runtime::metrics::metric_name;
 
 /// `darwin_relay_ready`: 1 while Kafka partitions are assigned.
 pub(crate) const READY: &str = "darwin_relay_ready";
