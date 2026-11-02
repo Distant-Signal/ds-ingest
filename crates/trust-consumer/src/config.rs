@@ -63,7 +63,7 @@ pub(crate) struct Config {
 
     /// STANOX->CRS translation table, loaded once at startup. See
     /// `crate::stanox_crs`'s module doc for the file format and
-    /// `reference-data/stanox-crs.md` for full provenance. Baked into the
+    /// `crates/trust-consumer/reference-data/stanox-crs.md` for full provenance. Baked into the
     /// image at `/app/reference-data/stanox-crs.csv` by
     /// `docker/trust-consumer.Dockerfile`, same pattern as `aggregator`'s
     /// `--lines-dir`/`LINES_DIR` (`crates/aggregator/src/config.rs`) --
@@ -183,7 +183,7 @@ pub(crate) mod tests {
     const DATABASE_URL: &str = "postgres://distant_signal_trust_consumer:pw@postgres/ds";
 
     pub(crate) fn parse(extra: &[&str]) -> Result<Config, clap::Error> {
-        let stanox_crs_file = common::manifest_dir!().join("../../reference-data/stanox-crs.csv");
+        let stanox_crs_file = common::manifest_dir!().join("reference-data/stanox-crs.csv");
         let base = [
             "trust-consumer".to_owned(),
             "--stanox-crs-file".to_owned(),

@@ -7,7 +7,7 @@
 //! # Known simplification left for follow-up work
 //!
 //! **STANOX->CRS translation is implemented via a table loaded once at
-//! startup from `reference-data/stanox-crs.csv`,
+//! startup from `crates/trust-consumer/reference-data/stanox-crs.csv`,
 //! `stanox_crs::StanoxCrsTable::stanox_to_crs`.** `loc_crs` in
 //! `process_message` is the real translated CRS (or `None` when the
 //! STANOX isn't in the table -- see below), and
@@ -18,7 +18,7 @@
 //! live -- this crate has no CIF SCHEDULE feed connection (a separate,
 //! larger, unbuilt ingestion pipeline; see
 //! docs/superpowers/specs/2026-08-30-schedule-feed-ingress-design.md) --
-//! see `stanox_crs`'s own module doc and `reference-data/stanox-crs.md`
+//! see `stanox_crs`'s own module doc and `crates/trust-consumer/reference-data/stanox-crs.md`
 //! for full provenance, the exact record format it was decoded against,
 //! and the (small, documented) set of STANOX values deliberately excluded
 //! as ambiguous. A lookup miss -- a genuinely unmapped or non-passenger
@@ -1928,7 +1928,7 @@ mod tests {
         assert_eq!(derived.delay_minutes, None);
     }
 
-    /// The real, checked-in `reference-data/stanox-crs.csv` -- not a
+    /// The real, checked-in `crates/trust-consumer/reference-data/stanox-crs.csv` -- not a
     /// synthetic fixture -- loaded once and shared across every test below,
     /// mirroring how `crates/aggregator`/`crates/api`'s own tests load the
     /// real `lines/` directory directly (see e.g.
@@ -1937,8 +1937,9 @@ mod tests {
     /// `"86031"`) actually translating, same as before this table moved out
     /// of a Rust literal.
     static TEST_STANOX_CRS: LazyLock<StanoxCrsTable> = LazyLock::new(|| {
-        let path = common::manifest_dir!().join("../../reference-data/stanox-crs.csv");
-        StanoxCrsTable::from_file(&path).expect("reference-data/stanox-crs.csv should parse")
+        let path = common::manifest_dir!().join("reference-data/stanox-crs.csv");
+        StanoxCrsTable::from_file(&path)
+            .expect("crates/trust-consumer/reference-data/stanox-crs.csv should parse")
     });
 
     /// `run_once`'s `received_at` for every test in this module that isn't
@@ -2435,7 +2436,7 @@ mod tests {
     #[tokio::test]
     async fn an_arrival_at_the_known_destination_produces_a_completed_event() {
         // ARRIVAL at WOK (86031 -- see this test module's own real
-        // `reference-data/stanox-crs.csv` STANOX->CRS translations).
+        // `crates/trust-consumer/reference-data/stanox-crs.csv` STANOX->CRS translations).
         let arrival_at_destination = r#"[{"header":{"msg_type":"0003"},"body":{
             "train_id":"221832406","event_type":"ARRIVAL",
             "planned_timestamp":"1787946600000","actual_timestamp":"1787946600000",

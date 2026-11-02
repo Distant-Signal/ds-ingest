@@ -11,7 +11,7 @@
 //!
 //! Two tiers, in order:
 //!
-//! 1. **Startup / fallback**: `reference-data/stanox-crs.csv`, loaded once
+//! 1. **Startup / fallback**: `crates/trust-consumer/reference-data/stanox-crs.csv`, loaded once
 //!    at process startup via `StanoxCrsTable::from_file` -- the
 //!    `--stanox-crs-file`/`STANOX_CRS_FILE` flag in `config.rs`, unchanged
 //!    since before the live table existed. This remains the checked-in
@@ -34,7 +34,7 @@
 //! **Full provenance for the CSV specifically** -- exactly how it was
 //! extracted, the record format's byte offsets, and the documented
 //! exclusion policy for ambiguous STANOX values -- lives in
-//! `reference-data/stanox-crs.md`. The live table applies the identical
+//! `crates/trust-consumer/reference-data/stanox-crs.md`. The live table applies the identical
 //! exclusion policy, reimplemented as real code in
 //! `crates/schedule-reference/src/parser.rs`.
 //!
@@ -42,7 +42,7 @@
 //! error: it covers both genuinely non-passenger locations (signals,
 //! junctions, sidings, depots have no CRS to begin with) and this
 //! snapshot's small set of deliberately-excluded ambiguous STANOX values
-//! (see `reference-data/stanox-crs.md`). The caller (`process.rs`) already
+//! (see `crates/trust-consumer/reference-data/stanox-crs.md`). The caller (`process.rs`) already
 //! falls back to the raw STANOX for display (see
 //! `journey::apply_movement`), and a pin simply won't match on that event
 //! -- exactly as if the location were untranslatable, which today it
@@ -65,7 +65,7 @@ struct StanoxCrsRecord {
 }
 
 /// The loaded STANOX->CRS table, built once at startup from
-/// `reference-data/stanox-crs.csv` (see this module's doc comment).
+/// `crates/trust-consumer/reference-data/stanox-crs.csv` (see this module's doc comment).
 ///
 /// Holds owned `String`s rather than `&'static str`s, since the data is no
 /// longer a compile-time literal -- same choice `common::LineDefinition`
@@ -214,8 +214,9 @@ mod tests {
     /// `lines/` directory directly (e.g. `crates/aggregator/src/segments.rs`'s
     /// `load_all_lines`), rather than a synthetic stand-in.
     fn load_real_table() -> StanoxCrsTable {
-        let path = common::manifest_dir!().join("../../reference-data/stanox-crs.csv");
-        StanoxCrsTable::from_file(&path).expect("reference-data/stanox-crs.csv should parse")
+        let path = common::manifest_dir!().join("../trust-consumer/reference-data/stanox-crs.csv");
+        StanoxCrsTable::from_file(&path)
+            .expect("crates/trust-consumer/reference-data/stanox-crs.csv should parse")
     }
 
     /// Real `TI` lines from `timetable_full.zip`'s `RJTTF942MCA.txt`
@@ -232,7 +233,7 @@ mod tests {
         "TIABRDEEN00897600GABERDEEN                  020712800ABDABERDEEN                ";
     const REAL_GLASGOW_CENTRAL: &str =
         "TIGLGC   04981300TGLASGOW CENTRAL           072572857GLCGLASGOW CENTRAL         ";
-    /// The STANOX-sharing case `reference-data/stanox-crs.md` documents:
+    /// The STANOX-sharing case `crates/trust-consumer/reference-data/stanox-crs.md` documents:
     /// `87201` is shared by London Victoria's real passenger CRS (`VIC`,
     /// this line)...
     const REAL_VICTORIA: &str =
@@ -309,7 +310,7 @@ mod tests {
     fn a_shared_stanox_resolves_to_the_real_passenger_crs_not_the_pseudo_code() {
         // 87201 is genuinely shared by TIPLOC VICTRIA (CRS VIC, a real
         // bookable station) and TIPLOC VICTRCR (CRS XVR, a non-passenger
-        // pseudo-code) in the real data -- see reference-data/stanox-crs.md
+        // pseudo-code) in the real data -- see crates/trust-consumer/reference-data/stanox-crs.md
         // and the two REAL_VICTORIA* fixtures above.
         let table = load_real_table();
         assert_eq!(table.stanox_to_crs("87201"), Some("VIC".to_string()));
@@ -329,7 +330,7 @@ mod tests {
         // 89428 real-world maps to two distinct real (non-X) CRS codes
         // across two TIPLOCs (an Ashford-area station cluster) with no
         // principled way to pick one -- deliberately excluded from the
-        // data file rather than guessed at. See reference-data/stanox-crs.md.
+        // data file rather than guessed at. See crates/trust-consumer/reference-data/stanox-crs.md.
         let table = load_real_table();
         assert_eq!(table.stanox_to_crs("89428"), None);
     }

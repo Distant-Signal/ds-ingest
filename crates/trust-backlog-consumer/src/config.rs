@@ -152,7 +152,8 @@ mod tests {
     use super::Config;
 
     fn parse(extra: &[&str]) -> Result<Config, clap::Error> {
-        let stanox = common::manifest_dir!().join("../../reference-data/stanox-crs.csv");
+        let stanox =
+            common::manifest_dir!().join("../trust-consumer/reference-data/stanox-crs.csv");
         let mut base = vec![
             "trust-backlog-consumer".to_owned(),
             "--stanox-crs-file".to_owned(),

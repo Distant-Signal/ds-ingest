@@ -9,7 +9,7 @@
 # rdkafka entirely (see docs/superpowers/plans/2026-09-04-movement-relay-plan.md
 # Task 16).
 #
-# No reference-data/ COPY step, unlike trust-consumer: this crate never
+# No STANOX/CRS table COPY step, unlike trust-consumer: this crate never
 # touches STANOX/CRS translation or the line catalogue -- it only classifies envelopes by header.msg_type
 # (trust_schema::schema::confirmed_envelope_bodies) and republishes raw
 # bytes, nothing else.

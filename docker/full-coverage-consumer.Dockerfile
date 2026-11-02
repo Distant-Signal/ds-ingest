@@ -101,7 +101,7 @@ RUN apt-get update \
     && useradd --system --no-create-home --shell /usr/sbin/nologin --uid 1000 --gid 1000 full-coverage-consumer
 
 COPY --from=builder /usr/local/bin/full-coverage-consumer /usr/local/bin/full-coverage-consumer
-# No reference-data COPY step (unlike trust-consumer): this crate's own
+# No STANOX/CRS table COPY step (unlike trust-consumer): this crate's own
 # STANOX/CRS table is always live-reloaded via queries::fetch_stanox_crs,
 # never a --stanox-crs-file startup default (confirmed against Task 9's
 # final config.rs -- it has no such flag at all).

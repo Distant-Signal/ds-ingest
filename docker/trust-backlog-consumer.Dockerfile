@@ -114,7 +114,7 @@ RUN apt-get update \
     && useradd --system --no-create-home --shell /usr/sbin/nologin --uid 1000 --gid 1000 trust-backlog-consumer
 
 COPY --from=builder /usr/local/bin/trust-backlog-consumer /usr/local/bin/trust-backlog-consumer
-COPY --chown=trust-backlog-consumer:trust-backlog-consumer reference-data/ /app/reference-data/
+COPY --chown=trust-backlog-consumer:trust-backlog-consumer crates/trust-consumer/reference-data/stanox-crs.csv /app/reference-data/stanox-crs.csv
 
 # Numeric USER, not the `trust-backlog-consumer` name useradd created
 # above: Kubernetes' runAsNonRoot admission check (this chart's
