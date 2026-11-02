@@ -57,7 +57,7 @@ pub(crate) struct Config {
     /// of this). A healthy iteration takes a few seconds (the `XREADGROUP`
     /// blocks for at most 5s); this is sized well above the worst
     /// legitimate one, every Postgres read in it being bounded by the
-    /// pool's timeouts (`common::pg`).
+    /// pool's timeouts (`ds_runtime::pg`).
     /// Larger than the other two consumers': one iteration here can also
     /// run a stats write, and a restart costs a startup replay of the rail
     /// day so far (see `replay.rs`). The population reload no longer runs
@@ -68,7 +68,7 @@ pub(crate) struct Config {
     #[arg(long, env, default_value_t = 9093)]
     pub metrics_port: u16,
     #[command(flatten)]
-    pub metrics: common::service_args::MetricsArgs,
+    pub metrics: ds_runtime::service_args::MetricsArgs,
 
     /// Which transport this crate's `MovementFeed` uses. Only
     /// `redis-stream` remains; `kafka` was removed in Deploy C (PL-15a) and
@@ -83,13 +83,13 @@ pub(crate) struct Config {
 
     /// Redis AUTH password (chart `redis.auth`, from a Secret). Unset or
     /// empty: no AUTH, `redis_url` is used as-is. Applied to `redis_url` by
-    /// `common::redis_auth::redis_url_with_password`, never logged.
+    /// `ds_runtime::redis_auth::redis_url_with_password`, never logged.
     #[arg(long, env, hide_env_values = true)]
-    pub redis_password: Option<common::secret::Secret>,
+    pub redis_password: Option<ds_runtime::secret::Secret>,
 
     /// Redis ACL user (chart `redis.acl`; ingest architecture phase 0c).
     /// Unset or empty: the `default` user, exactly as before. Combined with
-    /// `redis_password` by `common::redis_auth::redis_url_with_credentials`.
+    /// `redis_password` by `ds_runtime::redis_auth::redis_url_with_credentials`.
     #[arg(long, env)]
     pub redis_username: Option<String>,
 
@@ -291,7 +291,7 @@ pub(crate) mod tests {
             health_bind_url: String::new(),
             progress_stall_secs: 900,
             metrics_port: 9093,
-            metrics: common::service_args::MetricsArgs {
+            metrics: ds_runtime::service_args::MetricsArgs {
                 metrics_enabled: false,
             },
             movement_feed_backend: MovementFeedBackend::RedisStream,
@@ -309,7 +309,7 @@ pub(crate) mod tests {
                 line_membership: LineMembershipMode::Legacy,
             },
             reads: crate::reads::InternalReadArgs {
-                database_url: common::secret::Secret::new("postgres://nobody@127.0.0.1:1/none"),
+                database_url: ds_runtime::secret::Secret::new("postgres://nobody@127.0.0.1:1/none"),
             },
         }
     }

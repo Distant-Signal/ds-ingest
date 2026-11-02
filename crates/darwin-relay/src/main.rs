@@ -34,15 +34,15 @@ const MAX_BUFFERED: NonZeroUsize = NonZeroUsize::MIN.saturating_add(3);
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    common::logging::exit_code(run().await)
+    ds_runtime::logging::exit_code(run().await)
 }
 
 async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    common::logging::init("darwin-relay");
+    ds_runtime::logging::init("darwin-relay");
     let config = Config::parse();
     if config.metrics.metrics_enabled {
-        common::metrics::install(config.metrics_port)?;
+        ds_runtime::metrics::install(config.metrics_port)?;
         metrics::register();
     }
 
@@ -54,7 +54,7 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // The result carries the password: pass it on, never log it.
-    let redis_url = common::redis_auth::redis_url_with_credentials(
+    let redis_url = ds_runtime::redis_auth::redis_url_with_credentials(
         &config.redis_url,
         config.redis_username.as_deref(),
         config.redis_password.as_ref(),

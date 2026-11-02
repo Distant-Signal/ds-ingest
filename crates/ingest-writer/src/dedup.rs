@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use common::advisory_locks;
+use ds_runtime::advisory_locks;
 use ds_store::loops::LoopSpec;
 use sqlx::{PgConnection, PgPool};
 

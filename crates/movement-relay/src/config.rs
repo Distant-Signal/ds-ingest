@@ -10,7 +10,7 @@ pub(crate) struct Config {
     /// hand -- same posture as trust-consumer/src/config.rs's own
     /// identical field.
     #[command(flatten)]
-    pub kafka: common::service_args::KafkaConnectionArgs,
+    pub kafka: ds_runtime::service_args::KafkaConnectionArgs,
 
     /// The one real, RDM-issued group -- `SC-c4d90f8e-...` in production,
     /// per the design doc's "Why this exists" section. Deliberately no
@@ -43,13 +43,13 @@ pub(crate) struct Config {
 
     /// Redis AUTH password (chart `redis.auth`, from a Secret). Unset or
     /// empty: no AUTH, `redis_url` is used as-is. Applied to `redis_url` by
-    /// `common::redis_auth::redis_url_with_password`, never logged.
+    /// `ds_runtime::redis_auth::redis_url_with_password`, never logged.
     #[arg(long, env, hide_env_values = true)]
-    pub redis_password: Option<common::secret::Secret>,
+    pub redis_password: Option<ds_runtime::secret::Secret>,
 
     /// Redis ACL user (chart `redis.acl`; ingest architecture phase 0c).
     /// Unset or empty: the `default` user, exactly as before. Combined with
-    /// `redis_password` by `common::redis_auth::redis_url_with_credentials`.
+    /// `redis_password` by `ds_runtime::redis_auth::redis_url_with_credentials`.
     #[arg(long, env)]
     pub redis_username: Option<String>,
 

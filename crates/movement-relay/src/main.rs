@@ -21,16 +21,16 @@ use kafka_source::{KafkaRawSource, RawKafkaSource};
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    common::logging::exit_code(run().await)
+    ds_runtime::logging::exit_code(run().await)
 }
 
 async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    common::logging::init("movement-relay");
+    ds_runtime::logging::init("movement-relay");
 
     let config = Config::parse();
     if config.metrics_enabled {
-        common::metrics::install(config.metrics_port)?;
+        ds_runtime::metrics::install(config.metrics_port)?;
     }
 
     // Readiness (`/healthz`) stays "confirmed Kafka partition assignment"
@@ -46,9 +46,9 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // REDIS_USERNAME and REDIS_PASSWORD, when set, are applied here
-    // (common::redis_auth). The result carries the password: pass it on,
+    // (ds_runtime::redis_auth). The result carries the password: pass it on,
     // never log it.
-    let redis_url = common::redis_auth::redis_url_with_credentials(
+    let redis_url = ds_runtime::redis_auth::redis_url_with_credentials(
         &config.redis_url,
         config.redis_username.as_deref(),
         config.redis_password.as_ref(),
@@ -59,7 +59,7 @@ async fn run() -> anyhow::Result<()> {
         redis_url.expose(),
         config.movement_stream_maxlen,
         config.movement_consumer_groups.clone(),
-        common::startup::CONNECT_BACKOFF,
+        ds_runtime::startup::CONNECT_BACKOFF,
         &progress,
     )
     .await?;
@@ -71,7 +71,7 @@ async fn run() -> anyhow::Result<()> {
     }
     let mut source = KafkaRawSource::connect(&config, ready, progress.clone())?;
 
-    tokio::spawn(stream_lag_loop::<common::redis_conn::RedisConn>(
+    tokio::spawn(stream_lag_loop::<ds_runtime::redis_conn::RedisConn>(
         redis_url.expose().to_owned(),
         Duration::from_secs(config.stream_lag_poll_secs),
         config.movement_stream_maxlen,
@@ -140,7 +140,7 @@ where
         Err(err) => {
             tracing::error!(error = ?err, "error receiving from Kafka");
             metrics::counter!(
-                common::metrics::metric_name("movement_relay_errors_total"),
+                ds_runtime::metrics::metric_name("movement_relay_errors_total"),
                 "operation" => "kafka_receive"
             )
             .increment(1);
@@ -165,7 +165,7 @@ where
     if let Err(err) = source.commit().await {
         tracing::error!(error = ?err, "failed to commit Kafka offset");
         metrics::counter!(
-            common::metrics::metric_name("movement_relay_errors_total"),
+            ds_runtime::metrics::metric_name("movement_relay_errors_total"),
             "operation" => "commit_offsets"
         )
         .increment(1);
@@ -207,7 +207,7 @@ where
                         "skipping TRUST envelopes with no header.msg_type; publishing the rest of the record"
                     );
                     metrics::counter!(
-                        common::metrics::metric_name("movement_relay_errors_total"),
+                        ds_runtime::metrics::metric_name("movement_relay_errors_total"),
                         "operation" => "classify_envelope"
                     )
                     .increment(classified.malformed as u64);
@@ -224,7 +224,7 @@ where
                 // with its raw payload and counted here.
                 tracing::error!(error = ?err, raw = %raw, "failed to classify Kafka record; skipping it");
                 metrics::counter!(
-                    common::metrics::metric_name("movement_relay_errors_total"),
+                    ds_runtime::metrics::metric_name("movement_relay_errors_total"),
                     "operation" => "classify_record"
                 )
                 .increment(1);
@@ -235,14 +235,14 @@ where
             if let Err(err) = sink.publish(msg_type, payload).await {
                 tracing::error!(error = ?err, msg_type, "failed to XADD envelope; not committing this record's offset, and holding it for redelivery");
                 metrics::counter!(
-                    common::metrics::metric_name("movement_relay_errors_total"),
+                    ds_runtime::metrics::metric_name("movement_relay_errors_total"),
                     "operation" => "publish_event"
                 )
                 .increment(1);
                 return BatchOutcome::PublishFailed;
             }
             metrics::counter!(
-                common::metrics::metric_name("movement_relay_events_published_total"),
+                ds_runtime::metrics::metric_name("movement_relay_events_published_total"),
                 "msg_type" => msg_type.clone()
             )
             .increment(1);
@@ -264,7 +264,7 @@ where
 const STREAM_LAG_GROUPS: [&str; 3] = event_sink::DEFAULT_CONSUMER_GROUPS;
 
 /// A Redis connection capable of computing `movement-events` consumer-group
-/// lag -- split out from a concrete `common::redis_conn::RedisConn` purely so
+/// lag -- split out from a concrete `ds_runtime::redis_conn::RedisConn` purely so
 /// `stream_lag_loop`'s retry state machine (`run_lag_tick`) is unit-testable
 /// against a fake that can be told to fail its first N connect attempts,
 /// without a real Redis. Same fake-behind-a-trait shape `RawKafkaSource` /
@@ -291,12 +291,12 @@ trait LagConnection: Sized + Send + 'static {
 }
 
 #[async_trait::async_trait]
-impl LagConnection for common::redis_conn::RedisConn {
+impl LagConnection for ds_runtime::redis_conn::RedisConn {
     async fn connect(redis_url: &str) -> anyhow::Result<Self> {
         let client = redis::Client::open(redis_url)?;
-        // One bounded attempt per tick (see `common::redis_conn`):
+        // One bounded attempt per tick (see `ds_runtime::redis_conn`):
         // `run_lag_tick` already retries every tick.
-        Ok(common::redis_conn::connect(&client).await?)
+        Ok(ds_runtime::redis_conn::connect(&client).await?)
     }
 
     async fn group_lag(&mut self, group: &str) -> anyhow::Result<Option<i64>> {
@@ -451,46 +451,51 @@ struct LagSample {
     reason = "metric gauges take f64, and these counts and timestamps stay far below 2^52"
 )]
 fn publish_lag_sample(sample: &LagSample, maxlen: u64) {
-    metrics::gauge!(common::metrics::metric_name(STREAM_MAXLEN_METRIC)).set(maxlen as f64);
+    metrics::gauge!(ds_runtime::metrics::metric_name(STREAM_MAXLEN_METRIC)).set(maxlen as f64);
     if let Some(len) = sample.stream_length {
-        metrics::gauge!(common::metrics::metric_name(STREAM_LENGTH_METRIC)).set(len as f64);
+        metrics::gauge!(ds_runtime::metrics::metric_name(STREAM_LENGTH_METRIC)).set(len as f64);
     }
     for (group, lag) in &sample.group_lags {
         metrics::gauge!(
-            common::metrics::metric_name(STREAM_LAG_METRIC),
+            ds_runtime::metrics::metric_name(STREAM_LAG_METRIC),
             "group" => *group
         )
         .set(*lag as f64);
     }
     for (group, pending) in &sample.group_pending {
         metrics::gauge!(
-            common::metrics::metric_name(STREAM_PENDING_METRIC),
+            ds_runtime::metrics::metric_name(STREAM_PENDING_METRIC),
             "group" => *group
         )
         .set(*pending as f64);
     }
     if let Some(trimmed) = sample.deadletter_trimmed {
-        metrics::counter!(common::metrics::metric_name(DEADLETTER_TRIMMED_METRIC))
+        metrics::counter!(ds_runtime::metrics::metric_name(DEADLETTER_TRIMMED_METRIC))
             .increment(trimmed);
     }
     if let Some(age) = sample.deadletter_oldest_age_secs {
-        metrics::gauge!(common::metrics::metric_name(DEADLETTER_OLDEST_AGE_METRIC)).set(age as f64);
+        metrics::gauge!(ds_runtime::metrics::metric_name(
+            DEADLETTER_OLDEST_AGE_METRIC
+        ))
+        .set(age as f64);
     }
     if let Some(len) = sample.deadletter_length {
         metrics::gauge!(
-            common::metrics::metric_name(DEADLETTER_LENGTH_METRIC),
+            ds_runtime::metrics::metric_name(DEADLETTER_LENGTH_METRIC),
             "stream" => DEADLETTER_STREAM
         )
         .set(len as f64);
     }
     if let Some(status) = sample.persistence {
         let flag = |ok: bool| if ok { 1.0 } else { 0.0 };
-        metrics::gauge!(common::metrics::metric_name(AOF_ENABLED_METRIC))
+        metrics::gauge!(ds_runtime::metrics::metric_name(AOF_ENABLED_METRIC))
             .set(flag(status.aof_enabled));
-        metrics::gauge!(common::metrics::metric_name(AOF_LAST_WRITE_OK_METRIC))
+        metrics::gauge!(ds_runtime::metrics::metric_name(AOF_LAST_WRITE_OK_METRIC))
             .set(flag(status.aof_last_write_ok));
-        metrics::gauge!(common::metrics::metric_name(AOF_LAST_BGREWRITE_OK_METRIC))
-            .set(flag(status.aof_last_bgrewrite_ok));
+        metrics::gauge!(ds_runtime::metrics::metric_name(
+            AOF_LAST_BGREWRITE_OK_METRIC
+        ))
+        .set(flag(status.aof_last_bgrewrite_ok));
     }
 }
 
@@ -531,7 +536,7 @@ async fn stream_lag_loop<C: LagConnection>(
 ) {
     let mut conn: Option<C> = None;
     // Registered at 0 so a trim shows up in `increase()` from the first one.
-    metrics::counter!(common::metrics::metric_name(DEADLETTER_TRIMMED_METRIC)).increment(0);
+    metrics::counter!(ds_runtime::metrics::metric_name(DEADLETTER_TRIMMED_METRIC)).increment(0);
     loop {
         tokio::time::sleep(interval).await;
         let now_ms = std::time::SystemTime::now()
@@ -561,7 +566,7 @@ async fn run_lag_tick<C: LagConnection>(
             Err(err) => {
                 tracing::warn!(error = ?err, "stream_lag_loop: failed to (re)connect; will retry next tick");
                 metrics::counter!(
-                    common::metrics::metric_name("movement_relay_errors_total"),
+                    ds_runtime::metrics::metric_name("movement_relay_errors_total"),
                     "operation" => "redis_connect"
                 )
                 .increment(1);
@@ -652,7 +657,7 @@ async fn run_lag_tick<C: LagConnection>(
 /// (this function serves three group names from one binary; enricher's own
 /// copy only ever serves one, `"enricher"`) and field.
 async fn group_info_field(
-    conn: &mut common::redis_conn::RedisConn,
+    conn: &mut ds_runtime::redis_conn::RedisConn,
     group: &str,
     field: &str,
 ) -> anyhow::Result<Option<i64>> {
@@ -1385,43 +1390,43 @@ mod tests {
     #[test]
     fn stream_gauge_names_match_the_chart_alert_rules() {
         assert_eq!(
-            common::metrics::metric_name(STREAM_LAG_METRIC),
+            ds_runtime::metrics::metric_name(STREAM_LAG_METRIC),
             "distant_signal_movement_relay_stream_lag"
         );
         assert_eq!(
-            common::metrics::metric_name(STREAM_LENGTH_METRIC),
+            ds_runtime::metrics::metric_name(STREAM_LENGTH_METRIC),
             "distant_signal_movement_relay_stream_length"
         );
         assert_eq!(
-            common::metrics::metric_name(STREAM_MAXLEN_METRIC),
+            ds_runtime::metrics::metric_name(STREAM_MAXLEN_METRIC),
             "distant_signal_movement_relay_stream_maxlen"
         );
         assert_eq!(
-            common::metrics::metric_name(STREAM_PENDING_METRIC),
+            ds_runtime::metrics::metric_name(STREAM_PENDING_METRIC),
             "distant_signal_movement_relay_stream_pending"
         );
         assert_eq!(
-            common::metrics::metric_name(DEADLETTER_LENGTH_METRIC),
+            ds_runtime::metrics::metric_name(DEADLETTER_LENGTH_METRIC),
             "distant_signal_movement_relay_deadletter_length"
         );
         assert_eq!(
-            common::metrics::metric_name(DEADLETTER_TRIMMED_METRIC),
+            ds_runtime::metrics::metric_name(DEADLETTER_TRIMMED_METRIC),
             "distant_signal_movement_relay_deadletter_trimmed_total"
         );
         assert_eq!(
-            common::metrics::metric_name(DEADLETTER_OLDEST_AGE_METRIC),
+            ds_runtime::metrics::metric_name(DEADLETTER_OLDEST_AGE_METRIC),
             "distant_signal_movement_relay_deadletter_oldest_age_seconds"
         );
         assert_eq!(
-            common::metrics::metric_name(AOF_ENABLED_METRIC),
+            ds_runtime::metrics::metric_name(AOF_ENABLED_METRIC),
             "distant_signal_redis_aof_enabled"
         );
         assert_eq!(
-            common::metrics::metric_name(AOF_LAST_WRITE_OK_METRIC),
+            ds_runtime::metrics::metric_name(AOF_LAST_WRITE_OK_METRIC),
             "distant_signal_redis_aof_last_write_ok"
         );
         assert_eq!(
-            common::metrics::metric_name(AOF_LAST_BGREWRITE_OK_METRIC),
+            ds_runtime::metrics::metric_name(AOF_LAST_BGREWRITE_OK_METRIC),
             "distant_signal_redis_aof_last_bgrewrite_ok"
         );
     }

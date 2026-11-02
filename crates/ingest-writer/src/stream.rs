@@ -26,8 +26,8 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
-use common::progress::Progress;
-use common::redis_conn::RedisConn;
+use ds_runtime::progress::Progress;
+use ds_runtime::redis_conn::RedisConn;
 use ingest_stream::{
     ConsumerConfig, Handled, Handler, HandlerError, StreamConsumer, StreamEntry, budget, streams,
 };
@@ -430,10 +430,10 @@ pub fn spawn(runtime: &StreamRuntime, modes: &StreamModes) -> RunningStreams {
         let stop = stopped(shutdown.subscribe());
         let mode = *mode;
         tasks.spawn(async move {
-            let conn = common::redis_conn::connect_until_ready(
+            let conn = ds_runtime::redis_conn::connect_until_ready(
                 "Redis (ingest stream)",
                 &client,
-                common::startup::CONNECT_BACKOFF,
+                ds_runtime::startup::CONNECT_BACKOFF,
                 Some(&task_progress),
             )
             .await;
@@ -468,10 +468,10 @@ async fn trim_task(
     stop: impl Future<Output = ()>,
 ) {
     let mut stop = std::pin::pin!(stop);
-    let connect = common::redis_conn::connect_until_ready(
+    let connect = ds_runtime::redis_conn::connect_until_ready(
         "Redis (dead-letter trim)",
         &client,
-        common::startup::CONNECT_BACKOFF,
+        ds_runtime::startup::CONNECT_BACKOFF,
         None,
     );
     let mut conn = tokio::select! {

@@ -788,7 +788,7 @@ pub(crate) fn apply_stanox_crs_reload(
         Err(err) => {
             tracing::error!(error = ?err, "failed to reload stanox_crs table; keeping the currently loaded table");
             metrics::counter!(
-                common::metrics::metric_name("trust_consumer_errors_total"),
+                ds_runtime::metrics::metric_name("trust_consumer_errors_total"),
                 "operation" => "reload_stanox_crs"
             )
             .increment(1);
@@ -920,7 +920,7 @@ pub(crate) async fn run_once<F: MovementFeed + movement_feed::DeadLetterSink>(
                      continuing with the rest of the batch"
                 );
                 metrics::counter!(
-                    common::metrics::metric_name("trust_consumer_errors_total"),
+                    ds_runtime::metrics::metric_name("trust_consumer_errors_total"),
                     "operation" => "parse_batch"
                 )
                 .increment(1);
@@ -947,7 +947,7 @@ pub(crate) async fn run_once<F: MovementFeed + movement_feed::DeadLetterSink>(
             // received, per type, answering "is trust-consumer actually
             // seeing what movement-relay is sending it."
             metrics::counter!(
-                common::metrics::metric_name("trust_consumer_events_received_total"),
+                ds_runtime::metrics::metric_name("trust_consumer_events_received_total"),
                 "msg_type" => msg_type_label(&message)
             )
             .increment(1);
@@ -957,7 +957,7 @@ pub(crate) async fn run_once<F: MovementFeed + movement_feed::DeadLetterSink>(
             // directly comparable with `trust_consumer_events_received_total`
             // in the same way it always was.
             for event in process_message(&message, reference, state, stanox_crs, received_at) {
-                metrics::counter!(common::metrics::metric_name(
+                metrics::counter!(ds_runtime::metrics::metric_name(
                     "trust_consumer_events_matched_total"
                 ))
                 .increment(1);
@@ -980,7 +980,7 @@ pub(crate) async fn run_once<F: MovementFeed + movement_feed::DeadLetterSink>(
 fn count_envelope_failures(failures: &[trust_schema::schema::EnvelopeFailure]) {
     for failure in failures {
         metrics::counter!(
-            common::metrics::metric_name("trust_consumer_errors_total"),
+            ds_runtime::metrics::metric_name("trust_consumer_errors_total"),
             "operation" => "parse_envelope",
             "msg_type" => failure.msg_type.clone()
         )
@@ -1253,7 +1253,7 @@ fn process_message(
             // there was no `actual_timestamp` to anchor on at all.
             if let Some(was_corrected) = timestamp_pair.was_corrected {
                 metrics::counter!(
-                    common::metrics::metric_name("trust_consumer_timestamp_correction_total"),
+                    ds_runtime::metrics::metric_name("trust_consumer_timestamp_correction_total"),
                     "outcome" => if was_corrected { "corrected" } else { "raw" }
                 )
                 .increment(1);
@@ -1606,7 +1606,7 @@ fn process_message(
             );
             if let Some(was_corrected) = canx_pair.was_corrected {
                 metrics::counter!(
-                    common::metrics::metric_name("trust_consumer_timestamp_correction_total"),
+                    ds_runtime::metrics::metric_name("trust_consumer_timestamp_correction_total"),
                     "outcome" => if was_corrected { "corrected" } else { "raw" }
                 )
                 .increment(1);
@@ -1695,7 +1695,7 @@ fn process_message(
             );
             if let Some(was_corrected) = reinstated_pair.was_corrected {
                 metrics::counter!(
-                    common::metrics::metric_name("trust_consumer_timestamp_correction_total"),
+                    ds_runtime::metrics::metric_name("trust_consumer_timestamp_correction_total"),
                     "outcome" => if was_corrected { "corrected" } else { "raw" }
                 )
                 .increment(1);
