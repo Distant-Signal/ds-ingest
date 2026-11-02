@@ -576,7 +576,7 @@ impl<C: ConsumerOps> RawKafkaSource for KafkaRawSource<C> {
 #[cfg(test)]
 fn test_config() -> Config {
     Config {
-        kafka: common::service_args::KafkaConnectionArgs {
+        kafka: ds_runtime::service_args::KafkaConnectionArgs {
             kafka_brokers: "kafka.example:9094".to_string(),
             kafka_topic: "test-topic".to_string(),
             kafka_sasl_username: "user".to_string(),

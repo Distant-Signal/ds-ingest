@@ -33,7 +33,7 @@ use sink::{DbSink, TrainEventSink};
 fn register_parse_envelope_counters() {
     for msg_type in trust_schema::schema::ENVELOPE_FAILURE_MSG_TYPES {
         metrics::counter!(
-            common::metrics::metric_name("trust_consumer_errors_total"),
+            ds_runtime::metrics::metric_name("trust_consumer_errors_total"),
             "operation" => "parse_envelope",
             "msg_type" => msg_type
         )
@@ -64,12 +64,12 @@ const DEFAULT_MAX_CONNECTIONS: u32 = 2;
 
 /// Retry backoff for a failed tracked-trains reload: 1s doubling to 60s,
 /// jittered, and never longer than the reload interval itself.
-const TRACKED_TRAINS_RETRY: common::backoff::Backoff =
-    common::backoff::Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
+const TRACKED_TRAINS_RETRY: ds_runtime::backoff::Backoff =
+    ds_runtime::backoff::Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    common::logging::exit_code(run().await)
+    ds_runtime::logging::exit_code(run().await)
 }
 
 #[expect(
@@ -80,22 +80,22 @@ async fn main() -> std::process::ExitCode {
 async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
-    common::logging::init("trust-consumer");
+    ds_runtime::logging::init("trust-consumer");
 
     let config = Config::parse();
     config.validate()?;
     if config.metrics.metrics_enabled {
-        common::metrics::install(config.metrics_port)?;
+        ds_runtime::metrics::install(config.metrics_port)?;
     }
     // Register the stream-gap counter at 0 so the DistantSignalStreamGap
     // alert can use a plain `increase()`: a counter that only appears on its
     // first increment has no increase to see.
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "trust_consumer_stream_gap_detected_total"
     ))
     .increment(0);
     register_parse_envelope_counters();
-    common::metrics::register_operation_counters(
+    ds_runtime::metrics::register_operation_counters(
         "trust_consumer_errors_total",
         API_CALL_OPERATIONS,
     );
@@ -117,7 +117,8 @@ async fn run() -> anyhow::Result<()> {
     let mut feed = match config.movement_feed_backend {
         MovementFeedBackend::RedisStream => ActiveFeed::RedisStream(
             Box::new(
-                connect_redis_feed(&config, common::startup::CONNECT_BACKOFF, &progress).await?,
+                connect_redis_feed(&config, ds_runtime::startup::CONNECT_BACKOFF, &progress)
+                    .await?,
             ),
             connection_state,
             "trust_consumer_ready",
@@ -170,10 +171,10 @@ async fn run() -> anyhow::Result<()> {
     // of this loop while it failed: ~23.6k failed GETs in the 2026-10-01
     // Postgres outage.
     let mut reference_reload =
-        common::backoff::RetrySchedule::new(reload_interval, TRACKED_TRAINS_RETRY);
+        ds_runtime::backoff::RetrySchedule::new(reload_interval, TRACKED_TRAINS_RETRY);
     reference_reload.succeeded();
     // Consecutive failed cycles; see `CYCLE_RETRY_BACKOFF`.
-    let mut cycle_failures = common::backoff::FailureStreak::new(CYCLE_RETRY_BACKOFF);
+    let mut cycle_failures = ds_runtime::backoff::FailureStreak::new(CYCLE_RETRY_BACKOFF);
 
     loop {
         if reference_reload.is_due() {
@@ -193,7 +194,7 @@ async fn run() -> anyhow::Result<()> {
                         "failed to reload active tracked trains; keeping the previous reference"
                     );
                     metrics::counter!(
-                        common::metrics::metric_name("trust_consumer_errors_total"),
+                        ds_runtime::metrics::metric_name("trust_consumer_errors_total"),
                         "operation" => "reload_tracked_trains"
                     )
                     .increment(1);
@@ -215,7 +216,7 @@ async fn run() -> anyhow::Result<()> {
                         new_first_entry = %gap.stream_first_entry_id,
                         "movement-events stream gap detected: some events between these IDs were trimmed before trust-consumer ever read them -- any Activation/Movement in that range is silently lost, possibly stranding a pin in resolution_status='pending' forever"
                     );
-                    metrics::counter!(common::metrics::metric_name(
+                    metrics::counter!(ds_runtime::metrics::metric_name(
                         "trust_consumer_stream_gap_detected_total"
                     ))
                     .increment(1);
@@ -267,17 +268,17 @@ async fn run() -> anyhow::Result<()> {
 /// 200 through a Redis outage well past `PROGRESS_STALL_SECS` (300s by
 /// default) instead of the pod being killed or exiting into
 /// `CrashLoopBackOff`. After startup each Redis command is bounded (see
-/// `common::redis_conn`) and a failure is a `Cycle::Failed`: backed off by
+/// `ds_runtime::redis_conn`) and a failure is a `Cycle::Failed`: backed off by
 /// `CYCLE_RETRY_BACKOFF`, progress beaten, retried.
 async fn connect_redis_feed(
     config: &Config,
-    backoff: common::backoff::Backoff,
+    backoff: ds_runtime::backoff::Backoff,
     progress: &health_http::Progress,
 ) -> anyhow::Result<RedisStreamMovementFeed> {
     // REDIS_USERNAME and REDIS_PASSWORD, when set, are applied here
-    // (common::redis_auth). The result carries the password: pass it on,
+    // (ds_runtime::redis_auth). The result carries the password: pass it on,
     // never log it.
-    let redis_url = common::redis_auth::redis_url_with_credentials(
+    let redis_url = ds_runtime::redis_auth::redis_url_with_credentials(
         &config.redis_url,
         config.redis_username.as_deref(),
         config.redis_password.as_ref(),
@@ -297,8 +298,8 @@ async fn connect_redis_feed(
 /// dead-letter write): 1s doubling to 60s, jittered (spec R1, D1, plan
 /// 3b.3). A transient DB failure pauses reading; the batch stays pending in
 /// `movement-events`, so waiting longer loses nothing.
-const CYCLE_RETRY_BACKOFF: common::backoff::Backoff =
-    common::backoff::Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
+const CYCLE_RETRY_BACKOFF: ds_runtime::backoff::Backoff =
+    ds_runtime::backoff::Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
 
 /// Waits for Postgres (INF-5), connects the one pool (with the `db_pool_*`
 /// metrics) and passes the schema gate as the `trust_consumer` role (spec
@@ -326,7 +327,10 @@ async fn connect_database(
 
 /// How long to wait after a cycle, if at all: a committed cycle resets the
 /// streak, a failed one waits its next backoff.
-fn cycle_wait(outcome: &Cycle, failures: &mut common::backoff::FailureStreak) -> Option<Duration> {
+fn cycle_wait(
+    outcome: &Cycle,
+    failures: &mut ds_runtime::backoff::FailureStreak,
+) -> Option<Duration> {
     match outcome {
         Cycle::Committed => {
             failures.succeeded();
@@ -402,7 +406,7 @@ where
                     "failed to load active tracked trains at startup; not consuming until it loads"
                 );
                 metrics::counter!(
-                    common::metrics::metric_name("trust_consumer_errors_total"),
+                    ds_runtime::metrics::metric_name("trust_consumer_errors_total"),
                     "operation" => "startup_reference_load"
                 )
                 .increment(1);
@@ -477,7 +481,7 @@ where
         Err(err) => {
             tracing::error!(error = ?err, "error processing movement feed batch");
             metrics::counter!(
-                common::metrics::metric_name("trust_consumer_errors_total"),
+                ds_runtime::metrics::metric_name("trust_consumer_errors_total"),
                 "operation" => "process_batch"
             )
             .increment(1);
@@ -526,7 +530,7 @@ where
                 "failed to dead-letter rejected train events; leaving the batch un-ACKed to retry"
             );
             metrics::counter!(
-                common::metrics::metric_name("trust_consumer_errors_total"),
+                ds_runtime::metrics::metric_name("trust_consumer_errors_total"),
                 "operation" => "dead_letter"
             )
             .increment(1);
@@ -538,7 +542,7 @@ where
             "train events rejected for a data error; dead-lettered them and committing the rest"
         );
         metrics::counter!(
-            common::metrics::metric_name("trust_consumer_deadlettered_total"),
+            ds_runtime::metrics::metric_name("trust_consumer_deadlettered_total"),
             "reason" => operations.rejected
         )
         .increment(records.len() as u64);
@@ -547,7 +551,7 @@ where
     if let Err(err) = feed.commit().await {
         tracing::error!(error = ?err, "failed to commit the movement feed batch");
         metrics::counter!(
-            common::metrics::metric_name("trust_consumer_errors_total"),
+            ds_runtime::metrics::metric_name("trust_consumer_errors_total"),
             "operation" => "commit_offsets"
         )
         .increment(1);
@@ -585,7 +589,7 @@ where
     if common::ingest::classify_failure(&err) == common::ingest::FailureClass::Rejected {
         tracing::error!(error = ?err, "this batch's train events were rejected; isolating the poison entry");
         metrics::counter!(
-            common::metrics::metric_name("trust_consumer_errors_total"),
+            ds_runtime::metrics::metric_name("trust_consumer_errors_total"),
             "operation" => "post_rejected"
         )
         .increment(1);
@@ -596,7 +600,7 @@ where
     }
     tracing::error!(error = ?err, "failed to write train events; not committing this batch's offsets");
     metrics::counter!(
-        common::metrics::metric_name("trust_consumer_errors_total"),
+        ds_runtime::metrics::metric_name("trust_consumer_errors_total"),
         "operation" => operations.write
     )
     .increment(1);
@@ -738,7 +742,7 @@ mod tests {
         assert_eq!(feed.committed_count, 0, "nothing XACKed");
         assert!(feed.dead_lettered.is_empty());
         assert!(feed.rejected_batches.is_empty());
-        let mut failures = common::backoff::FailureStreak::new(CYCLE_RETRY_BACKOFF);
+        let mut failures = ds_runtime::backoff::FailureStreak::new(CYCLE_RETRY_BACKOFF);
         let wait = cycle_wait(&outcome, &mut failures).unwrap();
         assert!(wait <= Duration::from_secs(1), "{wait:?}");
     }
@@ -869,7 +873,7 @@ mod tests {
     /// reset after a committed cycle.
     #[test]
     fn failed_cycles_back_off_exponentially_and_reset_on_success() {
-        let mut failures = common::backoff::FailureStreak::new(CYCLE_RETRY_BACKOFF);
+        let mut failures = ds_runtime::backoff::FailureStreak::new(CYCLE_RETRY_BACKOFF);
         let mut previous_ceiling = Duration::ZERO;
         for attempt in 0..8 {
             let wait = cycle_wait(&Cycle::Failed, &mut failures).unwrap();
@@ -1368,7 +1372,7 @@ mod redis_outage_tests {
         let connecting = tokio::spawn(async move {
             connect_redis_feed(
                 &config,
-                common::backoff::Backoff::new(
+                ds_runtime::backoff::Backoff::new(
                     Duration::from_millis(50),
                     Duration::from_millis(200),
                 ),

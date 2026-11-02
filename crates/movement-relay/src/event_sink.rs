@@ -7,7 +7,7 @@
 //! applied here on the producer side for the first time in this codebase.
 
 use async_trait::async_trait;
-use common::redis_conn::RedisConn;
+use ds_runtime::redis_conn::RedisConn;
 
 const STREAM: &str = "movement-events";
 
@@ -151,21 +151,21 @@ impl RedisEventSink {
         redis_url: &str,
         maxlen: u64,
         groups: Vec<String>,
-        backoff: common::backoff::Backoff,
+        backoff: ds_runtime::backoff::Backoff,
         progress: &health_http::Progress,
     ) -> anyhow::Result<Self> {
         let client = redis::Client::open(redis_url)?;
-        // Bounded attempts (`common::redis_conn`): a failed attempt is
+        // Bounded attempts (`ds_runtime::redis_conn`): a failed attempt is
         // logged and beats `progress` instead of redis-rs retrying for
         // minutes, unlogged. Later reconnects ride on `main::run_cycle`'s
         // `ERROR_BACKOFF` (each failed XADD starts one background
         // reconnect, which the next cycle's XADD awaits; a timed-out one
         // -- possibly a half-open connection -- makes the next XADD open a
-        // new connection, see `common::redis_conn::RedisConn`).
+        // new connection, see `ds_runtime::redis_conn::RedisConn`).
         let conn =
-            common::redis_conn::connect_until_ready("Redis", &client, backoff, Some(progress))
+            ds_runtime::redis_conn::connect_until_ready("Redis", &client, backoff, Some(progress))
                 .await;
-        metrics::counter!(common::metrics::metric_name(STREAM_CREATED_METRIC)).increment(0);
+        metrics::counter!(ds_runtime::metrics::metric_name(STREAM_CREATED_METRIC)).increment(0);
         Ok(Self::new(conn, STREAM, maxlen, groups))
     }
 
@@ -232,7 +232,7 @@ impl RedisEventSink {
                      holding the Kafka record for retry"
                 );
                 metrics::counter!(
-                    common::metrics::metric_name("movement_relay_errors_total"),
+                    ds_runtime::metrics::metric_name("movement_relay_errors_total"),
                     "operation" => "redis_oom"
                 )
                 .increment(1);
@@ -277,7 +277,7 @@ impl EventSink for RedisEventSink {
             "movement-events is missing (Redis lost its data?); recreated it with every \
              consumer group at its start"
         );
-        metrics::counter!(common::metrics::metric_name(STREAM_CREATED_METRIC)).increment(1);
+        metrics::counter!(ds_runtime::metrics::metric_name(STREAM_CREATED_METRIC)).increment(1);
         self.xadd(true, msg_type, payload).await?;
         Ok(())
     }
@@ -375,7 +375,7 @@ mod tests {
                 &redis_url,
                 1_000,
                 Vec::new(),
-                common::backoff::Backoff::new(
+                ds_runtime::backoff::Backoff::new(
                     Duration::from_millis(50),
                     Duration::from_millis(200),
                 ),
@@ -497,7 +497,7 @@ mod tests {
 
         async fn conn() -> RedisConn {
             let client = redis::Client::open(redis_url()).unwrap();
-            common::redis_conn::connect(&client).await.unwrap()
+            ds_runtime::redis_conn::connect(&client).await.unwrap()
         }
 
         fn groups() -> Vec<String> {

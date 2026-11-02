@@ -361,7 +361,7 @@ pub(crate) fn process_message(
             .planned;
             if let Some(was_corrected) = timestamp_pair.was_corrected {
                 metrics::counter!(
-                    common::metrics::metric_name(
+                    ds_runtime::metrics::metric_name(
                         "trust_backlog_consumer_timestamp_correction_total"
                     ),
                     "outcome" => if was_corrected { "corrected" } else { "raw" }
@@ -473,7 +473,7 @@ pub(crate) fn process_message(
             );
             if let Some(was_corrected) = canx_pair.was_corrected {
                 metrics::counter!(
-                    common::metrics::metric_name(
+                    ds_runtime::metrics::metric_name(
                         "trust_backlog_consumer_timestamp_correction_total"
                     ),
                     "outcome" => if was_corrected { "corrected" } else { "raw" }
@@ -569,7 +569,7 @@ pub(crate) fn process_message(
             );
             if let Some(was_corrected) = dep_pair.was_corrected {
                 metrics::counter!(
-                    common::metrics::metric_name(
+                    ds_runtime::metrics::metric_name(
                         "trust_backlog_consumer_timestamp_correction_total"
                     ),
                     "outcome" => if was_corrected { "corrected" } else { "raw" }
@@ -606,7 +606,7 @@ pub(crate) fn process_message(
             );
             if let Some(was_corrected) = reinstated_pair.was_corrected {
                 metrics::counter!(
-                    common::metrics::metric_name(
+                    ds_runtime::metrics::metric_name(
                         "trust_backlog_consumer_timestamp_correction_total"
                     ),
                     "outcome" => if was_corrected { "corrected" } else { "raw" }

@@ -496,20 +496,20 @@ fn admin_url() -> String {
     let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
     let password = std::env::var("REDIS_PASSWORD")
         .ok()
-        .map(common::secret::Secret::from);
-    common::redis_auth::redis_url_with_password(&url, password.as_ref())
+        .map(ds_runtime::secret::Secret::from);
+    ds_runtime::redis_auth::redis_url_with_password(&url, password.as_ref())
         .unwrap()
         .expose()
         .to_owned()
 }
 
-async fn redis() -> common::redis_conn::RedisConn {
-    common::redis_conn::connect(&redis::Client::open(admin_url()).unwrap())
+async fn redis() -> ds_runtime::redis_conn::RedisConn {
+    ds_runtime::redis_conn::connect(&redis::Client::open(admin_url()).unwrap())
         .await
         .expect("Redis must be reachable (REDIS_URL) to run this test")
 }
 
-async fn delete_keys(conn: &mut common::redis_conn::RedisConn, keys: &[&str]) {
+async fn delete_keys(conn: &mut ds_runtime::redis_conn::RedisConn, keys: &[&str]) {
     let _: i64 = redis::cmd("DEL").arg(keys).query_async(conn).await.unwrap();
 }
 

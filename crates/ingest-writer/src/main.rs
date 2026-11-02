@@ -26,16 +26,16 @@ const STREAM_SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    common::logging::exit_code(run().await)
+    ds_runtime::logging::exit_code(run().await)
 }
 
 async fn run() -> anyhow::Result<()> {
     let config = Config::parse();
     config.validate()?;
-    common::logging::init("ingest-writer");
+    ds_runtime::logging::init("ingest-writer");
 
     if config.metrics.metrics_enabled {
-        common::metrics::install(config.metrics_port)?;
+        ds_runtime::metrics::install(config.metrics_port)?;
         ds_store::pool::register_metrics();
         // Every outcome at 0, so DistantSignalTrainEventOutboxRejected's
         // increase() sees the first rejection.
@@ -46,7 +46,7 @@ async fn run() -> anyhow::Result<()> {
     let (ready, progress) = health_http::spawn_worker(&config.health);
     // INF-5: wait for Postgres instead of exiting into CrashLoopBackOff.
     // `/healthz` stays 503 until this returns; `/livez` stays 200.
-    // ds_store's PoolSettings: common::pg's, plus the db_pool_* metrics.
+    // ds_store's PoolSettings: ds_runtime::pg's, plus the db_pool_* metrics.
     let pool = ds_store::pool::PoolSettings::from_env(APPLICATION_NAME, DEFAULT_MAX_CONNECTIONS)?
         .connect_until_ready(config.database_url.expose(), Some(&progress))
         .await?;
@@ -136,8 +136,8 @@ fn start_streams(
         uncovered.join(", ")
     );
     // REDIS_USERNAME and REDIS_PASSWORD, when set, are applied here
-    // (common::redis_auth). The result carries the password: never log it.
-    let redis_url = common::redis_auth::redis_url_with_credentials(
+    // (ds_runtime::redis_auth). The result carries the password: never log it.
+    let redis_url = ds_runtime::redis_auth::redis_url_with_credentials(
         config.redis_url.as_deref().unwrap_or_default(),
         config.redis_username.as_deref(),
         config.redis_password.as_ref(),

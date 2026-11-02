@@ -327,7 +327,7 @@ follows separately.
   trust-backlog-consumer, full-coverage-consumer, schedule-ingest,
   schedule-reference). A leftover variable is ignored, not refused. With
   them go `distant_signal_ingest_sink_info` and
-  `distant_signal_internal_reads_source_info` (`common::metrics`), which
+  `distant_signal_internal_reads_source_info` (`ds_runtime::metrics`), which
   only reported those settings; nothing alerted or graphed on them.
 - **Chart**: the island-of-Ireland pollers no longer render
   `INGEST_SINK=stream`. The preflight no longer checks the retired
@@ -1569,7 +1569,7 @@ only `store_` afterwards. **Done in the release D cleanup (2026-10-21).**
 
 **Prepared (2026-10-08): the rules already match both prefixes**, so the
 rename itself is a code-only change in `ds-store`. The full inventory of
-`api_`-prefixed names `ds-store` emits (after `common::metrics::metric_name`,
+`api_`-prefixed names `ds-store` emits (after `ds_runtime::metrics::metric_name`,
 each is `distant_signal_<name>`), and what reads each one:
 
 | Metric (`ds-store` source) | Emitted from | Read by (`templates/prometheusrule.yaml`) |
@@ -1647,7 +1647,7 @@ stay, deprecated.**
 | `backfill_incident_lines` | `writer-maintenance backfill-incident-lines` | ingest-writer | `DATABASE_URL`: the **`incidents` role** (it holds `UPDATE` on `incidents`; the writer does not, and no grant was added) | `ds_store::incidents::line_backfill` (moved from `api::data`) |
 
 Each retries its first connection like the one-shot Jobs
-(`common::startup::retry_until_ready_within`): the `ds-migrate` backfills
+(`ds_runtime::startup::retry_until_ready_within`): the `ds-migrate` backfills
 for up to `MIGRATION_CONNECT_DEADLINE_SECS`, `writer-maintenance` for up to
 `BACKFILL_CONNECT_DEADLINE_SECS` (both default 120 s).
 Every new entry point refuses to run as `distant_signal_api`

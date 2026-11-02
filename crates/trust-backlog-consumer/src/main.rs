@@ -47,21 +47,21 @@ const DEFAULT_MAX_CONNECTIONS: u32 = 3;
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    common::logging::exit_code(run().await)
+    ds_runtime::logging::exit_code(run().await)
 }
 
 async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    common::logging::init("trust-backlog-consumer");
+    ds_runtime::logging::init("trust-backlog-consumer");
     let config = Config::parse();
     config.validate()?;
     if config.metrics.metrics_enabled {
-        common::metrics::install(config.metrics_port)?;
+        ds_runtime::metrics::install(config.metrics_port)?;
     }
     // Register the stream-gap counter at 0 so the DistantSignalStreamGap
     // alert can use a plain `increase()`: a counter that only appears on its
     // first increment has no increase to see.
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "trust_backlog_consumer_stream_gap_detected_total"
     ))
     .increment(0);
@@ -69,17 +69,17 @@ async fn run() -> anyhow::Result<()> {
     // DistantSignalTrustEnvelopeParseDrops (R-097).
     for msg_type in trust_schema::schema::ENVELOPE_FAILURE_MSG_TYPES {
         metrics::counter!(
-            common::metrics::metric_name("trust_backlog_consumer_errors_total"),
+            ds_runtime::metrics::metric_name("trust_backlog_consumer_errors_total"),
             "operation" => "parse_envelope",
             "msg_type" => msg_type
         )
         .increment(0);
     }
-    common::metrics::register_operation_counters(
+    ds_runtime::metrics::register_operation_counters(
         "trust_backlog_consumer_errors_total",
         API_CALL_OPERATIONS,
     );
-    metrics::counter!(common::metrics::metric_name(OUTSIDE_RETENTION_METRIC)).increment(0);
+    metrics::counter!(ds_runtime::metrics::metric_name(OUTSIDE_RETENTION_METRIC)).increment(0);
     let (connection_state, progress) = health_http::spawn_with_progress(
         config.health_bind_url.clone(),
         "connected",
@@ -107,10 +107,10 @@ async fn run() -> anyhow::Result<()> {
         // Redis down at startup is waited for (each attempt logged, beating
         // progress so /livez stays 200); afterwards every Redis command is
         // bounded and a failure is retried by this loop. See
-        // `common::redis_conn`.
+        // `ds_runtime::redis_conn`.
         Box::new(
             RedisStreamMovementFeed::connect_until_ready(
-                common::redis_auth::redis_url_with_credentials(
+                ds_runtime::redis_auth::redis_url_with_credentials(
                     &config.redis_url,
                     config.redis_username.as_deref(),
                     config.redis_password.as_ref(),
@@ -119,7 +119,7 @@ async fn run() -> anyhow::Result<()> {
                 "trust-event-backlog",
                 "trust-event-backlog-1",
                 Duration::from_secs(config.redis_autoclaim_min_idle_secs),
-                common::startup::CONNECT_BACKOFF,
+                ds_runtime::startup::CONNECT_BACKOFF,
                 &progress,
             )
             .await?,
@@ -190,8 +190,8 @@ async fn consume<S: BacklogSink>(
     let mut last_redis_gap_check = tokio::time::Instant::now() - redis_gap_check_interval;
 
     // Consecutive failed deliveries and feed reads; see `delivery_wait`.
-    let mut delivery_failures = common::backoff::FailureStreak::new(DELIVERY_RETRY_BACKOFF);
-    let mut feed_failures = common::backoff::FailureStreak::new(FEED_RETRY_BACKOFF);
+    let mut delivery_failures = ds_runtime::backoff::FailureStreak::new(DELIVERY_RETRY_BACKOFF);
+    let mut feed_failures = ds_runtime::backoff::FailureStreak::new(FEED_RETRY_BACKOFF);
 
     loop {
         // 1. stanox_crs reload.
@@ -209,7 +209,7 @@ async fn consume<S: BacklogSink>(
                 Err(err) => {
                     tracing::error!(error = ?err, "failed to reload stanox_crs table; keeping previous snapshot");
                     metrics::counter!(
-                        common::metrics::metric_name("trust_backlog_consumer_errors_total"),
+                        ds_runtime::metrics::metric_name("trust_backlog_consumer_errors_total"),
                         "operation" => "reload_stanox_crs"
                     )
                     .increment(1);
@@ -228,7 +228,7 @@ async fn consume<S: BacklogSink>(
                         "movement-events stream gap detected: some events between these IDs were \
                          trimmed before trust-backlog-consumer ever read them"
                     );
-                    metrics::counter!(common::metrics::metric_name(
+                    metrics::counter!(ds_runtime::metrics::metric_name(
                         "trust_backlog_consumer_stream_gap_detected_total"
                     ))
                     .increment(1);
@@ -290,7 +290,7 @@ async fn consume<S: BacklogSink>(
                 if let Err(err) = sink.write_reasons(&reasons).await {
                     tracing::warn!(error = ?err, count = reasons.len(), "failed to write train reasons; continuing with the backlog batch");
                     metrics::counter!(
-                        common::metrics::metric_name("trust_backlog_consumer_errors_total"),
+                        ds_runtime::metrics::metric_name("trust_backlog_consumer_errors_total"),
                         "operation" => operations.write_reasons
                     )
                     .increment(1);
@@ -314,7 +314,7 @@ async fn consume<S: BacklogSink>(
             Err(err) => {
                 tracing::error!(error = ?err, "error receiving from movement feed");
                 metrics::counter!(
-                    common::metrics::metric_name("trust_backlog_consumer_errors_total"),
+                    ds_runtime::metrics::metric_name("trust_backlog_consumer_errors_total"),
                     "operation" => "movement_feed_receive"
                 )
                 .increment(1);
@@ -323,7 +323,7 @@ async fn consume<S: BacklogSink>(
                     .await;
             }
         }
-        metrics::histogram!(common::metrics::metric_name(
+        metrics::histogram!(ds_runtime::metrics::metric_name(
             "trust_backlog_consumer_cycle_duration_seconds"
         ))
         .record(cycle_start.elapsed().as_secs_f64());
@@ -352,13 +352,13 @@ fn unparseable_payload(raw: &str, err: &impl std::fmt::Debug) -> DeadLetter {
 /// the batch stays pending in `movement-events`, which holds about 28
 /// hours. A flat 2s through the 2026-10-01 Postgres outage re-sent the
 /// pending batch every 2s for six hours (~2,200 failures).
-const DELIVERY_RETRY_BACKOFF: common::backoff::Backoff =
-    common::backoff::Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
+const DELIVERY_RETRY_BACKOFF: ds_runtime::backoff::Backoff =
+    ds_runtime::backoff::Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
 
 /// Wait after a failed read from the movement feed (Redis): 1s doubling to
 /// 30s, jittered.
-const FEED_RETRY_BACKOFF: common::backoff::Backoff =
-    common::backoff::Backoff::new(Duration::from_secs(1), Duration::from_secs(30));
+const FEED_RETRY_BACKOFF: ds_runtime::backoff::Backoff =
+    ds_runtime::backoff::Backoff::new(Duration::from_secs(1), Duration::from_secs(30));
 
 /// How long to wait after `delivery` before the next batch, if at all: a
 /// committed batch resets the streak; a batch left pending (nothing
@@ -367,7 +367,7 @@ const FEED_RETRY_BACKOFF: common::backoff::Backoff =
 /// redelivery is a harmless duplicate.
 fn delivery_wait(
     delivery: &Delivery,
-    failures: &mut common::backoff::FailureStreak,
+    failures: &mut ds_runtime::backoff::FailureStreak,
 ) -> Option<Duration> {
     match delivery {
         Delivery::Committed => {
@@ -441,7 +441,7 @@ where
     if let Err(err) = feed.dead_letter(unparseable).await {
         tracing::error!(error = ?err, "failed to dead-letter unparseable payloads; leaving the batch un-ACKed to retry");
         metrics::counter!(
-            common::metrics::metric_name("trust_backlog_consumer_errors_total"),
+            ds_runtime::metrics::metric_name("trust_backlog_consumer_errors_total"),
             "operation" => "dead_letter"
         )
         .increment(1);
@@ -455,7 +455,7 @@ where
         {
             tracing::error!(error = ?err, "the trust-event-backlog batch's data was refused; isolating the poison entry");
             metrics::counter!(
-                common::metrics::metric_name("trust_backlog_consumer_errors_total"),
+                ds_runtime::metrics::metric_name("trust_backlog_consumer_errors_total"),
                 "operation" => "post_rejected"
             )
             .increment(1);
@@ -468,7 +468,7 @@ where
         Err(err) => {
             tracing::error!(error = ?err, "failed to write the trust-event-backlog batch; will retry next cycle");
             metrics::counter!(
-                common::metrics::metric_name("trust_backlog_consumer_errors_total"),
+                ds_runtime::metrics::metric_name("trust_backlog_consumer_errors_total"),
                 "operation" => operations.write
             )
             .increment(1);
@@ -510,19 +510,19 @@ where
                 "failed to dead-letter the refused rows; leaving the batch un-ACKed to retry"
             );
             metrics::counter!(
-                common::metrics::metric_name("trust_backlog_consumer_errors_total"),
+                ds_runtime::metrics::metric_name("trust_backlog_consumer_errors_total"),
                 "operation" => "dead_letter"
             )
             .increment(1);
             return Delivery::DeadLetterFailed;
         }
         metrics::counter!(
-            common::metrics::metric_name("trust_backlog_consumer_deadlettered_total"),
+            ds_runtime::metrics::metric_name("trust_backlog_consumer_deadlettered_total"),
             "reason" => operations.rejected
         )
         .increment(records.len() as u64);
     }
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "trust_backlog_consumer_events_stored_total"
     ))
     .increment(events.len().saturating_sub(response.rejected.len()) as u64);
@@ -530,7 +530,7 @@ where
     if let Err(err) = feed.commit().await {
         tracing::error!(error = ?err, "failed to commit Redis Streams offsets");
         metrics::counter!(
-            common::metrics::metric_name("trust_backlog_consumer_errors_total"),
+            ds_runtime::metrics::metric_name("trust_backlog_consumer_errors_total"),
             "operation" => "commit_offsets"
         )
         .increment(1);
@@ -610,7 +610,7 @@ fn collect_batch(
                 // PL-8: count every envelope the parser dropped.
                 for failure in &parsed.failures {
                     metrics::counter!(
-                        common::metrics::metric_name("trust_backlog_consumer_errors_total"),
+                        ds_runtime::metrics::metric_name("trust_backlog_consumer_errors_total"),
                         "operation" => "parse_envelope",
                         "msg_type" => failure.msg_type.clone()
                     )
@@ -638,7 +638,7 @@ fn collect_batch(
                         // Movement in the same replay needs),
                         // just not written.
                         if outside_retention {
-                            metrics::counter!(common::metrics::metric_name(
+                            metrics::counter!(ds_runtime::metrics::metric_name(
                                 OUTSIDE_RETENTION_METRIC
                             ))
                             .increment(1);
@@ -651,7 +651,7 @@ fn collect_batch(
             Err(err) => {
                 tracing::error!(error = ?err, raw = %raw, "failed to parse TRUST batch; dead-lettering this payload");
                 metrics::counter!(
-                    common::metrics::metric_name("trust_backlog_consumer_errors_total"),
+                    ds_runtime::metrics::metric_name("trust_backlog_consumer_errors_total"),
                     "operation" => "parse_batch"
                 )
                 .increment(1);
@@ -1067,7 +1067,7 @@ mod deliver_batch_tests {
     /// batch resets that.
     #[test]
     fn undelivered_batches_back_off_exponentially_and_reset_on_success() {
-        let mut failures = common::backoff::FailureStreak::new(DELIVERY_RETRY_BACKOFF);
+        let mut failures = ds_runtime::backoff::FailureStreak::new(DELIVERY_RETRY_BACKOFF);
         let mut previous_ceiling = Duration::ZERO;
         for attempt in 0..8 {
             let wait =

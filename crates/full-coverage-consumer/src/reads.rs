@@ -20,10 +20,10 @@ const DEFAULT_MAX_CONNECTIONS: u32 = 2;
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct InternalReadArgs {
     /// Postgres, as the `full_coverage_ro` role. Pool size and timeouts come
-    /// from the shared `DATABASE_*` variables (`common::pg`); the default
+    /// from the shared `DATABASE_*` variables (`ds_runtime::pg`); the default
     /// pool is 2 (spec §6.6, role limit 3).
     #[arg(long, env, hide_env_values = true)]
-    pub database_url: common::secret::Secret,
+    pub database_url: ds_runtime::secret::Secret,
 }
 
 impl InternalReadArgs {

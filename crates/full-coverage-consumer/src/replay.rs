@@ -187,7 +187,7 @@ macro_rules! retry {
                 Err(err) => {
                     tracing::error!(error = ?err, retry_in_secs = backoff.as_secs(), "startup replay: failed to {}; retrying", $what);
                     metrics::counter!(
-                        common::metrics::metric_name("full_coverage_consumer_errors_total"),
+                        ds_runtime::metrics::metric_name("full_coverage_consumer_errors_total"),
                         "operation" => "startup_replay"
                     )
                     .increment(1);
@@ -315,7 +315,7 @@ pub(crate) async fn run_startup_replay<S: ReplaySource + ?Sized>(
                 report.lookback_entries += 1;
             }
         }
-        metrics::counter!(common::metrics::metric_name(
+        metrics::counter!(ds_runtime::metrics::metric_name(
             "full_coverage_consumer_startup_replay_entries_total"
         ))
         .increment(page.entries.len() as u64);
