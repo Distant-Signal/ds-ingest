@@ -101,16 +101,10 @@ RUN apt-get update \
     && useradd --system --no-create-home --shell /usr/sbin/nologin --uid 1000 --gid 1000 full-coverage-consumer
 
 COPY --from=builder /usr/local/bin/full-coverage-consumer /usr/local/bin/full-coverage-consumer
-# No reference-data COPY step (unlike trust-consumer): this crate's own
+# No STANOX/CRS table COPY step (unlike trust-consumer): this crate's own
 # STANOX/CRS table is always live-reloaded via queries::fetch_stanox_crs,
 # never a --stanox-crs-file startup default (confirmed against Task 9's
 # final config.rs -- it has no such flag at all).
-#
-# The static line catalogue IS baked in, though -- same
-# --lines-dir/LINES_DIR pattern as aggregator/api/schedule-reference (see
-# those Dockerfiles' own identical COPY step); this crate needs it to
-# build Decision 2c's reverse tiploc->line index.
-COPY --chown=full-coverage-consumer:full-coverage-consumer lines/ /app/lines/
 
 # Numeric USER -- see docker/trust-consumer.Dockerfile's own comment for
 # why (Kubernetes' runAsNonRoot admission check needs a numeric uid, not a
