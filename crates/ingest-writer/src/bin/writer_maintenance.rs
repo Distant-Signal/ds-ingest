@@ -33,7 +33,7 @@
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use common::secret::Secret;
+use ds_runtime::secret::Secret;
 use ds_store::maintenance::Needs;
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -97,14 +97,14 @@ const INCIDENT_LINES_NEEDS: &[Needs] = &[
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    common::logging::exit_code(dispatch(Cli::parse()).await)
+    ds_runtime::logging::exit_code(dispatch(Cli::parse()).await)
 }
 
 async fn dispatch(cli: Cli) -> anyhow::Result<()> {
-    common::logging::init_with_filter(
+    ds_runtime::logging::init_with_filter(
         "writer-maintenance",
-        common::logging::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| common::logging::EnvFilter::new("info")),
+        ds_runtime::logging::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| ds_runtime::logging::EnvFilter::new("info")),
     );
     let url = cli
         .database_url
@@ -114,18 +114,18 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         .context("set DATABASE_URL (or --database-url)")?;
     let options: PgConnectOptions = url.parse().context("could not parse DATABASE_URL")?;
     let options = options
-        .options(common::pg::DEAD_CLIENT_DETECTION_SETTINGS)
+        .options(ds_runtime::pg::DEAD_CLIENT_DETECTION_SETTINGS)
         .application_name(APPLICATION_NAME);
-    let deadline = common::startup::connect_deadline_from_env(
-        common::startup::BACKFILL_CONNECT_DEADLINE_ENV,
-        common::startup::DEFAULT_CONNECT_DEADLINE,
+    let deadline = ds_runtime::startup::connect_deadline_from_env(
+        ds_runtime::startup::BACKFILL_CONNECT_DEADLINE_ENV,
+        ds_runtime::startup::DEFAULT_CONNECT_DEADLINE,
     )?;
     // The first connection is retried for up to
     // BACKFILL_CONNECT_DEADLINE_SECS, as the api image's backfills do.
     let connect = || async {
-        common::startup::retry_until_ready_within(
+        ds_runtime::startup::retry_until_ready_within(
             "postgres",
-            common::startup::CONNECT_BACKOFF,
+            ds_runtime::startup::CONNECT_BACKOFF,
             deadline,
             || {
                 PgPoolOptions::new()

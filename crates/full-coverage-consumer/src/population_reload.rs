@@ -57,9 +57,9 @@ pub(crate) enum LinePopulationFetch {
 pub(crate) const ABORT_AFTER_FAILURES: usize = 3;
 
 /// The wait after each consecutive failed cycle: 1s, doubling, capped at
-/// 60s, jittered (see [`common::backoff`]).
-pub(crate) const RETRY_BACKOFF: common::backoff::Backoff =
-    common::backoff::Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
+/// 60s, jittered (see [`ds_runtime::backoff`]).
+pub(crate) const RETRY_BACKOFF: ds_runtime::backoff::Backoff =
+    ds_runtime::backoff::Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
 
 /// The current population snapshot, swapped whole by the reloader.
 pub(crate) type SharedPopulation = Arc<ArcSwap<Population>>;
@@ -358,7 +358,7 @@ pub(crate) async fn reload_cycle_with<S: PopulationSource>(
             match source.fetch(&cycle, line_id, date, if_none_match).await {
                 Ok(LinePopulationFetch::NotModified) => {
                     metrics::counter!(
-                        common::metrics::metric_name(
+                        ds_runtime::metrics::metric_name(
                             "full_coverage_consumer_population_reloads_total"
                         ),
                         "result" => "not_modified"
@@ -369,7 +369,7 @@ pub(crate) async fn reload_cycle_with<S: PopulationSource>(
                 }
                 Ok(LinePopulationFetch::Fetched { body, etag }) => {
                     metrics::counter!(
-                        common::metrics::metric_name(
+                        ds_runtime::metrics::metric_name(
                             "full_coverage_consumer_population_reloads_total"
                         ),
                         "result" => "fetched"
@@ -408,7 +408,7 @@ pub(crate) async fn reload_cycle_with<S: PopulationSource>(
                         Err(err) => {
                             tracing::error!(error = ?err, line_id = %line_id, %date, "failed to deserialize a schedule line population; keeping previous snapshot");
                             metrics::counter!(
-                                common::metrics::metric_name("full_coverage_consumer_errors_total"),
+                                ds_runtime::metrics::metric_name("full_coverage_consumer_errors_total"),
                                 "operation" => "reload_line_population_deserialize"
                             )
                             .increment(1);
@@ -420,7 +420,7 @@ pub(crate) async fn reload_cycle_with<S: PopulationSource>(
                 Err(err) => {
                     tracing::error!(error = ?err, line_id = %line_id, %date, "failed to fetch schedule line population; keeping previous snapshot");
                     metrics::counter!(
-                        common::metrics::metric_name("full_coverage_consumer_errors_total"),
+                        ds_runtime::metrics::metric_name("full_coverage_consumer_errors_total"),
                         "operation" => "reload_line_population_fetch"
                     )
                     .increment(1);
@@ -454,7 +454,7 @@ fn report_entries_after_next_rail_day(
     pop: &crate::population::LinePop,
 ) {
     metrics::gauge!(
-        common::metrics::metric_name("full_coverage_consumer_line_entries_after_next_rail_day"),
+        ds_runtime::metrics::metric_name("full_coverage_consumer_line_entries_after_next_rail_day"),
         "line" => line_id.to_string(),
         "day" => day
     )
@@ -481,7 +481,7 @@ fn report_membership_shadow(
 ) {
     for (rule, count) in [("legacy", shadow.legacy), ("scope", shadow.scope)] {
         metrics::gauge!(
-            common::metrics::metric_name("full_coverage_consumer_line_membership_trains"),
+            ds_runtime::metrics::metric_name("full_coverage_consumer_line_membership_trains"),
             "line" => line_id.to_string(),
             "day" => day,
             "rule" => rule
@@ -493,7 +493,7 @@ fn report_membership_shadow(
         ("scope_only", shadow.scope_only),
     ] {
         metrics::gauge!(
-            common::metrics::metric_name("full_coverage_consumer_line_membership_differences"),
+            ds_runtime::metrics::metric_name("full_coverage_consumer_line_membership_differences"),
             "line" => line_id.to_string(),
             "day" => day,
             "kind" => kind
@@ -501,7 +501,7 @@ fn report_membership_shadow(
         .set(f64::from(count));
     }
     metrics::gauge!(
-        common::metrics::metric_name("full_coverage_consumer_line_membership_scoped_entries"),
+        ds_runtime::metrics::metric_name("full_coverage_consumer_line_membership_scoped_entries"),
         "line" => line_id.to_string(),
         "day" => day
     )
@@ -580,12 +580,12 @@ fn report_missing_populations(
     );
     for (day, missing) in [("today", today), ("tomorrow", tomorrow)] {
         metrics::gauge!(
-            common::metrics::metric_name("full_coverage_consumer_population_missing_lines"),
+            ds_runtime::metrics::metric_name("full_coverage_consumer_population_missing_lines"),
             "day" => day
         )
         .set(missing as f64);
     }
-    metrics::gauge!(common::metrics::metric_name(
+    metrics::gauge!(ds_runtime::metrics::metric_name(
         "full_coverage_consumer_population_missing_past_deadline_lines"
     ))
     .set(missing_past_deadline(today, service_date, now) as f64);
@@ -610,7 +610,7 @@ pub(crate) struct Reloader {
     pub interval: Duration,
     /// Wait after each consecutive cycle with any failure, by how many
     /// failed in a row ([`RETRY_BACKOFF`] in production).
-    pub retry: common::backoff::Backoff,
+    pub retry: ds_runtime::backoff::Backoff,
     /// How long the FIRST load may keep failing for some lines (while
     /// others succeed) before consumption is let through anyway, with those
     /// lines marked partial. While EVERY fetch fails (the source down) the first
@@ -681,13 +681,13 @@ impl Reloader {
                 failed = outcome.failed.len(),
                 "population reload cycle"
             );
-            metrics::gauge!(common::metrics::metric_name(
+            metrics::gauge!(ds_runtime::metrics::metric_name(
                 "full_coverage_consumer_population_uids"
             ))
             .set(next.total_uids() as f64);
             report_missing_populations(&next, &line_ids, service_date, chrono::Utc::now());
             self.population.store(Arc::new(next));
-            metrics::histogram!(common::metrics::metric_name(
+            metrics::histogram!(ds_runtime::metrics::metric_name(
                 "full_coverage_consumer_population_reload_duration_seconds"
             ))
             .record(cycle_start.elapsed().as_secs_f64());
@@ -705,7 +705,7 @@ impl Reloader {
                             "starting consumption without these lines' populations; their stats are partial for this rail day"
                         );
                     }
-                    metrics::gauge!(common::metrics::metric_name(
+                    metrics::gauge!(ds_runtime::metrics::metric_name(
                         "full_coverage_consumer_population_loaded"
                     ))
                     .set(1.0);
@@ -717,7 +717,7 @@ impl Reloader {
             }
 
             let wait = if outcome.failed.is_empty() {
-                metrics::gauge!(common::metrics::metric_name(
+                metrics::gauge!(ds_runtime::metrics::metric_name(
                     "full_coverage_consumer_population_last_success_timestamp_seconds"
                 ))
                 .set(chrono::Utc::now().timestamp() as f64);
@@ -1065,7 +1065,7 @@ pub(crate) mod tests {
             geometry: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             population: Arc::clone(&population),
             interval: Duration::from_secs(3600),
-            retry: common::backoff::Backoff::new(
+            retry: ds_runtime::backoff::Backoff::new(
                 Duration::from_millis(20),
                 Duration::from_millis(100),
             ),
@@ -1168,7 +1168,7 @@ pub(crate) mod tests {
         let fetches = Arc::clone(&source.fetches);
         let (mut reloader, _) = reloader(&["waterloo-reading"]);
         reloader.retry =
-            common::backoff::Backoff::new(Duration::from_millis(100), Duration::from_secs(60));
+            ds_runtime::backoff::Backoff::new(Duration::from_millis(100), Duration::from_secs(60));
         let _rx = reloader.spawn(source);
         tokio::time::sleep(Duration::from_millis(1000)).await;
         let fetches = fetches.load(Ordering::Relaxed);

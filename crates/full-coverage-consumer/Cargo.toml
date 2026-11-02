@@ -15,6 +15,7 @@ clap = { version = "4.6.6", features = ["derive", "env"] }
 common = { path = "../common" }
 # The line catalogue, embedded (`--lines-dir` defaults to it).
 ds-lines = { path = "../ds-lines" }
+ds-runtime = { path = "../ds-runtime" }
 dotenvy = "0.15.7"
 # The reads (ingest architecture plan 4.3): the readers, the pool and the
 # schema gate.

@@ -420,7 +420,7 @@ mod db_tests {
         assert_eq!(feed.committed_count, 0, "nothing XACKed");
         assert!(feed.dead_lettered.is_empty());
         assert!(feed.rejected_batches.is_empty());
-        let mut failures = common::backoff::FailureStreak::new(crate::DELIVERY_RETRY_BACKOFF);
+        let mut failures = ds_runtime::backoff::FailureStreak::new(crate::DELIVERY_RETRY_BACKOFF);
         let wait = crate::delivery_wait(&delivery, &mut failures).unwrap();
         assert!(wait <= Duration::from_secs(1), "{wait:?}");
 

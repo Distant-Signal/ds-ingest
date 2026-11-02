@@ -21,10 +21,10 @@ pub(crate) use movement_feed::MovementFeedBackend;
 pub(crate) struct Config {
     /// Postgres, for the sink and the reads: one URL and one pool for
     /// both, as the `trust_consumer` role. Pool size and timeouts come from
-    /// the shared `DATABASE_*` variables (`common::pg`); the default pool
+    /// the shared `DATABASE_*` variables (`ds_runtime::pg`); the default pool
     /// is 2 (spec §6.6, role limit 3).
     #[arg(long, env, hide_env_values = true)]
-    pub database_url: common::secret::Secret,
+    pub database_url: ds_runtime::secret::Secret,
 
     /// How often to reload the active-tracked-trains reference set from
     /// Postgres -- picks up newly created pins and pins that resolved on a
@@ -53,8 +53,8 @@ pub(crate) struct Config {
     /// of this). A healthy iteration takes a few seconds (the `XREADGROUP`
     /// blocks for at most 5s); this is sized well above the worst
     /// legitimate one, every Postgres call in it being bounded by the
-    /// pool's timeouts (`common::pg`) and every Redis
-    /// command by `common::redis_conn` (one reconnect attempt of at most
+    /// pool's timeouts (`ds_runtime::pg`) and every Redis
+    /// command by `ds_runtime::redis_conn` (one reconnect attempt of at most
     /// 5s, a reply within 30s; a failed command ends the cycle). A Redis
     /// outage is therefore a run of fast failed cycles, each beating
     /// progress, never one stalled iteration.
@@ -106,13 +106,13 @@ pub(crate) struct Config {
 
     /// Redis AUTH password (chart `redis.auth`, from a Secret). Unset or
     /// empty: no AUTH, `redis_url` is used as-is. Applied to `redis_url` by
-    /// `common::redis_auth::redis_url_with_password`, never logged.
+    /// `ds_runtime::redis_auth::redis_url_with_password`, never logged.
     #[arg(long, env, hide_env_values = true)]
-    pub redis_password: Option<common::secret::Secret>,
+    pub redis_password: Option<ds_runtime::secret::Secret>,
 
     /// Redis ACL user (chart `redis.acl`; ingest architecture phase 0c).
     /// Unset or empty: the `default` user, exactly as before. Combined with
-    /// `redis_password` by `common::redis_auth::redis_url_with_credentials`.
+    /// `redis_password` by `ds_runtime::redis_auth::redis_url_with_credentials`.
     #[arg(long, env)]
     pub redis_username: Option<String>,
 
@@ -143,7 +143,7 @@ pub(crate) struct Config {
     #[arg(long, env, default_value_t = 9095)]
     pub metrics_port: u16,
     #[command(flatten)]
-    pub metrics: common::service_args::MetricsArgs,
+    pub metrics: ds_runtime::service_args::MetricsArgs,
 
     /// Global kill switch for
     /// `common::trust_timestamp::parse_trust_epoch_millis_pair`'s

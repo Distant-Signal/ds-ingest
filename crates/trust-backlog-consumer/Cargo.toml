@@ -14,6 +14,7 @@ clap = { version = "4.6.6", features = ["derive", "env"] }
 common = { path = "../common" }
 # The line catalogue, embedded (`--lines-dir` defaults to it).
 ds-lines = { path = "../ds-lines" }
+ds-runtime = { path = "../ds-runtime" }
 dotenvy = "0.15.7"
 # The DB sink (ingest architecture plan 3b.1): the backlog, shared
 # movement and reasons writers, `list_stanox_crs`, the pool and the schema

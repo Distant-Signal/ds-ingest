@@ -234,7 +234,7 @@ impl TrainState {
         }
         if self.parked.len() >= MAX_PARKED_TRAINS && !self.parked.contains_key(train_id) {
             metrics::counter!(
-                common::metrics::metric_name("full_coverage_consumer_unattributed_total"),
+                ds_runtime::metrics::metric_name("full_coverage_consumer_unattributed_total"),
                 "msg_type" => message.msg_type()
             )
             .increment(1);

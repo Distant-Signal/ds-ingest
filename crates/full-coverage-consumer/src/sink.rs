@@ -54,7 +54,7 @@ impl StatsSink {
     /// `full-coverage-consumer` ACL user, which may XADD and XREVRANGE
     /// `ds:ingest:full-coverage`).
     pub(crate) fn from_config(config: &Config) -> anyhow::Result<Self> {
-        let url = common::redis_auth::redis_url_with_credentials(
+        let url = ds_runtime::redis_auth::redis_url_with_credentials(
             &config.redis_url,
             config.redis_username.as_deref(),
             config.redis_password.as_ref(),
@@ -103,7 +103,7 @@ impl StatsSink {
         if windows > 0 {
             tokio::spawn(async move {
                 if receipt.written().await.is_ok() {
-                    metrics::counter!(common::metrics::metric_name(
+                    metrics::counter!(ds_runtime::metrics::metric_name(
                         "full_coverage_consumer_window_rows_posted_total"
                     ))
                     .increment(windows as u64);

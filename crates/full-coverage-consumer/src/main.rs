@@ -105,7 +105,7 @@ use day::dispatch_message;
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    common::logging::exit_code(run().await)
+    ds_runtime::logging::exit_code(run().await)
 }
 
 #[expect(
@@ -114,11 +114,11 @@ async fn main() -> std::process::ExitCode {
 )]
 async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    common::logging::init("full-coverage-consumer");
+    ds_runtime::logging::init("full-coverage-consumer");
     let config = Config::parse();
     config.reads.validate()?;
     if config.metrics.metrics_enabled {
-        common::metrics::install(config.metrics_port)?;
+        ds_runtime::metrics::install(config.metrics_port)?;
     }
     init_metrics();
     // Plan 3a.8: each stats write goes to ds:ingest:full-coverage (`sink.rs`).
@@ -139,10 +139,10 @@ async fn run() -> anyhow::Result<()> {
             // Redis down at startup is waited for (each attempt logged,
             // beating progress so /livez stays 200); afterwards every Redis
             // command is bounded and a failure is retried by this loop.
-            // See `common::redis_conn`.
+            // See `ds_runtime::redis_conn`.
             Box::new(
                 RedisStreamMovementFeed::connect_until_ready(
-                    common::redis_auth::redis_url_with_credentials(
+                    ds_runtime::redis_auth::redis_url_with_credentials(
                         &config.redis_url,
                         config.redis_username.as_deref(),
                         config.redis_password.as_ref(),
@@ -151,7 +151,7 @@ async fn run() -> anyhow::Result<()> {
                     "full-coverage-consumer",
                     "full-coverage-consumer-1",
                     Duration::from_secs(config.redis_autoclaim_min_idle_secs),
-                    common::startup::CONNECT_BACKOFF,
+                    ds_runtime::startup::CONNECT_BACKOFF,
                     &progress,
                 )
                 .await?,
@@ -217,7 +217,7 @@ async fn run() -> anyhow::Result<()> {
     )
     .await?;
 
-    let mut feed_failures = common::backoff::FailureStreak::new(FEED_RETRY_BACKOFF);
+    let mut feed_failures = ds_runtime::backoff::FailureStreak::new(FEED_RETRY_BACKOFF);
     let stats_write_interval = Duration::from_secs(config.stats_write_interval_secs);
     let mut last_stats_write = tokio::time::Instant::now() - stats_write_interval;
 
@@ -297,7 +297,7 @@ async fn run() -> anyhow::Result<()> {
                         pending_entries_trimmed = gap.pending_entries_trimmed,
                         "movement-events stream gap detected: events were trimmed before full-coverage-consumer finished with them -- this biases this consumer's shadow-mode SampleStats for the affected window (e.g. inflating the unconfirmed-by-window-close = cancelled bucket); treat any rail day during which a gap was detected as not clean signal"
                     );
-                    metrics::counter!(common::metrics::metric_name(
+                    metrics::counter!(ds_runtime::metrics::metric_name(
                         "full_coverage_consumer_stream_gap_detected_total"
                     ))
                     .increment(1);
@@ -320,7 +320,7 @@ async fn run() -> anyhow::Result<()> {
         // blocking read, and `ArcSwap` guards are meant to be short-lived.
         let cycle_start = std::time::Instant::now();
         let failed = consume_once(&mut feed, &mut day, &lookups, &population.load_full()).await;
-        metrics::histogram!(common::metrics::metric_name(
+        metrics::histogram!(ds_runtime::metrics::metric_name(
             "full_coverage_consumer_cycle_duration_seconds"
         ))
         .record(cycle_start.elapsed().as_secs_f64());
@@ -374,7 +374,7 @@ fn init_metrics() {
         "full_coverage_consumer_startup_replay_entries_total",
         "full_coverage_consumer_window_rows_posted_total",
     ] {
-        metrics::counter!(common::metrics::metric_name(counter)).increment(0);
+        metrics::counter!(ds_runtime::metrics::metric_name(counter)).increment(0);
     }
     for gauge in [
         "full_coverage_consumer_population_loaded",
@@ -385,24 +385,24 @@ fn init_metrics() {
         "full_coverage_consumer_pending_trains",
         "full_coverage_consumer_window_presumed_cancelled",
     ] {
-        metrics::gauge!(common::metrics::metric_name(gauge)).set(0.0);
+        metrics::gauge!(ds_runtime::metrics::metric_name(gauge)).set(0.0);
     }
     for msg_type in ["0002", "0005", "0006"] {
         metrics::counter!(
-            common::metrics::metric_name("full_coverage_consumer_unattributed_total"),
+            ds_runtime::metrics::metric_name("full_coverage_consumer_unattributed_total"),
             "msg_type" => msg_type
         )
         .increment(0);
     }
     // DistantSignalConsumerApiCallsFailing.
-    common::metrics::register_operation_counters(
+    ds_runtime::metrics::register_operation_counters(
         "full_coverage_consumer_errors_total",
         API_CALL_OPERATIONS,
     );
     // DistantSignalTrustEnvelopeParseDrops (R-097).
     for msg_type in trust_schema::schema::ENVELOPE_FAILURE_MSG_TYPES {
         metrics::counter!(
-            common::metrics::metric_name("full_coverage_consumer_errors_total"),
+            ds_runtime::metrics::metric_name("full_coverage_consumer_errors_total"),
             "operation" => "parse_envelope",
             "msg_type" => msg_type
         )
@@ -441,7 +441,7 @@ async fn start_consuming<F: replay::ReplaySource>(
     )
     .await;
     let elapsed = started.elapsed();
-    metrics::gauge!(common::metrics::metric_name(
+    metrics::gauge!(ds_runtime::metrics::metric_name(
         "full_coverage_consumer_startup_replay_seconds"
     ))
     .set(elapsed.as_secs_f64());
@@ -456,7 +456,7 @@ async fn start_consuming<F: replay::ReplaySource>(
         "startup replay complete; consuming as the group"
     );
     publish_day_partial_metrics(&day);
-    metrics::gauge!(common::metrics::metric_name(
+    metrics::gauge!(ds_runtime::metrics::metric_name(
         "full_coverage_consumer_startup_complete"
     ))
     .set(1.0);
@@ -464,7 +464,7 @@ async fn start_consuming<F: replay::ReplaySource>(
 }
 
 fn publish_day_partial_metrics(day: &DayState) {
-    metrics::gauge!(common::metrics::metric_name(
+    metrics::gauge!(ds_runtime::metrics::metric_name(
         "full_coverage_consumer_day_partial"
     ))
     .set(if day.partial_reason.is_some() {
@@ -491,7 +491,7 @@ async fn consume_once<F: MovementFeed + DeadLetterSink>(
         Err(err) => {
             tracing::error!(error = ?err, "error receiving from movement feed");
             metrics::counter!(
-                common::metrics::metric_name("full_coverage_consumer_errors_total"),
+                ds_runtime::metrics::metric_name("full_coverage_consumer_errors_total"),
                 "operation" => "movement_feed_receive"
             )
             .increment(1);
@@ -507,7 +507,7 @@ async fn consume_once<F: MovementFeed + DeadLetterSink>(
         if let Err(err) = day.dispatch_payload(raw, lookups, population, received_at) {
             tracing::error!(error = ?err, raw = %raw, "failed to parse TRUST batch; dead-lettering this payload");
             metrics::counter!(
-                common::metrics::metric_name("full_coverage_consumer_errors_total"),
+                ds_runtime::metrics::metric_name("full_coverage_consumer_errors_total"),
                 "operation" => "parse_batch"
             )
             .increment(1);
@@ -527,7 +527,7 @@ async fn consume_once<F: MovementFeed + DeadLetterSink>(
     if let Err(err) = feed.dead_letter(&unparseable).await {
         tracing::error!(error = ?err, "failed to dead-letter unparseable payloads; not committing this batch");
         metrics::counter!(
-            common::metrics::metric_name("full_coverage_consumer_errors_total"),
+            ds_runtime::metrics::metric_name("full_coverage_consumer_errors_total"),
             "operation" => "dead_letter"
         )
         .increment(1);
@@ -539,7 +539,7 @@ async fn consume_once<F: MovementFeed + DeadLetterSink>(
     else if let Err(err) = feed.commit().await {
         tracing::error!(error = ?err, "failed to commit movement feed offsets");
         metrics::counter!(
-            common::metrics::metric_name("full_coverage_consumer_errors_total"),
+            ds_runtime::metrics::metric_name("full_coverage_consumer_errors_total"),
             "operation" => "commit_offsets"
         )
         .increment(1);
@@ -561,7 +561,7 @@ async fn reload_stanox_crs(
         Ok(records) => records,
         Err(err) => {
             metrics::counter!(
-                common::metrics::metric_name("full_coverage_consumer_errors_total"),
+                ds_runtime::metrics::metric_name("full_coverage_consumer_errors_total"),
                 "operation" => "reload_stanox_crs"
             )
             .increment(1);
@@ -613,8 +613,8 @@ async fn load_stanox_crs_until_ok(
 /// write): 1s doubling to 30s, jittered, reset by the next good step. It
 /// used to be a flat 2s; the stream holds the backlog, so a longer wait
 /// loses nothing (the same change as trust-consumer's `CYCLE_RETRY_BACKOFF`).
-const FEED_RETRY_BACKOFF: common::backoff::Backoff =
-    common::backoff::Backoff::new(Duration::from_secs(1), Duration::from_secs(30));
+const FEED_RETRY_BACKOFF: ds_runtime::backoff::Backoff =
+    ds_runtime::backoff::Backoff::new(Duration::from_secs(1), Duration::from_secs(30));
 
 /// What the top of the loop must do about the rail day, given the day it is
 /// currently correlating into and the current instant. Split out of the loop
@@ -804,27 +804,27 @@ fn build_stats(
         line_rows.push(row);
     }
     if let Some((trains, ctx)) = &windowed {
-        metrics::gauge!(common::metrics::metric_name(
+        metrics::gauge!(ds_runtime::metrics::metric_name(
             "full_coverage_consumer_parked_messages"
         ))
         .set(trains.parked_count() as f64);
         report_windows(&window_rows, ctx.feed_stale);
     }
-    metrics::gauge!(common::metrics::metric_name(
+    metrics::gauge!(ds_runtime::metrics::metric_name(
         "full_coverage_consumer_lines_available_total"
     ))
     .set(available_count as f64);
-    metrics::gauge!(common::metrics::metric_name(
+    metrics::gauge!(ds_runtime::metrics::metric_name(
         "full_coverage_consumer_lines_pending_total"
     ))
     .set(pending_count as f64);
-    metrics::gauge!(common::metrics::metric_name(
+    metrics::gauge!(ds_runtime::metrics::metric_name(
         "full_coverage_consumer_lines_partial"
     ))
     .set(partial_count as f64);
 
     let station_rows = station_correlate::build_station_rows(&day.stations, now, defaults);
-    metrics::gauge!(common::metrics::metric_name(
+    metrics::gauge!(ds_runtime::metrics::metric_name(
         "full_coverage_consumer_stations_available_total"
     ))
     .set(station_rows.len() as f64);
@@ -891,7 +891,7 @@ fn windowed_write_context(
     reason = "metric gauges take f64, and these counts stay far below 2^52"
 )]
 fn report_windows(rows: &[common::FullCoverageWindowStatsRow], feed_stale: bool) {
-    metrics::gauge!(common::metrics::metric_name(
+    metrics::gauge!(ds_runtime::metrics::metric_name(
         "full_coverage_consumer_window_feed_stale"
     ))
     .set(if feed_stale { 1.0 } else { 0.0 });
@@ -904,11 +904,11 @@ fn report_windows(rows: &[common::FullCoverageWindowStatsRow], feed_stale: bool)
             c + u64::from(r.counts.cancelled_presumed),
         )
     });
-    metrics::gauge!(common::metrics::metric_name(
+    metrics::gauge!(ds_runtime::metrics::metric_name(
         "full_coverage_consumer_pending_trains"
     ))
     .set(pending as f64);
-    metrics::gauge!(common::metrics::metric_name(
+    metrics::gauge!(ds_runtime::metrics::metric_name(
         "full_coverage_consumer_window_presumed_cancelled"
     ))
     .set(presumed as f64);
@@ -1706,7 +1706,7 @@ mod tests {
             geometry: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             population: Arc::clone(&population),
             interval: Duration::from_secs(300),
-            retry: common::backoff::Backoff::new(
+            retry: ds_runtime::backoff::Backoff::new(
                 Duration::from_millis(20),
                 Duration::from_secs(60),
             ),

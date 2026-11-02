@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use common::redis_conn::RedisConn;
+use ds_runtime::redis_conn::RedisConn;
 use redis::AsyncCommands;
 
 use crate::{DeadLetter, DeadLetterSink, MovementFeed};
@@ -134,11 +134,12 @@ const LIVE_READ_BLOCK_MS: usize = 5000;
 /// (`connect_to_named_stream`) still get the production wait.
 const LIVE_BLOCK_MS: usize = if cfg!(test) { 100 } else { LIVE_READ_BLOCK_MS };
 
-// Every command is bounded by `common::redis_conn::RESPONSE_TIMEOUT`, so a
+// Every command is bounded by `ds_runtime::redis_conn::RESPONSE_TIMEOUT`, so a
 // blocking read must return well within it or a quiet stream would look
 // like a dead connection.
-const _: () =
-    assert!((LIVE_READ_BLOCK_MS as u128) * 2 < common::redis_conn::RESPONSE_TIMEOUT.as_millis());
+const _: () = assert!(
+    (LIVE_READ_BLOCK_MS as u128) * 2 < ds_runtime::redis_conn::RESPONSE_TIMEOUT.as_millis()
+);
 
 pub struct RedisStreamMovementFeed {
     conn: RedisConn,
@@ -205,7 +206,7 @@ impl RedisStreamMovementFeed {
     /// one-fixed-name convention and this design's own
     /// single-replica constraint (design doc Decision 2).
     ///
-    /// One bounded attempt (see `common::redis_conn`): errors within
+    /// One bounded attempt (see `ds_runtime::redis_conn`): errors within
     /// seconds if Redis is unreachable. Services start through
     /// [`Self::connect_until_ready`] instead.
     pub async fn connect(
@@ -223,11 +224,11 @@ impl RedisStreamMovementFeed {
     /// the consumer-group setup is waited for, not exited on. Each failed
     /// attempt is logged and beats `progress`, so the worker's `/livez`
     /// stays 200 while this waits and a Redis outage at startup cannot get
-    /// the pod killed. Pass `common::startup::CONNECT_BACKOFF` outside
+    /// the pod killed. Pass `ds_runtime::startup::CONNECT_BACKOFF` outside
     /// tests. Only an unparseable `redis_url` is an error.
     ///
     /// Once connected, every command is bounded (one reconnect attempt of
-    /// at most `common::redis_conn::CONNECT_TIMEOUT`, a reply within
+    /// at most `ds_runtime::redis_conn::CONNECT_TIMEOUT`, a reply within
     /// `RESPONSE_TIMEOUT`) and returns its error to the caller, whose loop
     /// backs off and retries -- redis-rs never retries internally.
     pub async fn connect_until_ready(
@@ -235,7 +236,7 @@ impl RedisStreamMovementFeed {
         group: &str,
         consumer: &str,
         autoclaim_min_idle: Duration,
-        backoff: common::backoff::Backoff,
+        backoff: ds_runtime::backoff::Backoff,
         progress: &health_http::Progress,
     ) -> anyhow::Result<Self> {
         Self::connect_stream_until_ready(
@@ -256,11 +257,11 @@ impl RedisStreamMovementFeed {
         group: &str,
         consumer: &str,
         autoclaim_min_idle: Duration,
-        backoff: common::backoff::Backoff,
+        backoff: ds_runtime::backoff::Backoff,
         progress: &health_http::Progress,
     ) -> anyhow::Result<Self> {
         let client = redis::Client::open(redis_url)?;
-        Ok(common::startup::retry_until_ready(
+        Ok(ds_runtime::startup::retry_until_ready(
             "Redis movement-events stream",
             backoff,
             Some(progress),
@@ -315,7 +316,7 @@ impl RedisStreamMovementFeed {
         consumer: impl Into<String>,
         autoclaim_min_idle: Duration,
     ) -> anyhow::Result<Self> {
-        let mut conn = common::redis_conn::connect(client).await?;
+        let mut conn = ds_runtime::redis_conn::connect(client).await?;
         let group = group.into();
 
         ensure_group(&mut conn, stream, &group, "$").await?;
@@ -327,35 +328,35 @@ impl RedisStreamMovementFeed {
         // a fresh pod's series, fired on every rollout).
         for reason in crate::DEAD_LETTER_REASONS {
             metrics::counter!(
-                common::metrics::metric_name("movement_feed_deadlettered_total"),
+                ds_runtime::metrics::metric_name("movement_feed_deadlettered_total"),
                 "group" => group.clone(),
                 "reason" => reason
             )
             .increment(0);
         }
         metrics::counter!(
-            common::metrics::metric_name("movement_feed_deadletter_full_total"),
+            ds_runtime::metrics::metric_name("movement_feed_deadletter_full_total"),
             "group" => group.clone()
         )
         .increment(0);
         metrics::counter!(
-            common::metrics::metric_name(GROUP_RECREATED_METRIC),
+            ds_runtime::metrics::metric_name(GROUP_RECREATED_METRIC),
             "group" => group.clone()
         )
         .increment(0);
         metrics::counter!(
-            common::metrics::metric_name(GROUP_RESTORED_METRIC),
+            ds_runtime::metrics::metric_name(GROUP_RESTORED_METRIC),
             "group" => group.clone()
         )
         .increment(0);
         // ...and the long-pending counter, for DistantSignalMovementFeedLongPending.
         metrics::counter!(
-            common::metrics::metric_name("movement_feed_long_pending_total"),
+            ds_runtime::metrics::metric_name("movement_feed_long_pending_total"),
             "group" => group.clone()
         )
         .increment(0);
         metrics::counter!(
-            common::metrics::metric_name(ENTRY_ID_UNPARSEABLE_METRIC),
+            ds_runtime::metrics::metric_name(ENTRY_ID_UNPARSEABLE_METRIC),
             "group" => group.clone()
         )
         .increment(0);
@@ -443,7 +444,7 @@ impl RedisStreamMovementFeed {
              (a downstream outage, or a failure the consumer cannot classify as a data rejection)"
         );
         metrics::counter!(
-            common::metrics::metric_name("movement_feed_long_pending_total"),
+            ds_runtime::metrics::metric_name("movement_feed_long_pending_total"),
             "group" => self.group.clone()
         )
         .increment(long_pending.len() as u64);
@@ -567,7 +568,7 @@ impl DeadLetterSink for RedisStreamMovementFeed {
                  pending until it is drained (see docs/movement-events-deadletter.md)"
             );
             metrics::counter!(
-                common::metrics::metric_name("movement_feed_deadletter_full_total"),
+                ds_runtime::metrics::metric_name("movement_feed_deadletter_full_total"),
                 "group" => self.group.clone()
             )
             .increment(records.len() as u64);
@@ -612,14 +613,14 @@ impl DeadLetterSink for RedisStreamMovementFeed {
                 "dead-lettered a poison record instead of retrying it forever"
             );
             metrics::counter!(
-                common::metrics::metric_name("movement_feed_deadlettered_total"),
+                ds_runtime::metrics::metric_name("movement_feed_deadlettered_total"),
                 "group" => self.group.clone(),
                 "reason" => record.reason
             )
             .increment(1);
         }
         metrics::gauge!(
-            common::metrics::metric_name("movement_feed_deadletter_length"),
+            ds_runtime::metrics::metric_name("movement_feed_deadletter_length"),
             "stream" => stream
         )
         .set((len + records.len()) as f64);
@@ -825,7 +826,7 @@ fn next_pel_replay_cursor(
 }
 
 /// After a failed read: moves `group` forward to `last_delivered_id` if
-/// Redis reports it behind (`common::redis_group::restore_group_position`),
+/// Redis reports it behind (`ds_runtime::redis_group::restore_group_position`),
 /// logging a warning and counting [`GROUP_RESTORED_METRIC`]; a group at or
 /// past it is adopted as the new `last_delivered_id`. Returns whether the
 /// check is done: `false` (logged) when Redis could not be asked, so the
@@ -844,14 +845,14 @@ async fn restore_group_position<C: redis::aio::ConnectionLike + Send>(
     let Some(remembered) = last_delivered_id.clone() else {
         // Nothing to compare with; seed it, as at connect.
         if let Ok(Some(at)) =
-            common::redis_group::group_last_delivered_id(conn, stream, group).await
+            ds_runtime::redis_group::group_last_delivered_id(conn, stream, group).await
         {
             *last_delivered_id = Some(at);
         }
         return true;
     };
-    match common::redis_group::restore_group_position(conn, stream, group, &remembered).await {
-        Ok(common::redis_group::GroupPosition::Restored { was }) => {
+    match ds_runtime::redis_group::restore_group_position(conn, stream, group, &remembered).await {
+        Ok(ds_runtime::redis_group::GroupPosition::Restored { was }) => {
             tracing::warn!(
                 stream,
                 group,
@@ -862,17 +863,17 @@ async fn restore_group_position<C: redis::aio::ConnectionLike + Send>(
                  already processed are not delivered again"
             );
             metrics::counter!(
-                common::metrics::metric_name(GROUP_RESTORED_METRIC),
+                ds_runtime::metrics::metric_name(GROUP_RESTORED_METRIC),
                 "group" => group.to_string()
             )
             .increment(1);
             true
         }
-        Ok(common::redis_group::GroupPosition::Current { at }) => {
+        Ok(ds_runtime::redis_group::GroupPosition::Current { at }) => {
             *last_delivered_id = Some(at);
             true
         }
-        Ok(common::redis_group::GroupPosition::Missing) => true,
+        Ok(ds_runtime::redis_group::GroupPosition::Missing) => true,
         Err(err) => {
             tracing::warn!(error = ?err, stream, group, "could not check the consumer group's position; retrying before the next read");
             false
@@ -978,7 +979,7 @@ impl RedisStreamMovementFeed {
             return;
         }
         metrics::counter!(
-            common::metrics::metric_name(GROUP_RECREATED_METRIC),
+            ds_runtime::metrics::metric_name(GROUP_RECREATED_METRIC),
             "group" => self.group.clone()
         )
         .increment(1);
@@ -1110,7 +1111,7 @@ impl RedisStreamMovementFeed {
                 "stream entry id has no parseable time; using this consumer's clock as its arrival time"
             );
             metrics::counter!(
-                common::metrics::metric_name(ENTRY_ID_UNPARSEABLE_METRIC),
+                ds_runtime::metrics::metric_name(ENTRY_ID_UNPARSEABLE_METRIC),
                 "group" => self.group.clone()
             )
             .increment(1);
@@ -1698,7 +1699,7 @@ mod recreate_start_id_tests {
     #[test]
     fn the_group_recreated_counter_name_matches_the_chart_alert() {
         assert_eq!(
-            common::metrics::metric_name(GROUP_RECREATED_METRIC),
+            ds_runtime::metrics::metric_name(GROUP_RECREATED_METRIC),
             "distant_signal_movement_feed_group_recreated_total"
         );
     }
@@ -1723,10 +1724,10 @@ mod recreate_start_id_tests {
 }
 
 /// [`restore_group_position`] against a scripted Redis
-/// (`common::redis_group::fake::FakeConn`).
+/// (`ds_runtime::redis_group::fake::FakeConn`).
 #[cfg(test)]
 mod restore_group_position_tests {
-    use common::redis_group::fake::FakeConn;
+    use ds_runtime::redis_group::fake::FakeConn;
     use redis::Value;
 
     use super::*;
@@ -1871,7 +1872,7 @@ mod redis_tests {
         assert!(payloads(feed.next_batch().await.unwrap()).is_empty()); // drain empty startup PEL
 
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
         // An explicit id 2026-10-01T00:59:00Z (01:59 London): long before
         // this read, as for a lagging consumer.
         let _: String = redis::cmd("XADD")
@@ -1901,8 +1902,8 @@ mod redis_tests {
         let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
         let password = std::env::var("REDIS_PASSWORD")
             .ok()
-            .map(common::secret::Secret::from);
-        common::redis_auth::redis_url_with_password(&url, password.as_ref())
+            .map(ds_runtime::secret::Secret::from);
+        ds_runtime::redis_auth::redis_url_with_password(&url, password.as_ref())
             .expect("REDIS_URL/REDIS_PASSWORD combine")
             .expose()
             .to_owned()
@@ -1921,9 +1922,9 @@ mod redis_tests {
         let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
         let password = std::env::var("REDIS_PASSWORD")
             .unwrap_or_else(|_| "rollout-step-1-server-has-no-password-yet".into());
-        let url = common::redis_auth::redis_url_with_password(
+        let url = ds_runtime::redis_auth::redis_url_with_password(
             &url,
-            Some(&common::secret::Secret::new(password)),
+            Some(&ds_runtime::secret::Secret::new(password)),
         )
         .unwrap();
         let stream = unique_stream("auth");
@@ -1954,7 +1955,7 @@ mod redis_tests {
 
     async fn cleanup(stream: &str) {
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
         let _: redis::RedisResult<i64> = redis::cmd("DEL")
             .arg(stream)
             .arg(format!("{stream}{DEAD_LETTER_SUFFIX}"))
@@ -1965,7 +1966,7 @@ mod redis_tests {
     /// `(field -> value)` maps of every entry in `stream`'s dead-letter stream.
     async fn dead_letters(stream: &str) -> Vec<std::collections::HashMap<String, String>> {
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
         let reply: redis::streams::StreamRangeReply = conn
             .xrange_all(format!("{stream}{DEAD_LETTER_SUFFIX}"))
             .await
@@ -2223,7 +2224,7 @@ mod redis_tests {
 
     async fn xadd(stream: &str, payload: &str) {
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
         let _: String = redis::cmd("XADD")
             .arg(stream)
             .arg("*")
@@ -2258,7 +2259,7 @@ mod redis_tests {
         // deliberately written with a raw XADD rather than this module's own
         // `xadd` helper, which always sets "payload".
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut raw_conn = common::redis_conn::connect(&client).await.unwrap();
+        let mut raw_conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
         let _: String = redis::cmd("XADD")
             .arg(&stream)
             .arg("*")
@@ -2508,7 +2509,7 @@ mod redis_tests {
         .unwrap();
 
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut raw_conn = common::redis_conn::connect(&client).await.unwrap();
+        let mut raw_conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
         let mut pipe = redis::pipe();
         for i in 0..BACKLOG {
             pipe.cmd("XADD")
@@ -2584,7 +2585,7 @@ mod redis_tests {
         // Creates the group (at `$`) before anything is added.
         drop(connect().await);
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
         let mut pipe = redis::pipe();
         for i in 0..total {
             pipe.cmd("XADD")
@@ -2658,7 +2659,7 @@ mod redis_tests {
         // Force aggressive trimming past what the group has read, via a
         // separate client (MAXLEN on XADD only trims on write).
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut raw_conn = common::redis_conn::connect(&client).await.unwrap();
+        let mut raw_conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
         for i in 0..10 {
             let _: String = redis::cmd("XADD")
                 .arg(&stream)
@@ -2933,7 +2934,7 @@ mod redis_tests {
 
         assert!(payloads(feed.next_batch().await.unwrap()).is_empty());
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
         let _: String = redis::cmd("XADD")
             .arg(&stream)
             .arg("*")
@@ -3040,7 +3041,7 @@ mod redis_tests {
         assert_eq!(drain(&mut feed).await.len(), 5);
 
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
         let destroyed: i64 = redis::cmd("XGROUP")
             .arg("DESTROY")
             .arg(&stream)
@@ -3069,7 +3070,7 @@ mod redis_tests {
         assert!(feed.last_delivered_id.is_some());
 
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
         let _: i64 = redis::cmd("XGROUP")
             .arg("DESTROY")
             .arg(&stream)
@@ -3090,7 +3091,7 @@ mod redis_tests {
 /// A Redis outage must never park a consumer inside redis-rs: startup waits
 /// visibly (logged, beating progress), and once running every command fails
 /// within seconds so the consumer's own loop retries. See
-/// `common::redis_conn`.
+/// `ds_runtime::redis_conn`.
 #[cfg(test)]
 mod outage_tests {
 
@@ -3121,7 +3122,7 @@ mod outage_tests {
                 "trust-consumer",
                 "trust-consumer-1",
                 Duration::from_secs(30),
-                common::backoff::Backoff::new(
+                ds_runtime::backoff::Backoff::new(
                     Duration::from_millis(20),
                     Duration::from_millis(100),
                 ),
@@ -3151,7 +3152,7 @@ mod outage_tests {
             "g",
             "c",
             Duration::from_secs(30),
-            common::startup::CONNECT_BACKOFF,
+            ds_runtime::startup::CONNECT_BACKOFF,
             &progress,
         )
         .await;
@@ -3215,8 +3216,8 @@ mod outage_tests {
     fn with_password(url: &str) -> String {
         let password = std::env::var("REDIS_PASSWORD")
             .ok()
-            .map(common::secret::Secret::from);
-        common::redis_auth::redis_url_with_password(url, password.as_ref())
+            .map(ds_runtime::secret::Secret::from);
+        ds_runtime::redis_auth::redis_url_with_password(url, password.as_ref())
             .unwrap()
             .expose()
             .to_owned()
@@ -3260,7 +3261,7 @@ mod outage_tests {
             let took = started.elapsed();
             assert!(result.is_err(), "attempt {attempt}: Redis is down");
             assert!(
-                took < common::redis_conn::CONNECT_TIMEOUT + Duration::from_secs(1),
+                took < ds_runtime::redis_conn::CONNECT_TIMEOUT + Duration::from_secs(1),
                 "attempt {attempt} took {took:?}: a read during an outage must fail fast"
             );
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -3280,7 +3281,7 @@ mod outage_tests {
         assert!(recovered, "the same feed reads again once Redis is back");
 
         let client = redis::Client::open(direct_redis_url()).unwrap();
-        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
         let _: redis::RedisResult<i64> =
             redis::cmd("DEL").arg(&stream).query_async(&mut conn).await;
     }
@@ -3300,7 +3301,7 @@ mod outage_tests {
             .as_nanos();
         let stream = format!("movement-events-test-rewind-{nanos}");
         let client = redis::Client::open(direct_redis_url()).unwrap();
-        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
         let mut feed = RedisStreamMovementFeed::connect_for_test(
             &with_password(&format!("redis://127.0.0.1:{}", proxy.port)),
             &stream,
@@ -3368,7 +3369,7 @@ mod outage_tests {
         }
         assert_eq!(read, ["c"], "a and b must not be delivered again");
         let group_at =
-            common::redis_group::group_last_delivered_id(&mut conn, &stream, "test-group")
+            ds_runtime::redis_group::group_last_delivered_id(&mut conn, &stream, "test-group")
                 .await
                 .unwrap()
                 .unwrap();

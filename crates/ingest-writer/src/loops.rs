@@ -1,7 +1,7 @@
 //! The writer's loops (spec §12.3), registered when `INGEST_WRITER_LOOPS`
 //! is on.
 //!
-//! | Loop | Lock ([`common::advisory_locks`]) | Body | Interval env (default) |
+//! | Loop | Lock ([`ds_runtime::advisory_locks`]) | Body | Interval env (default) |
 //! |---|---|---|---|
 //! | schedule-match | `SCHEDULE_MATCH_SWEEP` | [`ds_store::loops::schedule_match`] | `SCHEDULE_MATCH_INTERVAL_SECS` (300) |
 //! | reconciliation | `RECONCILIATION_SWEEP` | [`ds_store::loops::reconciliation`] (also finishes trains still `en_route` two days after their service date) | `RECONCILIATION_SWEEP_INTERVAL_SECS` (300), grace `SCHEDULE_ENRICHMENT_GRACE_MINUTES` (30) |
@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use common::advisory_locks;
+use ds_runtime::advisory_locks;
 use ds_store::loops::{CrsLineIndex, LoopRunner, LoopSpec};
 
 use crate::config::Config;

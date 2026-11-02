@@ -25,7 +25,7 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use common::metrics::metric_name;
+use ds_runtime::metrics::metric_name;
 use sqlx::PgPool;
 
 use crate::stream::{STREAMS, StreamModes};
@@ -47,7 +47,7 @@ pub const FRESHNESS_INTERVAL: Duration = Duration::from_secs(60);
 /// Sets `ingest_stream_mode_info` for every stream the writer knows.
 pub fn export_stream_modes(modes: &StreamModes) {
     for spec in STREAMS {
-        common::metrics::set_info(
+        ds_runtime::metrics::set_info(
             STREAM_MODE_INFO,
             &[
                 ("stream", spec.stream),
