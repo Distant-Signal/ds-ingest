@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
 
 # The Darwin Push Port relay (DS-152): Kafka (the RDM Push Port JSON topic)
 # to the ds:ingest:darwin Redis stream, which ingest-writer applies. No

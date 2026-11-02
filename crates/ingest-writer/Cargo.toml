@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
 
 # A library target as well as the binary, so its tests reach the config and
 # the loop registration. The loop runner itself is `ds_store::loops` (plan
