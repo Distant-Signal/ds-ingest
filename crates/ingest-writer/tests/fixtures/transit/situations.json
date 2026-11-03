@@ -1,0 +1,57 @@
+{
+  "network": "metrolink",
+  "situations": [
+    {
+      "situation_id": "TFGM-1001",
+      "version": 2,
+      "progress": "open",
+      "planned": false,
+      "reason": "equipment:liftFailure",
+      "summary": "Lift out of service at Heaton Park",
+      "description": "The lift at Heaton Park is out of service.",
+      "info_url": null,
+      "validity": [{"start": "2026-10-09T08:00:00Z", "end": null}],
+      "publication": [{"start": "2026-10-09T08:00:00Z", "end": "2026-10-20T00:00:00Z"}],
+      "consequences": [
+        {
+          "condition": "unknown",
+          "severity": "slight",
+          "all_lines": true,
+          "line_ids": [],
+          "unmapped_line_refs": [],
+          "stop_ids": ["9400ZZMAHEA"],
+          "advice": null
+        }
+      ],
+      "line_ids": [],
+      "stop_ids": ["9400ZZMAHEA"],
+      "scope": "stop"
+    },
+    {
+      "situation_id": "TFGM-1002",
+      "version": null,
+      "progress": "open",
+      "planned": true,
+      "reason": "miscellaneous:engineeringWorks",
+      "summary": "No trams between Cornbrook and Eccles",
+      "description": null,
+      "info_url": "https://example.invalid/works",
+      "validity": [{"start": "2026-10-18T05:00:00Z", "end": "2026-10-19T23:59:00Z"}],
+      "publication": [{"start": "2026-10-11T00:00:00Z", "end": null}],
+      "consequences": [
+        {
+          "condition": "suspended",
+          "severity": "severe",
+          "all_lines": false,
+          "line_ids": ["blue"],
+          "unmapped_line_refs": ["BLUEX"],
+          "stop_ids": [],
+          "advice": "Use replacement buses."
+        }
+      ],
+      "line_ids": ["blue"],
+      "stop_ids": [],
+      "scope": "line"
+    }
+  ]
+}

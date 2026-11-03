@@ -474,10 +474,11 @@ mod tests {
 
     #[test]
     fn situation_ids_outside_their_grammar_are_poison() {
-        let fixture: TransitSituations = serde_json::from_str(include_str!(
-            "../../../common/tests/fixtures/transit/situations.json"
-        ))
-        .unwrap();
+        // A copy of common's fixture: common moves to ds-core (repo split
+        // spec §9, phase 4), and a test can't reach into another repository.
+        let fixture: TransitSituations =
+            serde_json::from_str(include_str!("../../tests/fixtures/transit/situations.json"))
+                .unwrap();
         assert!(check_situations(&fixture).is_ok());
         let mut long = fixture.clone();
         long.situations[0].situation_id = "x".repeat(MAX_SITUATION_ID_LEN + 1);

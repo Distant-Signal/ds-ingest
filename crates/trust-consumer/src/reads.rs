@@ -34,7 +34,7 @@ mod tests {
     use super::*;
 
     /// The reads go to the view and `stanox_crs`.
-    #[sqlx::test(migrations = "../ds-store/migrations")]
+    #[sqlx::test(migrator = "ds_store::migrate::MIGRATOR")]
     #[ignore = "needs DATABASE_URL (a role that can create databases)"]
     async fn the_reads_read_postgres(pool: sqlx::PgPool) {
         sqlx::query(
