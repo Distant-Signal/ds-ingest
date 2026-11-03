@@ -1368,7 +1368,7 @@ mod db_tests {
     /// Spec §11.1: the first cycle reads every published pair; an unchanged
     /// population then reads nothing, and a republished one only its own
     /// pair.
-    #[sqlx::test(migrations = "../ds-store/migrations")]
+    #[sqlx::test(migrator = "ds_store::migrate::MIGRATOR")]
     #[ignore = "needs DATABASE_URL (a role that can create databases)"]
     async fn a_changed_version_refetches_only_that_pair(pool: sqlx::PgPool) {
         let next_day = day() + chrono::Duration::days(1);
@@ -1433,7 +1433,7 @@ mod db_tests {
     /// The abort after three failures applies to the database too: with
     /// the version query failing, three fetches fail and the cycle stops,
     /// keeping every previous snapshot.
-    #[sqlx::test(migrations = "../ds-store/migrations")]
+    #[sqlx::test(migrator = "ds_store::migrate::MIGRATOR")]
     #[ignore = "needs DATABASE_URL (a role that can create databases)"]
     async fn a_failing_database_stops_the_cycle_after_three_failures(pool: sqlx::PgPool) {
         let lines: Vec<String> = (0..4).map(|i| format!("line-{i}")).collect();
