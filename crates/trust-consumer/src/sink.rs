@@ -761,7 +761,7 @@ mod db_tests {
                 [Some("42501".to_string()), Some("42501".to_string())]
             );
         }
-        assert!(rejected.unwrap().is_empty());
+        assert_eq!(rejected.unwrap(), []);
         assert_eq!(
             rows.iter()
                 .filter(|row| row.starts_with("movement "))
@@ -777,6 +777,6 @@ mod db_tests {
     #[ignore = "requires a live database; run with DATABASE_URL set and --ignored"]
     async fn an_empty_batch_writes_nothing() {
         let db = DbSink { pool: pool().await };
-        assert!(db.write(&[], &HashMap::new()).await.unwrap().is_empty());
+        assert_eq!(db.write(&[], &HashMap::new()).await.unwrap(), []);
     }
 }

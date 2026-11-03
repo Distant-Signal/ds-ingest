@@ -324,7 +324,9 @@ mod tests {
     /// `timetable_variation`. It used to stay `None`, so every full-coverage
     /// row read `delayed = 0`.
     #[test]
-    #[expect(
+    // `allow`, not `expect`: clippy 1.99's `float_cmp` no longer fires
+    // here, but older toolchains' does (workspace Cargo.toml).
+    #[allow(
         clippy::float_cmp,
         reason = "a single 12-minute sample averages to exactly 12.0"
     )]
@@ -382,7 +384,7 @@ mod tests {
             date,
         );
 
-        assert!(result.matched_lines.is_empty());
+        assert_eq!(result.matched_lines, []);
         assert!(state.derived.is_empty());
     }
 
@@ -485,7 +487,7 @@ mod tests {
             &population_with_uid_in_line_a(date),
             date,
         );
-        assert!(cancelled.is_empty());
+        assert_eq!(cancelled, []);
         assert!(state.derived.is_empty());
     }
 

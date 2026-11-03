@@ -418,8 +418,8 @@ mod db_tests {
 
         assert_eq!(delivery, Delivery::PostFailed);
         assert_eq!(feed.committed_count, 0, "nothing XACKed");
-        assert!(feed.dead_lettered.is_empty());
-        assert!(feed.rejected_batches.is_empty());
+        assert_eq!(feed.dead_lettered, []);
+        assert_eq!(feed.rejected_batches, [] as [String; 0]);
         let mut failures = ds_runtime::backoff::FailureStreak::new(crate::DELIVERY_RETRY_BACKOFF);
         let wait = crate::delivery_wait(&delivery, &mut failures).unwrap();
         assert!(wait <= Duration::from_secs(1), "{wait:?}");
@@ -458,6 +458,6 @@ mod db_tests {
         sink.write_reasons(&[]).await.unwrap();
         let response = sink.write_backlog(&[]).await.unwrap();
         assert_eq!(response.upserted, 0);
-        assert!(response.rejected.is_empty());
+        assert_eq!(response.rejected, []);
     }
 }

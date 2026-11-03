@@ -754,8 +754,8 @@ mod tests {
 
         assert_eq!(outcome, Cycle::Failed);
         assert_eq!(feed.committed_count, 0, "nothing XACKed");
-        assert!(feed.dead_lettered.is_empty());
-        assert!(feed.rejected_batches.is_empty());
+        assert_eq!(feed.dead_lettered, []);
+        assert_eq!(feed.rejected_batches, [] as [String; 0]);
         let mut failures = ds_runtime::backoff::FailureStreak::new(CYCLE_RETRY_BACKOFF);
         let wait = cycle_wait(&outcome, &mut failures).unwrap();
         assert!(wait <= Duration::from_secs(1), "{wait:?}");
@@ -936,8 +936,8 @@ mod tests {
             assert_eq!(outcome, Cycle::Failed);
         }
         assert_eq!(feed.committed_count, 0);
-        assert!(feed.rejected_batches.is_empty());
-        assert!(feed.dead_lettered.is_empty());
+        assert_eq!(feed.rejected_batches, [] as [String; 0]);
+        assert_eq!(feed.dead_lettered, []);
     }
 
     /// PL-2: an explicit data rejection hands the batch to `reject_batch`,
@@ -998,8 +998,8 @@ mod tests {
         .await;
         assert_eq!(failed, Cycle::Failed);
         assert_eq!(feed.committed_count, 0);
-        assert!(feed.dead_lettered.is_empty());
-        assert!(feed.rejected_batches.is_empty());
+        assert_eq!(feed.dead_lettered, []);
+        assert_eq!(feed.rejected_batches, [] as [String; 0]);
         assert!(state.resolved.is_empty());
 
         let retried = run_cycle(

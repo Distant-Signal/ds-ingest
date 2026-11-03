@@ -870,7 +870,7 @@ mod tests {
                 .as_deref(),
             Some("2026-08-28")
         );
-        assert!(collected.unparseable.is_empty());
+        assert_eq!(collected.unparseable, []);
 
         let mut state = process::ProcessorState::default();
         let collected = collect_batch(&batch, &mut state, &stanox, &crs_index, now, 0);
@@ -1037,7 +1037,7 @@ mod deliver_batch_tests {
 
         assert_eq!(outcome, Delivery::Committed);
         assert_eq!(feed.committed_count, 1);
-        assert!(feed.dead_lettered.is_empty());
+        assert_eq!(feed.dead_lettered, []);
     }
 
     /// A transient failure must still leave the batch un-ACKed so it is
@@ -1054,7 +1054,7 @@ mod deliver_batch_tests {
 
         assert_eq!(outcome, Delivery::PostFailed);
         assert_eq!(feed.committed_count, 0);
-        assert!(feed.dead_lettered.is_empty());
+        assert_eq!(feed.dead_lettered, []);
     }
 
     /// Consecutive undelivered batches wait longer and longer (1s, 2s, 4s,
@@ -1128,8 +1128,8 @@ mod deliver_batch_tests {
             assert_eq!(outcome, Delivery::PostFailed, "{kind}");
         }
         assert_eq!(feed.committed_count, 0);
-        assert!(feed.dead_lettered.is_empty());
-        assert!(feed.rejected_batches.is_empty());
+        assert_eq!(feed.dead_lettered, []);
+        assert_eq!(feed.rejected_batches, [] as [String; 0]);
     }
 
     /// PL-2: an explicit data rejection of the batch goes to

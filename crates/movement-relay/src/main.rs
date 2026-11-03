@@ -801,7 +801,7 @@ mod tests {
             "no ERROR_BACKOFF for a skipped record"
         );
         assert_eq!(source.committed_offsets, vec![0]);
-        assert!(sink.published.is_empty());
+        assert_eq!(sink.published, []);
     }
 
     #[tokio::test]
@@ -939,7 +939,7 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(run_cycle(&mut source, &mut sink).await, Cycle::Failed);
         }
-        assert!(sink.published.is_empty());
+        assert_eq!(sink.published, []);
         assert_eq!(source.committed_count, 0);
 
         for _ in 0..ids.len() {

@@ -1736,7 +1736,7 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "three failing cycles cost milliseconds"
         );
-        assert!(!feed.touches.is_empty());
+        assert_ne!(feed.touches, [] as [bool; 0]);
         assert!(
             feed.touches.iter().all(|loaded| *loaded),
             "every read happened after the population was in place: {:?}",
@@ -1899,7 +1899,7 @@ mod tests {
     #[test]
     fn with_windowed_stats_off_the_legacy_row_is_unchanged_and_there_are_no_windows() {
         let (lines, windows) = capture_write(false);
-        assert!(windows.is_empty());
+        assert_eq!(windows, [] as [serde_json::Value; 0]);
         let today = current_rail_service_date(chrono::Utc::now());
         assert_eq!(
             lines,

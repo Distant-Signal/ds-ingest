@@ -861,7 +861,7 @@ mod tests {
         let mut uids: Vec<&str> = pop.uids.iter().map(String::as_str).collect();
         uids.sort_unstable();
         assert_eq!(uids, vec!["W45448", "W45449"]);
-        assert!(pop.trains.is_empty());
+        assert_eq!(pop.trains, []);
         assert_eq!(pop.relevance, Relevance::StopsOnly);
         assert!(parse_line_population("null", None, date).unwrap().is_none());
         assert!(parse_line_population("[1]", None, date).is_err());
@@ -1275,7 +1275,7 @@ mod tests {
     fn uids_for_an_unpublished_line_or_date_is_empty_not_a_panic() {
         let population = Population::default();
         let date: chrono::NaiveDate = "2026-09-04".parse().unwrap();
-        assert!(population.uids_for("nonexistent", date).is_empty());
+        assert_eq!(population.uids_for("nonexistent", date), [] as [&str; 0]);
     }
 
     /// Regression test for the 2026-09-26 crash-loop investigation's actual

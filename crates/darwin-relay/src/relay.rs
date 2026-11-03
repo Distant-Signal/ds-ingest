@@ -352,7 +352,7 @@ mod tests {
             ..FakeSink::default()
         };
         assert!(run_cycle(&mut source, &mut sink, LIMITS).await.is_err());
-        assert!(source.committed.is_empty());
+        assert_eq!(source.committed, [] as [Vec<(String, i32, i64)>; 0]);
     }
 
     #[tokio::test]
@@ -369,7 +369,7 @@ mod tests {
         run_cycle(&mut source, &mut sink, LIMITS)
             .await
             .expect("cycle");
-        assert!(sink.published.is_empty());
+        assert_eq!(sink.published, []);
         assert_eq!(source.committed, vec![vec![("t".to_owned(), 0, 12)]]);
     }
 

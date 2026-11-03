@@ -623,9 +623,15 @@ mod tests {
         let modes: StreamModes = "station-samples:apply,full-coverage:apply,tfl:apply,tfl-stops:apply,reference:apply,ioi-gtfs:apply,ioi-nir:apply,ioi-live:apply,transit-metrolink:apply,transit-net:apply,transit-tfl:apply"
             .parse()
             .unwrap();
-        assert!(modes.uncovered(&crate::handlers::registry()).is_empty());
+        assert_eq!(
+            modes.uncovered(&crate::handlers::registry()),
+            [] as [String; 0]
+        );
         let off = StreamModes::default();
-        assert!(off.uncovered(&crate::handlers::registry()).is_empty());
+        assert_eq!(
+            off.uncovered(&crate::handlers::registry()),
+            [] as [String; 0]
+        );
     }
 
     /// Plan 3c.1: the tfl, reference and island-of-Ireland streams have a

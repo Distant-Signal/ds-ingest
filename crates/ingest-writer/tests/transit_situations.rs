@@ -161,7 +161,7 @@ async fn a_snapshot_writes_its_situations_and_the_line_statuses() {
     .await
     .unwrap();
     assert_eq!(mode, NETWORK);
-    assert!(operators.is_empty());
+    assert_eq!(operators, [] as [String; 0]);
     assert_eq!(first_seen, at);
     let freshness: Option<DateTime<Utc>> = sqlx::query_scalar(
         "SELECT fetched_at FROM ingest_freshness WHERE source = 'transit-metrolink-situations'",
@@ -228,7 +228,7 @@ async fn a_snapshot_writes_its_situations_and_the_line_statuses() {
     .unwrap();
     let purged = applied(apply(&db, &snapshot(Vec::new()), gone_at + TimeDelta::minutes(1)).await);
     assert_eq!(purged.purged, 1);
-    assert!(situation_ids(&db).await.is_empty());
+    assert_eq!(situation_ids(&db).await, [] as [String; 0]);
     db.cleanup().await;
 }
 

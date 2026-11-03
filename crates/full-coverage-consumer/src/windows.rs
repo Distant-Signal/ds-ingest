@@ -453,7 +453,9 @@ pub(crate) fn feed_stale(
 }
 
 #[cfg(test)]
-#[expect(
+// `allow`, not `expect`: clippy 1.99's `float_cmp` no longer fires
+// here, but older toolchains' does (workspace Cargo.toml).
+#[allow(
     clippy::float_cmp,
     reason = "test code: exact expected values are the point"
 )]

@@ -1552,7 +1552,7 @@ mod split_deliverable_and_malformed_tests {
         let (entries, malformed_ids) = split_deliverable_and_malformed(vec![stream_id("1-0", map)]);
 
         assert_eq!(entries, vec![("1-0".to_string(), "hello".to_string())]);
-        assert!(malformed_ids.is_empty());
+        assert_eq!(malformed_ids, []);
     }
 
     #[test]
@@ -1828,7 +1828,10 @@ mod long_pending_entries_tests {
 
     #[test]
     fn an_entry_xpending_did_not_report_is_not_long_pending() {
-        assert!(long_pending_entries(&[entry("9-0")], &HashMap::new(), 1).is_empty());
+        assert_eq!(
+            long_pending_entries(&[entry("9-0")], &HashMap::new(), 1),
+            []
+        );
     }
 
     #[test]
@@ -1869,7 +1872,10 @@ mod redis_tests {
         let stream = unique_stream("arrival_time");
         cleanup(&stream).await;
         let mut feed = connect(&stream).await;
-        assert!(payloads(feed.next_batch().await.unwrap()).is_empty()); // drain empty startup PEL
+        assert_eq!(
+            payloads(feed.next_batch().await.unwrap()),
+            [] as [String; 0]
+        ); // drain empty startup PEL
 
         let client = redis::Client::open(redis_url()).unwrap();
         let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
@@ -1937,7 +1943,10 @@ mod redis_tests {
         )
         .await
         .expect("AUTH default <password> accepted");
-        assert!(payloads(feed.next_batch().await.unwrap()).is_empty());
+        assert_eq!(
+            payloads(feed.next_batch().await.unwrap()),
+            [] as [String; 0]
+        );
         cleanup(&stream).await;
     }
 
@@ -2061,7 +2070,7 @@ mod redis_tests {
 
         // Once the outage ends it commits normally.
         feed.commit().await.unwrap();
-        assert!(pending_ids(&mut feed, &stream).await.is_empty());
+        assert_eq!(pending_ids(&mut feed, &stream).await, [] as [String; 0]);
         cleanup(&stream).await;
     }
 
@@ -2102,17 +2111,20 @@ mod redis_tests {
             .await
             .unwrap();
 
-        assert!(pending_ids(&mut feed, &stream).await.is_empty());
+        assert_eq!(pending_ids(&mut feed, &stream).await, [] as [String; 0]);
         let letters = dead_letters(&stream).await;
         assert_eq!(letters.len(), 1);
         assert_eq!(letters[0]["payload"], "poison");
         assert_eq!(letters[0]["reason"], "rejected_by_api");
         assert_eq!(letters[0]["group"], "test-group");
         assert_eq!(letters[0]["detail"], "422 Unprocessable Entity: bad row");
-        assert!(!letters[0]["source_id"].is_empty());
+        assert_ne!(letters[0]["source_id"], "");
 
         // The PEL is empty, so isolation ends and live reads resume.
-        assert!(payloads(feed.next_batch().await.unwrap()).is_empty());
+        assert_eq!(
+            payloads(feed.next_batch().await.unwrap()),
+            [] as [String; 0]
+        );
         assert!(!feed.isolating);
         xadd(&stream, "later").await;
         assert_eq!(
@@ -2144,7 +2156,7 @@ mod redis_tests {
             payloads(feed.next_batch().await.unwrap()),
             vec!["a".to_string()]
         );
-        assert!(dead_letters(&stream).await.is_empty());
+        assert_eq!(dead_letters(&stream).await, []);
         assert_eq!(pending_ids(&mut feed, &stream).await.len(), 2);
         cleanup(&stream).await;
     }
@@ -2926,13 +2938,19 @@ mod redis_tests {
     async fn a_lost_consumer_group_is_recreated_after_nogroup() {
         let stream = unique_stream("nogroup");
         let mut feed = connect(&stream).await;
-        assert!(payloads(feed.next_batch().await.unwrap()).is_empty());
+        assert_eq!(
+            payloads(feed.next_batch().await.unwrap()),
+            [] as [String; 0]
+        );
 
         cleanup(&stream).await;
         let err = feed.next_batch().await.expect_err("the group is gone");
         assert!(is_nogroup(&err), "{err:?}");
 
-        assert!(payloads(feed.next_batch().await.unwrap()).is_empty());
+        assert_eq!(
+            payloads(feed.next_batch().await.unwrap()),
+            [] as [String; 0]
+        );
         let client = redis::Client::open(redis_url()).unwrap();
         let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
         let _: String = redis::cmd("XADD")
@@ -3252,7 +3270,7 @@ mod outage_tests {
         )
         .await
         .expect("connects through the proxy");
-        assert!(feed.next_batch().await.unwrap().is_empty());
+        assert_eq!(feed.next_batch().await.unwrap(), []);
 
         proxy.take_down().await;
         for attempt in 0..4 {
@@ -3311,7 +3329,7 @@ mod outage_tests {
         )
         .await
         .expect("connects through the proxy");
-        assert!(feed.next_batch().await.unwrap().is_empty());
+        assert_eq!(feed.next_batch().await.unwrap(), []);
 
         for payload in ["a", "b"] {
             let _: String = redis::cmd("XADD")

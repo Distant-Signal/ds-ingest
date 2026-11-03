@@ -239,7 +239,7 @@ async fn a_snapshot_replaces_the_stops_and_their_rail_links() {
     let ids: Vec<&str> = stops.iter().map(|row| row.0.as_str()).collect();
     assert_eq!(ids, ["940GZZTESTA", "940GZZTESTB"]);
     assert_eq!(stops[1].1, "Elephant and Testle");
-    assert!(db.links().await.is_empty());
+    assert_eq!(db.links().await, []);
 
     // An older snapshot (a late redelivery) changes nothing.
     db.applied(&db.entry("old", t1, &first)).await;

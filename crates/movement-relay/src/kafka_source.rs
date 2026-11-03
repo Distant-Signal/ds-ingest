@@ -880,7 +880,7 @@ mod consumer_tests {
             .await
             .expect("a revoked partition must not fail the commit");
 
-        assert!(source.consumer.state().stored.is_empty());
+        assert_eq!(source.consumer.state().stored, []);
         assert!(source.last_received.is_none());
         assert!(source.pending_retry.is_empty());
         assert!(!source.paused, "the retry window is over");

@@ -916,7 +916,7 @@ pub(crate) mod tests {
         for _ in 0..2 {
             let (next, outcome) =
                 reload_cycle(&source, &lines, &HashMap::new(), &population, today).await;
-            assert!(outcome.failed.is_empty());
+            assert_eq!(outcome.failed, []);
             population = next;
             for date in [today, tomorrow] {
                 assert_eq!(
@@ -970,7 +970,7 @@ pub(crate) mod tests {
         // geometry changed, so both dates are read whole again.
         for g in [&before, &before, &after] {
             let (next, outcome) = reload_cycle(&source, &lines, g, &population, today).await;
-            assert!(outcome.failed.is_empty());
+            assert_eq!(outcome.failed, []);
             population = next;
         }
         assert_eq!(whole.load(Ordering::Relaxed), 4);
@@ -1007,7 +1007,7 @@ pub(crate) mod tests {
             today,
         )
         .await;
-        assert!(outcome.failed.is_empty());
+        assert_eq!(outcome.failed, []);
         let mut uids = next.uids_for("waterloo-reading", today);
         uids.sort_unstable();
         assert_eq!(uids, vec!["C11052", "C22222"]);
@@ -1195,7 +1195,7 @@ pub(crate) mod tests {
         .await
         .unwrap();
 
-        assert!(first.missing_lines.is_empty());
+        assert_eq!(first.missing_lines, [] as [String; 0]);
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "retried on the short backoff, not the {}s interval",
@@ -1401,7 +1401,7 @@ mod db_tests {
 
         let (second, outcome) =
             reload_cycle_with(&source, &lines, &geometry, &first, day(), 0).await;
-        assert!(outcome.failed.is_empty());
+        assert_eq!(outcome.failed, []);
         assert!(source.take().1.is_empty(), "nothing changed: no body read");
         assert_eq!(
             population_checksum(&second, &lines, &[day(), next_day]),
