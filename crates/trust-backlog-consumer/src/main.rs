@@ -45,8 +45,22 @@ const APPLICATION_NAME: &str = "distant-signal-trust-backlog-consumer";
 /// Spec §6.6: pool 3, role limit 4. One batch is written at a time.
 const DEFAULT_MAX_CONNECTIONS: u32 = 3;
 
+/// What `--print-config-defaults` prints (`ds_runtime::service_args`).
+fn config_defaults() -> ds_runtime::service_args::ConfigDefaults {
+    ds_runtime::service_args::ConfigDefaults::for_config::<Config>("trust-backlog-consumer")
+        .postgres_pool(DEFAULT_MAX_CONNECTIONS)
+        .env(
+            ds_store::corpus::FALLBACK_ENV,
+            Some(&ds_store::corpus::parse_fallback_flag(None).unwrap_or_default().to_string()),
+        )
+        .db_role(ds_store::schema::DbRole::TrustBacklog.key())
+        // The chart's DistantSignalConsumerApiCallsFailing sums exactly these.
+        .contract("api_call_operations", API_CALL_OPERATIONS.to_vec())
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    ds_runtime::service_args::exit_if_print_config_defaults(config_defaults);
     ds_runtime::logging::exit_code(run().await)
 }
 
@@ -702,25 +716,6 @@ fn outside_backlog_retention(
 #[cfg(test)]
 mod rail_day_tests {
     use super::*;
-
-    /// The chart's `DistantSignalConsumerApiCallsFailing` sums exactly
-    /// [`API_CALL_OPERATIONS`] for this consumer.
-    #[test]
-    fn the_chart_alerts_on_every_api_call_operation() {
-        let template = std::fs::read_to_string(
-            common::manifest_dir!()
-                .join("../../charts/distant-signal/templates/prometheusrule.yaml"),
-        )
-        .unwrap();
-        let entry = format!(
-            r#"(list "trust_backlog_consumer" "trust-backlog-consumer" "{}")"#,
-            API_CALL_OPERATIONS.join("|")
-        );
-        assert!(
-            template.contains(&entry),
-            "the chart template has no {entry}"
-        );
-    }
 
     #[test]
     fn well_after_the_0200_cutoff_is_that_calendar_days_rail_day() {

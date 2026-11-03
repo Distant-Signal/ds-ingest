@@ -103,8 +103,22 @@ use stats::current_rail_service_date;
 #[cfg(test)]
 use day::dispatch_message;
 
+/// What `--print-config-defaults` prints (`ds_runtime::service_args`).
+fn config_defaults() -> ds_runtime::service_args::ConfigDefaults {
+    ds_runtime::service_args::ConfigDefaults::for_config::<Config>("full-coverage-consumer")
+        .postgres_pool(reads::DEFAULT_MAX_CONNECTIONS)
+        .env(
+            ds_store::corpus::FALLBACK_ENV,
+            Some(&ds_store::corpus::parse_fallback_flag(None).unwrap_or_default().to_string()),
+        )
+        .db_role(ds_store::schema::DbRole::FullCoverageRo.key())
+        // The chart's DistantSignalConsumerApiCallsFailing sums exactly these.
+        .contract("api_call_operations", API_CALL_OPERATIONS.to_vec())
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    ds_runtime::service_args::exit_if_print_config_defaults(config_defaults);
     ds_runtime::logging::exit_code(run().await)
 }
 
@@ -921,25 +935,6 @@ fn report_windows(rows: &[common::FullCoverageWindowStatsRow], feed_stale: bool)
 )]
 mod tests {
     use std::collections::HashMap;
-
-    /// The chart's `DistantSignalConsumerApiCallsFailing` sums exactly
-    /// [`API_CALL_OPERATIONS`](super::API_CALL_OPERATIONS) for this consumer.
-    #[test]
-    fn the_chart_alerts_on_every_api_call_operation() {
-        let template = std::fs::read_to_string(
-            common::manifest_dir!()
-                .join("../../charts/distant-signal/templates/prometheusrule.yaml"),
-        )
-        .unwrap();
-        let entry = format!(
-            r#"(list "full_coverage_consumer" "full-coverage-consumer" "{}")"#,
-            API_CALL_OPERATIONS.join("|")
-        );
-        assert!(
-            template.contains(&entry),
-            "the chart template has no {entry}"
-        );
-    }
 
     use super::*;
     use crate::feed::FakeMovementFeed;

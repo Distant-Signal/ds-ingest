@@ -52,6 +52,8 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "
 tracing = "0.1.44"
 
 [dev-dependencies]
+# `test_support::DB_GRANTS_YAML`: freshness_rls checks the row policies.
+ds-store = { path = "../ds-store", features = ["test-support"] }
 # The clamp counter's and the gauges' unit tests read a local recorder.
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 

@@ -12,7 +12,7 @@
 const APPLICATION_NAME: &str = "distant-signal-full-coverage-consumer";
 /// Spec §6.6: pool 2, role limit 3. The population reload and the
 /// STANOX/CRS reload are the only users, one query at a time each.
-const DEFAULT_MAX_CONNECTIONS: u32 = 2;
+pub(crate) const DEFAULT_MAX_CONNECTIONS: u32 = 2;
 
 /// The database the reads use. Release D (ingest phase 5,
 /// docs/ingest-phase5-runbook.md) removed the `POPULATION_SOURCE` and
