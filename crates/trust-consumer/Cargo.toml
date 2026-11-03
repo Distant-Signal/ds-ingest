@@ -11,14 +11,14 @@ anyhow = "1.0.104"
 async-trait = "0.1.92"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.6", features = ["derive", "env"] }
-common = { path = "../common" }
-ds-runtime = { path = "../ds-runtime" }
+common = { workspace = true, features = ["default"] }
+ds-runtime = { workspace = true, features = ["default"] }
 dotenvy = "0.15.7"
 # The DB sink (ingest architecture plan 3b.3, D1) and the reads (plan 4.4):
 # the train-event and forward-signal writers, the readers, the pool and the
 # schema gate.
-ds-store = { path = "../ds-store" }
-health-http = { path = "../health-http" }
+ds-store = { workspace = true }
+health-http = { workspace = true }
 metrics = "0.24"
 movement-feed = { path = "../movement-feed" }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -27,7 +27,7 @@ serde_json = "1.0.151"
 sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio", "tls-native-tls"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time"] }
 tracing = "0.1.44"
-trust-schema = { path = "../trust-schema" }
+trust-schema = { workspace = true }
 
 [dev-dependencies]
 # The db-source test: a #[sqlx::test] database migrated from ds-store's
@@ -35,7 +35,7 @@ trust-schema = { path = "../trust-schema" }
 sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio", "tls-native-tls", "macros", "migrate"] }
 movement-feed = { path = "../movement-feed", features = ["test-util"] }
 # The DB sink tests' fixtures (a subscription to write events for).
-ds-store = { path = "../ds-store", features = ["test-support"] }
+ds-store = { workspace = true, features = ["test-support"] }
 # The health-listener test's GETs.
 reqwest = { version = "0.13.4", default-features = false, features = ["native-tls"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "test-util"] }

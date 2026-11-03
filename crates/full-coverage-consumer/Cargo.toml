@@ -12,30 +12,30 @@ arc-swap = "1.9.2"
 async-trait = "0.1.92"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.6", features = ["derive", "env"] }
-common = { path = "../common" }
+common = { workspace = true, features = ["default"] }
 # The line catalogue, embedded (`--lines-dir` defaults to it).
-ds-lines = { path = "../ds-lines" }
-ds-runtime = { path = "../ds-runtime" }
+ds-lines = { workspace = true }
+ds-runtime = { workspace = true, features = ["default"] }
 dotenvy = "0.15.7"
 # The reads (ingest architecture plan 4.3): the readers, the pool and the
 # schema gate.
-ds-store = { path = "../ds-store" }
-health-http = { path = "../health-http" }
+ds-store = { workspace = true }
+health-http = { workspace = true }
 # The stream sink (ingest architecture plan 3a.8): the
 # ds:ingest:full-coverage producer, and its Redis client. ingest-stream is
 # DB-free.
-ingest-stream = { path = "../ingest-stream" }
+ingest-stream = { workspace = true }
 metrics = "0.24"
 movement-feed = { path = "../movement-feed" }
 redis = { version = "1.8", features = ["tokio-comp", "connection-manager"] }
-schedule-query = { path = "../schedule-query" }
+schedule-query = { workspace = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 # The pool type and the Postgres wait, as the other direct readers.
 sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio", "tls-native-tls"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing = "0.1.44"
-trust-schema = { path = "../trust-schema" }
+trust-schema = { workspace = true }
 
 [dev-dependencies]
 # The DbSource tests: #[sqlx::test] databases migrated from ds-store's
