@@ -10,17 +10,17 @@ license.workspace = true
 anyhow = "1.0.104"
 async-trait = "0.1.92"
 clap = { version = "4.6.6", features = ["derive", "env"] }
-common = { path = "../common", features = ["redis"] }
-ds-runtime = { path = "../ds-runtime", features = ["redis"] }
+common = { workspace = true, features = ["default", "redis"] }
+ds-runtime = { workspace = true, features = ["default", "redis"] }
 dotenvy = "0.15.7"
-health-http = { path = "../health-http" }
+health-http = { workspace = true }
 metrics = "0.24"
 rdkafka = { version = "0.39.0", features = ["cmake-build", "ssl", "sasl"] }
 redis = { version = "1.8", features = ["tokio-comp", "connection-manager"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time"] }
 tracing = "0.1.44"
-trust-schema = { path = "../trust-schema" }
+trust-schema = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "test-util", "net", "io-util"] }

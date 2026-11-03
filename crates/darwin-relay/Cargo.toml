@@ -17,12 +17,12 @@ async-trait = "0.1.92"
 base64 = "0.22"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6.6", features = ["derive", "env"] }
-common = { path = "../common", features = ["redis"] }
-ds-runtime = { path = "../ds-runtime", features = ["redis"] }
+common = { workspace = true, features = ["default", "redis"] }
+ds-runtime = { workspace = true, features = ["default", "redis"] }
 dotenvy = "0.15.7"
 flate2 = "1"
-health-http = { path = "../health-http" }
-ingest-stream = { path = "../ingest-stream" }
+health-http = { workspace = true }
+ingest-stream = { workspace = true }
 metrics = "0.24"
 # Same features as movement-relay: SASL_SSL against RDM's brokers.
 rdkafka = { version = "0.39.0", features = ["cmake-build", "ssl", "sasl"] }
