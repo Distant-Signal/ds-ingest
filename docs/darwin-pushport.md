@@ -130,6 +130,16 @@ for later trains as Darwin publishes them. The Push Port's snapshot
 product (a full state, for a resync after a long outage) is not built;
 it is the later option for a gap longer than Kafka's retention.
 
+**Offset resets** are counted in
+`distant_signal_darwin_relay_offset_resets_total{reason}`: `no_committed_offset`
+when an assigned partition has no committed offset for the group (checked
+after every assignment), `reset_after_error` when librdkafka resets a
+position after an error (a committed offset older than the topic's
+retention). Either means the relay started where `autoOffsetReset` says
+rather than where it left off: with `latest`, the records in between were
+skipped. The first start of a new consumer group counts one
+`no_committed_offset` per partition.
+
 ## Switching on the arrival boards
 
 poller-ldbws's tracked-stop lane can also poll the LDBWS arrivals product
