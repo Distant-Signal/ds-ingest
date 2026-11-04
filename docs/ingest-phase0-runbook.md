@@ -8,9 +8,9 @@ Agents only read production.
 
 | Step | What | Runbook | Restarts | Rollback |
 |---|---|---|---|---|
-| 0a | The Postgres role split, Stages A–C (in progress) | [postgres-app-role.md](postgres-app-role.md), "Rollout runbook" | Stage B: api, aggregator, enricher, notifier | its "Rollback" section |
-| 0b | One Postgres role per service (`postgresql.roles.perService`), then 7 days of `pg_stat_statements` and the `observe-role-usage.py` report | [postgres-app-role.md](postgres-app-role.md#stage-0b-one-role-per-service-ingest-architecture-phase-0b), "Stage 0b" | one service per release | `perService.<service>.connect: false` |
-| 0c | Redis ACL users (`redis.acl`), four releases | [redis-acl.md](redis-acl.md) | Redis (steps 1, 3, 4), one client per release (step 2) | the previous step's values |
+| 0a | The Postgres role split, Stages A–C (in progress) | [postgres-app-role.md](https://github.com/Distant-Signal/ds-deploy/blob/main/docs/postgres-app-role.md), "Rollout runbook" | Stage B: api, aggregator, enricher, notifier | its "Rollback" section |
+| 0b | One Postgres role per service (`postgresql.roles.perService`), then 7 days of `pg_stat_statements` and the `observe-role-usage.py` report | [postgres-app-role.md](https://github.com/Distant-Signal/ds-deploy/blob/main/docs/postgres-app-role.md#stage-0b-one-role-per-service-ingest-architecture-phase-0b), "Stage 0b" | one service per release | `perService.<service>.connect: false` |
+| 0c | Redis ACL users (`redis.acl`), four releases | [redis-acl.md](https://github.com/Distant-Signal/ds-deploy/blob/main/docs/redis-acl.md) | Redis (steps 1, 3, 4), one client per release (step 2) | the previous step's values |
 | 0d | Narrow `allow-ingress-same-namespace` (Ranma's NetworkPolicy) | below | none | restore the old policy |
 | prep for 1B | Raise the HelmRelease `timeout` to 20 minutes | below | none | the old timeout |
 
