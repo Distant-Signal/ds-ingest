@@ -391,7 +391,8 @@ pub struct StreamRuntime {
     pub client: redis::Client,
     pub pool: PgPool,
     pub registry: Arc<Registry>,
-    /// This consumer's name in each group: the pod name.
+    /// This consumer's name in each group: fixed, not the pod name
+    /// (`Config::stream_consumer`).
     pub consumer: String,
     pub stall_after: Duration,
     /// [`ConsumerConfig::unsupported_deadline`] for every stream

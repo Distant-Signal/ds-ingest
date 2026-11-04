@@ -577,6 +577,86 @@ async fn an_entry_flows_from_the_stream_to_the_database_once() {
     db.cleanup().await;
 }
 
+/// A writer restarted under the fixed consumer name applies the entry its
+/// predecessor read but never acknowledged on its first step, from its own
+/// pending-entries list. Under a different name (the old pod-name scheme)
+/// the same entry stays stranded until `XAUTOCLAIM` (5 minutes idle).
+#[tokio::test]
+#[ignore = "requires a live database and Redis; run with DATABASE_URL and REDIS_URL set and --ignored"]
+async fn a_restarted_writer_applies_what_its_predecessor_left_pending_at_once() {
+    let db = Db::new().await;
+    let stream = format!("t{}:ds:ingest:writer-test", rand_suffix());
+    let dead_letters = ingest_stream::dead_letter_stream(&stream);
+    let name = ingest_writer::config::DEFAULT_STREAM_CONSUMER;
+    let mut conn = redis().await;
+    let mut old = StreamConsumer::new(
+        redis().await,
+        ingest_stream::ConsumerConfig::new(&stream, name, 100),
+    );
+    old.ensure_group().await.unwrap();
+    let entry = db.entry(rows_schema(), "k1", Utc::now(), &[row("left", 1)]);
+    ingest_stream::xadd_entry(&mut conn, &stream, 100, &entry.envelope.encode().unwrap())
+        .await
+        .unwrap();
+    // The old writer reads it and dies before applying it.
+    let _: redis::Value = redis::cmd("XREADGROUP")
+        .arg("GROUP")
+        .arg(ingest_stream::WRITER_GROUP)
+        .arg(name)
+        .arg("COUNT")
+        .arg(10)
+        .arg("STREAMS")
+        .arg(&stream)
+        .arg(">")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    drop(old);
+    let handler = db.handler();
+
+    // The old scheme: a new pod name sees an empty PEL and nothing new.
+    let mut other = StreamConsumer::new(
+        redis().await,
+        ingest_stream::ConsumerConfig::new(&stream, "ingest-writer-5f7d-xyz12", 100),
+    );
+    let step = other
+        .step(&handler, std::pin::pin!(std::future::pending::<()>()))
+        .await
+        .unwrap();
+    assert_eq!(step, Step::PelDrained, "nothing of its own pending");
+    assert_eq!(
+        db.rows().await,
+        Vec::<(String, i32)>::new(),
+        "stranded under the old name"
+    );
+    drop(other);
+
+    // The fixed name: the first step replays it.
+    let mut restarted = StreamConsumer::new(
+        redis().await,
+        ingest_stream::ConsumerConfig::new(&stream, name, 100),
+    );
+    let step = restarted
+        .step(&handler, std::pin::pin!(std::future::pending::<()>()))
+        .await
+        .unwrap();
+    assert_eq!(step, Step::Processed(1));
+    assert_eq!(db.rows().await, [("left".to_owned(), 1)]);
+    let pending: Vec<redis::Value> = redis::cmd("XPENDING")
+        .arg(&stream)
+        .arg(ingest_stream::WRITER_GROUP)
+        .arg("-")
+        .arg("+")
+        .arg(10)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert!(pending.is_empty(), "applied and acked");
+
+    delete_keys(&mut conn, &[&stream, &dead_letters]).await;
+    db.cleanup().await;
+}
+
 #[tokio::test]
 #[ignore = "requires Redis; run with REDIS_URL set and --ignored"]
 async fn dead_letters_older_than_seven_days_are_trimmed() {
