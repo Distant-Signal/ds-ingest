@@ -9,8 +9,8 @@ which covers the separate `movement-events` pipeline.
 
 Code: `crates/ingest-stream/src/consumer.rs` (`dead_letter`,
 `rejected_fields`) and the writer's handlers. Alerts:
-[DistantSignalIngestDeadLetters](alerts.md#distantsignalingestdeadletters)
-and [DistantSignalIngestDeadLetterExpiring](alerts.md#distantsignalingestdeadletterexpiring).
+[DistantSignalIngestDeadLetters](https://github.com/Distant-Signal/ds-deploy/blob/main/docs/alerts.md#distantsignalingestdeadletters)
+and [DistantSignalIngestDeadLetterExpiring](https://github.com/Distant-Signal/ds-deploy/blob/main/docs/alerts.md#distantsignalingestdeadletterexpiring).
 
 ## What is dead-lettered, and what never is
 
@@ -30,13 +30,13 @@ source entry's id).
 - **A transient failure** (the database down, a pool timeout, a
   serialization failure, a deadlock, a lock or statement timeout). The
   entry stays pending and is retried forever, in order, with backoff;
-  [DistantSignalIngestStreamBacklog](alerts.md#distantsignalingeststreambacklog)
+  [DistantSignalIngestStreamBacklog](https://github.com/Distant-Signal/ds-deploy/blob/main/docs/alerts.md#distantsignalingeststreambacklog)
   alerts on its age. An outage must not empty a stream into its
   dead-letter stream.
 - **An unknown schema *version*, or envelope version `v`** (a producer
   newer than the writer). The
   entry stays pending and
-  [DistantSignalIngestUnsupportedSchema](alerts.md#distantsignalingestunsupportedschema)
+  [DistantSignalIngestUnsupportedSchema](https://github.com/Distant-Signal/ds-deploy/blob/main/docs/alerts.md#distantsignalingestunsupportedschema)
   fires. Roll the writer forward; do not `XACK` it by hand.
 
 ## Visibility

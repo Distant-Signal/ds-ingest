@@ -118,7 +118,7 @@ one by name and renders none of them.
 5. **Alerts** come with it: `DistantSignalDarwinPushPortStale`,
    `DistantSignalDarwinConsumerLagHigh` and
    `DistantSignalIngestSourceStale{source="darwin-pushport"}`
-   ([runbooks](alerts.md#darwin-push-port-darwin-relay)).
+   ([runbooks](https://github.com/Distant-Signal/ds-deploy/blob/main/docs/alerts.md#darwin-push-port-darwin-relay)).
 
 **Rollback:** `darwinRelay.enabled: false`. The api keeps serving the
 stored rows until the aggregator prunes them, then falls back to the
