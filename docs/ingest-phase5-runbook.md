@@ -934,7 +934,10 @@ rollout strategy)".
   arriving in the gap wait in the stream; anything the old pod read but
   did not ack stays in the group's PEL, and the new pod (same consumer
   name) replays it at startup. A surge was worse: two pods reading as the
-  same consumer at once.
+  same consumer at once. On SIGTERM each lets the cycle in flight finish
+  (write, then XACK) for up to 15 s (`movement_feed::shutdown::DRAIN_TIMEOUT`)
+  and stops; a cycle that does not finish is dropped un-ACKed and replayed,
+  as above. The default 30 s `terminationGracePeriodSeconds` covers it.
 - **enricher**: the same for its stream (`enricher-1`), plus reclaim and
   the sweep; the LLM batch state is in Postgres. A surge pod would also
   have its own in-process in-flight dedupe, so the same incident could be

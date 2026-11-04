@@ -27,6 +27,7 @@ use config::Config;
 use movement_feed::ActiveFeed;
 use movement_feed::MovementFeed;
 use movement_feed::redis_stream::RedisStreamMovementFeed;
+use movement_feed::shutdown::{DRAIN_TIMEOUT, Finished, Shutdown, finish_within};
 use movement_feed::{DeadLetter, DeadLetterSink};
 use sink::{BacklogSink, DbSink, Operations};
 
@@ -171,11 +172,10 @@ async fn connect_database(
     Ok(pool)
 }
 
-/// The consume loop. Never returns.
+/// The consume loop. Returns only on shutdown (SIGTERM).
 #[expect(
     clippy::expect_used,
-    clippy::too_many_lines,
-    reason = "a poisoned lock means another thread already panicked; long but linear; splitting it would scatter its shared state across helpers"
+    reason = "a poisoned lock means another thread already panicked"
 )]
 async fn consume<S: BacklogSink>(
     config: &Config,
@@ -184,7 +184,6 @@ async fn consume<S: BacklogSink>(
     progress: &health_http::Progress,
     sink: &S,
 ) -> anyhow::Result<()> {
-    let operations = S::OPERATIONS;
     let stanox = RwLock::new(config.stanox_crs.clone());
     let mut process_state = process::ProcessorState {
         trust_timestamp_correction_enabled: config.trust_timestamp_correction_enabled,
@@ -207,7 +206,16 @@ async fn consume<S: BacklogSink>(
     let mut delivery_failures = ds_runtime::backoff::FailureStreak::new(DELIVERY_RETRY_BACKOFF);
     let mut feed_failures = ds_runtime::backoff::FailureStreak::new(FEED_RETRY_BACKOFF);
 
+    // SIGTERM is handled from here on: the cycle in flight finishes (write,
+    // then XACK) and the loop stops (`movement_feed::shutdown`). Before
+    // this, the default action exits, which is safe: nothing is ACKed.
+    let mut shutdown = Shutdown::on_sigterm();
+
     loop {
+        if shutdown.is_requested() {
+            tracing::info!("shutdown requested between cycles; stopping");
+            break;
+        }
         // 1. stanox_crs reload.
         if last_stanox_crs_reload.elapsed() >= stanox_crs_reload_interval {
             match sink.stanox_crs().await {
@@ -257,85 +265,32 @@ async fn consume<S: BacklogSink>(
 
         // 3. consume + filter + write.
         let cycle_start = std::time::Instant::now();
-        match feed.next_batch().await {
-            Ok(batch) => {
-                feed_failures.succeeded();
-                let now = chrono::Utc::now();
-                let today = current_rail_day(now);
-                // Age out parked Activations once per rail day (finding #5):
-                // before this, `pending_service_dates`/`pending_train_uids`
-                // were never pruned at all, so they grew without bound AND
-                // could misfile a recycled `train_id`'s movements under a
-                // long-dead train's service_date/train_uid. See
-                // `process::prune_stale_activations`.
-                if last_pruned_rail_day != Some(today) {
-                    let before = process_state.pending_service_dates.len();
-                    process::prune_stale_activations(&mut process_state, today);
-                    let dropped = before - process_state.pending_service_dates.len();
-                    if dropped > 0 {
-                        tracing::info!(
-                            dropped,
-                            retained = process_state.pending_service_dates.len(),
-                            "pruned parked Activations that no live train can still be matched to"
-                        );
-                    }
-                    last_pruned_rail_day = Some(today);
-                }
-                let snapshot = stanox.read().expect("stanox lock poisoned").clone();
-                let CollectedBatch {
-                    events,
-                    reasons,
-                    unparseable,
-                } = collect_batch(
-                    &batch,
-                    &mut process_state,
-                    &snapshot,
-                    crs_index,
-                    now,
-                    config.trust_event_backlog_retention_days,
-                );
-
-                // Reasons first, best-effort: a failure is logged and
-                // counted, never allowed to hold up the backlog batch (a
-                // reason is enrichment). The common failure, Postgres being
-                // down, also fails the backlog write below,
-                // which leaves the batch un-ACKed, so the reasons are
-                // re-sent on redelivery. The upsert is idempotent.
-                if let Err(err) = sink.write_reasons(&reasons).await {
-                    tracing::warn!(error = ?err, count = reasons.len(), "failed to write train reasons; continuing with the backlog batch");
-                    metrics::counter!(
-                        ds_runtime::metrics::metric_name("trust_backlog_consumer_errors_total"),
-                        "operation" => operations.write_reasons
-                    )
-                    .increment(1);
-                }
-
-                let delivery =
-                    deliver_batch(feed, &events, &unparseable, &operations, async |events| {
-                        sink.write_backlog(events).await
-                    })
-                    .await;
-                if let Some(wait) = delivery_wait(&delivery, &mut delivery_failures) {
-                    tracing::warn!(
-                        failures = delivery_failures.failures(),
-                        retry_in_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
-                        "trust-event-backlog batch not delivered; backing off before the redelivery"
-                    );
-                    // Beats while it waits: a long backoff is not a stall.
-                    progress.idle(tokio::time::sleep(wait)).await;
-                }
+        let cycle = consume_cycle(
+            config,
+            crs_index,
+            feed,
+            sink,
+            &mut process_state,
+            &stanox,
+            &mut last_pruned_rail_day,
+            &mut delivery_failures,
+            &mut feed_failures,
+        );
+        let wait = match finish_within(&mut shutdown, DRAIN_TIMEOUT, cycle).await {
+            Finished::Ran(wait) => wait,
+            stopped => {
+                movement_feed::shutdown::log_stop("trust-backlog-consumer", &stopped);
+                break;
             }
-            Err(err) => {
-                tracing::error!(error = ?err, "error receiving from movement feed");
-                metrics::counter!(
-                    ds_runtime::metrics::metric_name("trust_backlog_consumer_errors_total"),
-                    "operation" => "movement_feed_receive"
-                )
-                .increment(1);
-                progress
-                    .idle(tokio::time::sleep(feed_failures.failed(None)))
-                    .await;
-            }
+        };
+        // Beats while it waits: a long backoff is not a stall.
+        if let Some(wait) = wait
+            && !shutdown
+                .wait_unless_requested(progress.idle(tokio::time::sleep(wait)))
+                .await
+        {
+            tracing::info!("shutdown requested during the retry backoff; stopping");
+            break;
         }
         metrics::histogram!(ds_runtime::metrics::metric_name(
             "trust_backlog_consumer_cycle_duration_seconds"
@@ -344,6 +299,108 @@ async fn consume<S: BacklogSink>(
         // One loop iteration completed, however it went -- see
         // `health_http::Progress`.
         progress.beat();
+    }
+    Ok(())
+}
+
+/// One consume + filter + write cycle: read a batch, write it, ACK it (or
+/// leave it pending). Returns the backoff to wait before the next one, if
+/// any. Split out so the loop can let it finish on SIGTERM
+/// (`movement_feed::shutdown::finish_within`).
+#[expect(
+    clippy::expect_used,
+    clippy::too_many_arguments,
+    reason = "a poisoned lock means another thread already panicked; the loop's state, borrowed for one cycle"
+)]
+async fn consume_cycle<S: BacklogSink>(
+    config: &Config,
+    crs_index: &HashSet<String>,
+    feed: &mut ActiveFeed,
+    sink: &S,
+    process_state: &mut process::ProcessorState,
+    stanox: &RwLock<stanox_crs::StanoxCrsTable>,
+    last_pruned_rail_day: &mut Option<chrono::NaiveDate>,
+    delivery_failures: &mut ds_runtime::backoff::FailureStreak,
+    feed_failures: &mut ds_runtime::backoff::FailureStreak,
+) -> Option<Duration> {
+    let operations = S::OPERATIONS;
+    match feed.next_batch().await {
+        Ok(batch) => {
+            feed_failures.succeeded();
+            let now = chrono::Utc::now();
+            let today = current_rail_day(now);
+            // Age out parked Activations once per rail day (finding #5):
+            // before this, `pending_service_dates`/`pending_train_uids`
+            // were never pruned at all, so they grew without bound AND
+            // could misfile a recycled `train_id`'s movements under a
+            // long-dead train's service_date/train_uid. See
+            // `process::prune_stale_activations`.
+            if *last_pruned_rail_day != Some(today) {
+                let before = process_state.pending_service_dates.len();
+                process::prune_stale_activations(process_state, today);
+                let dropped = before - process_state.pending_service_dates.len();
+                if dropped > 0 {
+                    tracing::info!(
+                        dropped,
+                        retained = process_state.pending_service_dates.len(),
+                        "pruned parked Activations that no live train can still be matched to"
+                    );
+                }
+                *last_pruned_rail_day = Some(today);
+            }
+            let snapshot = stanox.read().expect("stanox lock poisoned").clone();
+            let CollectedBatch {
+                events,
+                reasons,
+                unparseable,
+            } = collect_batch(
+                &batch,
+                process_state,
+                &snapshot,
+                crs_index,
+                now,
+                config.trust_event_backlog_retention_days,
+            );
+
+            // Reasons first, best-effort: a failure is logged and
+            // counted, never allowed to hold up the backlog batch (a
+            // reason is enrichment). The common failure, Postgres being
+            // down, also fails the backlog write below,
+            // which leaves the batch un-ACKed, so the reasons are
+            // re-sent on redelivery. The upsert is idempotent.
+            if let Err(err) = sink.write_reasons(&reasons).await {
+                tracing::warn!(error = ?err, count = reasons.len(), "failed to write train reasons; continuing with the backlog batch");
+                metrics::counter!(
+                    ds_runtime::metrics::metric_name("trust_backlog_consumer_errors_total"),
+                    "operation" => operations.write_reasons
+                )
+                .increment(1);
+            }
+
+            let delivery =
+                deliver_batch(feed, &events, &unparseable, &operations, async |events| {
+                    sink.write_backlog(events).await
+                })
+                .await;
+            let wait = delivery_wait(&delivery, delivery_failures);
+            if let Some(wait) = wait {
+                tracing::warn!(
+                    failures = delivery_failures.failures(),
+                    retry_in_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+                    "trust-event-backlog batch not delivered; backing off before the redelivery"
+                );
+            }
+            wait
+        }
+        Err(err) => {
+            tracing::error!(error = ?err, "error receiving from movement feed");
+            metrics::counter!(
+                ds_runtime::metrics::metric_name("trust_backlog_consumer_errors_total"),
+                "operation" => "movement_feed_receive"
+            )
+            .increment(1);
+            Some(feed_failures.failed(None))
+        }
     }
 }
 
@@ -1037,6 +1094,53 @@ mod deliver_batch_tests {
 
         assert_eq!(outcome, Delivery::Committed);
         assert_eq!(feed.committed_count, 1);
+        assert_eq!(feed.dead_lettered, []);
+    }
+
+    /// SIGTERM mid-write: the write finishes, then the batch is `ACKed`.
+    #[tokio::test(start_paused = true)]
+    async fn sigterm_mid_write_finishes_the_write_then_acks() {
+        let mut feed = feed_with_one_batch().await;
+        let events = vec![event("0003", "good")];
+        let (trigger, mut shutdown) = Shutdown::manual();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            trigger.trigger();
+        });
+
+        let delivery = deliver_batch(&mut feed, &events, &[], &sink::DB_OPERATIONS, async |_| {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Ok(common::TrustBacklogIngestResponse {
+                upserted: 1,
+                rejected: vec![],
+            })
+        });
+        let finished = finish_within(&mut shutdown, DRAIN_TIMEOUT, delivery).await;
+
+        assert_eq!(finished, Finished::Drained(Delivery::Committed));
+        assert_eq!(feed.committed_count, 1);
+    }
+
+    /// A write that outlasts the drain window is dropped and the batch is
+    /// not `ACKed`: it stays pending for the next pod.
+    #[tokio::test(start_paused = true)]
+    async fn sigterm_with_a_write_that_outlasts_the_drain_acks_nothing() {
+        let mut feed = feed_with_one_batch().await;
+        let events = vec![event("0003", "good")];
+        let (trigger, mut shutdown) = Shutdown::manual();
+        trigger.trigger();
+
+        let delivery = deliver_batch(&mut feed, &events, &[], &sink::DB_OPERATIONS, async |_| {
+            std::future::pending::<()>().await;
+            Ok(common::TrustBacklogIngestResponse {
+                upserted: 1,
+                rejected: vec![],
+            })
+        });
+        let finished = finish_within(&mut shutdown, DRAIN_TIMEOUT, delivery).await;
+
+        assert_eq!(finished, Finished::Abandoned);
+        assert_eq!(feed.committed_count, 0);
         assert_eq!(feed.dead_lettered, []);
     }
 

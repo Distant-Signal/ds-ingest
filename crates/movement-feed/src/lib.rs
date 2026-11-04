@@ -17,6 +17,7 @@
 
 pub mod active_feed;
 pub mod redis_stream;
+pub mod shutdown;
 
 pub use active_feed::{ActiveFeed, MovementFeedBackend};
 pub use redis_stream::LONG_PENDING_DELIVERIES;

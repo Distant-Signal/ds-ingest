@@ -97,6 +97,7 @@ use feed::MovementFeed;
 use movement_feed::ActiveFeed;
 use movement_feed::DeadLetterSink;
 use movement_feed::redis_stream::RedisStreamMovementFeed;
+use movement_feed::shutdown::{DRAIN_TIMEOUT, Finished, Shutdown, finish_within};
 use population_reload::{SharedGeometry, SharedLineIds, SharedPopulation};
 use stats::current_rail_service_date;
 
@@ -235,7 +236,18 @@ async fn run() -> anyhow::Result<()> {
     let stats_write_interval = Duration::from_secs(config.stats_write_interval_secs);
     let mut last_stats_write = tokio::time::Instant::now() - stats_write_interval;
 
+    // SIGTERM is handled from here on: the consume cycle in flight finishes
+    // and the loop stops (`movement_feed::shutdown`). Before this (the
+    // startup replay included), the default action exits. Nothing else
+    // changes on shutdown: the day's state is rebuilt by the startup replay
+    // as on any restart, and the stats are written again from it.
+    let mut shutdown = Shutdown::on_sigterm();
+
     loop {
+        if shutdown.is_requested() {
+            tracing::info!("shutdown requested between cycles; stopping");
+            break;
+        }
         // 0. rail-day rollover, and NOT a `Utc::now().date_naive() !=
         // service_date` check.
         //
@@ -333,15 +345,29 @@ async fn run() -> anyhow::Result<()> {
         // `Arc`), not `load`: the snapshot is held across `next_batch`'s
         // blocking read, and `ArcSwap` guards are meant to be short-lived.
         let cycle_start = std::time::Instant::now();
-        let failed = consume_once(&mut feed, &mut day, &lookups, &population.load_full()).await;
+        let population_now = population.load_full();
+        let cycle = consume_once(&mut feed, &mut day, &lookups, &population_now);
+        let failed = match finish_within(&mut shutdown, DRAIN_TIMEOUT, cycle).await {
+            Finished::Ran(failed) => failed,
+            stopped => {
+                movement_feed::shutdown::log_stop("full-coverage-consumer", &stopped);
+                break;
+            }
+        };
         metrics::histogram!(ds_runtime::metrics::metric_name(
             "full_coverage_consumer_cycle_duration_seconds"
         ))
         .record(cycle_start.elapsed().as_secs_f64());
         if failed {
-            progress
-                .idle(tokio::time::sleep(feed_failures.failed(None)))
-                .await;
+            if !shutdown
+                .wait_unless_requested(
+                    progress.idle(tokio::time::sleep(feed_failures.failed(None))),
+                )
+                .await
+            {
+                tracing::info!("shutdown requested during the retry backoff; stopping");
+                break;
+            }
         } else {
             feed_failures.succeeded();
         }
@@ -365,6 +391,7 @@ async fn run() -> anyhow::Result<()> {
         // `health_http::Progress`.
         progress.beat();
     }
+    Ok(())
 }
 
 /// Creates every counter/gauge an alert keys on at its "nothing happened"
@@ -1823,6 +1850,70 @@ mod tests {
         let mut feed = FakeMovementFeed::new(vec![vec![ACTIVATION_C11052.to_string()]]);
         assert!(!consume_once(&mut feed, &mut day, &lookups, &population.load()).await);
         assert_eq!(feed.committed_count, 1);
+    }
+
+    /// SIGTERM already requested: the cycle in flight still dispatches its
+    /// batch and ACKs it (the startup replay restores `ACKed` entries on the
+    /// next start, as on any restart).
+    #[tokio::test(start_paused = true)]
+    async fn sigterm_lets_the_cycle_in_flight_dispatch_and_ack() {
+        let population = shared(population::Population::default());
+        let lookups = waterloo_lookups();
+        let mut day = DayState::new(current_rail_service_date(chrono::Utc::now()));
+        let mut feed = FakeMovementFeed::new(vec![vec![ACTIVATION_C11052.to_string()]]);
+        let (trigger, mut shutdown) = Shutdown::manual();
+        trigger.trigger();
+
+        let population_now = population.load_full();
+        let cycle = consume_once(&mut feed, &mut day, &lookups, &population_now);
+        let finished = finish_within(&mut shutdown, DRAIN_TIMEOUT, cycle).await;
+
+        assert_eq!(finished, Finished::Drained(false));
+        assert_eq!(feed.committed_count, 1);
+    }
+
+    /// A cycle stuck past the drain window (a dead-letter write that never
+    /// returns) is dropped without `ACKing` its batch.
+    #[tokio::test(start_paused = true)]
+    async fn sigterm_with_a_cycle_that_outlasts_the_drain_acks_nothing() {
+        struct HangingDeadLetters(FakeMovementFeed);
+
+        #[async_trait::async_trait]
+        impl MovementFeed for HangingDeadLetters {
+            async fn next_batch(&mut self) -> anyhow::Result<Vec<movement_feed::FeedEntry>> {
+                self.0.next_batch().await
+            }
+
+            async fn commit(&mut self) -> anyhow::Result<()> {
+                self.0.commit().await
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl DeadLetterSink for HangingDeadLetters {
+            async fn dead_letter(
+                &mut self,
+                _records: &[movement_feed::DeadLetter],
+            ) -> anyhow::Result<()> {
+                std::future::pending().await
+            }
+        }
+
+        let population = shared(population::Population::default());
+        let lookups = waterloo_lookups();
+        let mut day = DayState::new(current_rail_service_date(chrono::Utc::now()));
+        let mut feed = HangingDeadLetters(FakeMovementFeed::new(vec![vec![
+            ACTIVATION_C11052.to_string(),
+        ]]));
+        let (trigger, mut shutdown) = Shutdown::manual();
+        trigger.trigger();
+
+        let population_now = population.load_full();
+        let cycle = consume_once(&mut feed, &mut day, &lookups, &population_now);
+        let finished = finish_within(&mut shutdown, DRAIN_TIMEOUT, cycle).await;
+
+        assert_eq!(finished, Finished::Abandoned);
+        assert_eq!(feed.0.committed_count, 0);
     }
 
     /// The live path dates each entry by when it arrived (its stream id),
