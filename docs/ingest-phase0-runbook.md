@@ -1,7 +1,7 @@
 # Ingest architecture, phase 0: what Ranma rolls out, in order
 
-Phase 0 of [the ingest architecture plan](superpowers/plans/2026-10-06-ingest-architecture-plan.md)
-(spec: [design](superpowers/specs/2026-10-06-ingest-architecture-design.md)).
+Phase 0 of [the ingest architecture plan](https://github.com/Distant-Signal/distant-signal/blob/main/docs/superpowers/plans/2026-10-06-ingest-architecture-plan.md)
+(spec: [design](https://github.com/Distant-Signal/distant-signal/blob/main/docs/superpowers/specs/2026-10-06-ingest-architecture-design.md)).
 Everything here is a Ranma-Config values change; the chart ships every
 switch **off**, and with them off it renders exactly what it did before.
 Agents only read production.
