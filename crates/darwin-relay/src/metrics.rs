@@ -27,6 +27,19 @@ pub(crate) const LAST_MESSAGE: &str = "darwin_relay_last_message_timestamp_secon
 pub(crate) const CONSUMER_LAG: &str = "darwin_relay_consumer_lag";
 /// `darwin_relay_errors_total{operation}`.
 pub(crate) const ERRORS: &str = "darwin_relay_errors_total";
+/// `darwin_relay_offset_resets_total{reason}`: partitions whose read
+/// position came from `auto.offset.reset` instead of the group's committed
+/// offset. Any increase means records may have been skipped (with
+/// `latest`) or replayed (with `earliest`). Reasons:
+/// [`RESET_NO_COMMITTED_OFFSET`] and [`RESET_AFTER_ERROR`].
+pub(crate) const OFFSET_RESETS: &str = "darwin_relay_offset_resets_total";
+/// An assigned partition had no committed offset for the group (a new or
+/// expired group, or offsets lost).
+pub(crate) const RESET_NO_COMMITTED_OFFSET: &str = "no_committed_offset";
+/// librdkafka reset a partition's position after an error, typically a
+/// committed offset that is out of range (older than the topic's
+/// retention).
+pub(crate) const RESET_AFTER_ERROR: &str = "reset_after_error";
 
 pub(crate) fn record(outcome: &'static str) {
     metrics::counter!(metric_name(RECORDS), "outcome" => outcome).increment(1);
@@ -44,6 +57,10 @@ pub(crate) fn error(operation: &'static str) {
     metrics::counter!(metric_name(ERRORS), "operation" => operation).increment(1);
 }
 
+pub(crate) fn offset_resets(reason: &'static str, partitions: usize) {
+    metrics::counter!(metric_name(OFFSET_RESETS), "reason" => reason).increment(partitions as u64);
+}
+
 pub(crate) fn last_message(ts: DateTime<Utc>) {
     metrics::gauge!(metric_name(LAST_MESSAGE)).set(ts.timestamp_millis() as f64 / 1000.0);
 }
@@ -59,6 +76,9 @@ pub(crate) fn register() {
         metrics::counter!(metric_name(RECORDS), "outcome" => outcome).increment(0);
     }
     metrics::counter!(metric_name(BATCHES)).increment(0);
+    for reason in [RESET_NO_COMMITTED_OFFSET, RESET_AFTER_ERROR] {
+        offset_resets(reason, 0);
+    }
 }
 
 #[cfg(test)]
@@ -77,5 +97,27 @@ mod tests {
             "distant_signal_darwin_relay_consumer_lag"
         );
         assert_eq!(metric_name(READY), "distant_signal_darwin_relay_ready");
+        assert_eq!(
+            metric_name(OFFSET_RESETS),
+            "distant_signal_darwin_relay_offset_resets_total"
+        );
+    }
+
+    /// Both reasons exist at 0, so an alert's `increase()` sees the first
+    /// reset.
+    #[test]
+    fn offset_resets_are_registered_at_zero() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, register);
+        let rendered = handle.render();
+        for reason in [RESET_NO_COMMITTED_OFFSET, RESET_AFTER_ERROR] {
+            let series =
+                format!("distant_signal_darwin_relay_offset_resets_total{{reason=\"{reason}\"}} 0");
+            assert!(
+                rendered.contains(&series),
+                "{series} missing from {rendered}"
+            );
+        }
     }
 }

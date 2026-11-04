@@ -585,6 +585,7 @@ dependencies = [
  "health-http",
  "ingest-stream",
  "metrics",
+ "metrics-exporter-prometheus",
  "rdkafka",
  "redis",
  "serde_json",
