@@ -93,24 +93,188 @@ async fn run() -> anyhow::Result<()> {
         Duration::from_secs(config.deadletter_max_age_secs),
     ));
 
+    // SIGTERM is handled from here on (before this, the default action
+    // kills the process, which is safe: nothing has been committed).
+    let stop = relay_until_shutdown(
+        &mut source,
+        &mut sink,
+        shutdown_signal(),
+        &progress,
+        DRAIN_TIMEOUT,
+    )
+    .await;
+    match stop {
+        Stop::Idle => tracing::info!("shutdown requested; no record was in flight"),
+        Stop::Drained(cycle) => {
+            tracing::info!(?cycle, "shutdown requested; finished the record in flight");
+        }
+        Stop::Abandoned => tracing::warn!(
+            drain_secs = DRAIN_TIMEOUT.as_secs(),
+            "shutdown requested; the record in flight did not finish in time and was abandoned \
+             uncommitted, so it is re-read after the restart"
+        ),
+    }
+    match close_within(CLOSE_TIMEOUT, move || source.close()).await {
+        Closed::Done => tracing::info!("committed the stored Kafka offsets and left the group"),
+        Closed::Failed => {}
+        Closed::TimedOut => tracing::warn!(
+            close_secs = CLOSE_TIMEOUT.as_secs(),
+            "the final Kafka commit and close did not finish in time; exiting anyway (records \
+             since the last commit are re-read, and the group drops this member after its \
+             session timeout)"
+        ),
+    }
+    Ok(())
+}
+
+/// How long a SIGTERM waits for the record in flight (published but not
+/// yet committed, or still publishing) to finish. A record that does not
+/// finish is abandoned with its offset uncommitted, so it is re-read: a
+/// duplicate, never a gap. Ten seconds is ample for one record's XADDs on a
+/// healthy Redis; on a degraded one, abandoning is the safe choice.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the final synchronous commit and the consumer close
+/// (`RawKafkaSource::close`) may take before the process exits anyway.
+/// Both are blocking librdkafka calls, so they run on their own thread.
+///
+/// The pod's `terminationGracePeriodSeconds` must exceed
+/// `DRAIN_TIMEOUT + CLOSE_TIMEOUT` (25 s) with room to spare: 45.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Why [`relay_until_shutdown`] returned.
+#[derive(Debug, PartialEq, Eq)]
+enum Stop {
+    /// Shutdown arrived while waiting for a record or backing off.
+    Idle,
+    /// Shutdown arrived mid-record; the record finished within the drain
+    /// window, with this outcome.
+    Drained(Cycle),
+    /// Shutdown arrived mid-record and the record did not finish within the
+    /// drain window. It was dropped without its offset being stored.
+    Abandoned,
+}
+
+/// The relay loop: receive, publish, commit, until `shutdown` resolves.
+///
+/// Shutdown while waiting for the next record (or in a backoff) stops at
+/// once. Shutdown while a record is being published or committed lets that
+/// record finish for up to `drain`, then gives up on it. Giving up is safe
+/// because an offset is stored only after every one of the record's
+/// envelopes is in `movement-events` (`run_cycle`'s rule): an abandoned
+/// record has no stored offset, so the final commit cannot pass it.
+async fn relay_until_shutdown<S, K, F>(
+    source: &mut S,
+    sink: &mut K,
+    shutdown: F,
+    progress: &health_http::Progress,
+    drain: Duration,
+) -> Stop
+where
+    S: RawKafkaSource,
+    K: EventSink,
+    F: Future<Output = ()>,
+{
+    let mut shutdown = std::pin::pin!(shutdown);
     loop {
-        match run_cycle(&mut source, &mut sink).await {
-            Cycle::Committed => progress.beat(),
+        let batch = tokio::select! {
+            biased;
+            () = shutdown.as_mut() => return Stop::Idle,
+            batch = source.next_batch() => batch,
+        };
+        let cycle = {
+            let mut work = std::pin::pin!(process_batch(source, sink, batch));
+            tokio::select! {
+                biased;
+                cycle = work.as_mut() => cycle,
+                () = shutdown.as_mut() => {
+                    return match tokio::time::timeout(drain, work).await {
+                        Ok(cycle) => Stop::Drained(cycle),
+                        Err(_elapsed) => Stop::Abandoned,
+                    };
+                }
+            }
+        };
+        let beat_after_backoff = match cycle {
+            Cycle::Committed => {
+                progress.beat();
+                continue;
+            }
             // A failed receive or publish (Kafka or Redis down) is the
             // process alive and retrying, not a wedge: restarting would not
             // bring Redis back. See `health_http::Progress`.
-            Cycle::Failed => {
-                tokio::time::sleep(ERROR_BACKOFF).await;
-                progress.beat();
-            }
+            Cycle::Failed => true,
             // A record that published but whose offset cannot be stored is
             // different: retrying it forever while beating would hide a
             // wedge from `/livez` (a revoked partition used to do exactly
             // that). Transient failures clear on the next cycle; one that
             // persists for `progress_stall_secs` restarts the pod.
-            Cycle::CommitFailed => tokio::time::sleep(ERROR_BACKOFF).await,
+            Cycle::CommitFailed => false,
+        };
+        tokio::select! {
+            biased;
+            () = shutdown.as_mut() => return Stop::Idle,
+            () = tokio::time::sleep(ERROR_BACKOFF) => {}
+        }
+        if beat_after_backoff {
+            progress.beat();
         }
     }
+}
+
+/// How [`close_within`] ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Closed {
+    Done,
+    /// `close` returned an error (already logged by it).
+    Failed,
+    TimedOut,
+}
+
+/// Runs the blocking `close` on its own OS thread and waits up to `budget`.
+/// Not `spawn_blocking`: the runtime waits for those when it shuts down,
+/// which would undo the bound. A thread still running at the deadline is
+/// left behind and ends with the process.
+async fn close_within<C>(budget: Duration, close: C) -> Closed
+where
+    C: FnOnce() -> anyhow::Result<()> + Send + 'static,
+{
+    let (done, finished) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("kafka-close".to_string())
+        .spawn(move || {
+            let _ = done.send(close().is_ok());
+        });
+    if let Err(err) = spawned {
+        tracing::error!(error = ?err, "could not start the Kafka close thread");
+        return Closed::Failed;
+    }
+    match tokio::time::timeout(budget, finished).await {
+        Ok(Ok(true)) => Closed::Done,
+        // An error, or the thread panicked (the sender dropped).
+        Ok(Ok(false) | Err(_)) => Closed::Failed,
+        Err(_elapsed) => Closed::TimedOut,
+    }
+}
+
+/// SIGTERM (Kubernetes) or Ctrl-C.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = sigterm.recv() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(error = ?err, "could not install a SIGTERM handler; Ctrl-C only");
+            }
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// How long to wait before retrying after a failed cycle -- flat, not
@@ -145,12 +309,28 @@ enum Cycle {
 /// re-deliver exactly it before fetching anything new. The one deliberate
 /// exception is a record that cannot be classified at all -- see
 /// `publish_batch`: it is skipped and the offset commits past it.
+#[cfg(test)]
 async fn run_cycle<S, K>(source: &mut S, sink: &mut K) -> Cycle
 where
     S: RawKafkaSource,
     K: EventSink,
 {
-    let batch = match source.next_batch().await {
+    let batch = source.next_batch().await;
+    process_batch(source, sink, batch).await
+}
+
+/// The publish-and-commit half of [`run_cycle`], for a batch `next_batch`
+/// already returned (or failed to).
+async fn process_batch<S, K>(
+    source: &mut S,
+    sink: &mut K,
+    batch: anyhow::Result<Vec<String>>,
+) -> Cycle
+where
+    S: RawKafkaSource,
+    K: EventSink,
+{
+    let batch = match batch {
         Ok(batch) => batch,
         Err(err) => {
             tracing::error!(error = ?err, "error receiving from Kafka");
@@ -1035,6 +1215,187 @@ mod tests {
 
         assert_eq!(outcome, Cycle::Committed);
         assert_eq!(source.committed_count, 0);
+    }
+
+    /// A source that serves `records` and then waits forever, as a quiet
+    /// Kafka topic does (`FakeRawSource` alone returns empty polls at once,
+    /// which a loop would spin on).
+    struct QuietAfter {
+        inner: FakeRawSource,
+        remaining: usize,
+    }
+
+    impl QuietAfter {
+        fn new(records: Vec<String>) -> Self {
+            Self {
+                remaining: records.len(),
+                inner: FakeRawSource::new(records.into_iter().map(|r| vec![r]).collect()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RawKafkaSource for QuietAfter {
+        async fn next_batch(&mut self) -> anyhow::Result<Vec<String>> {
+            if self.remaining == 0 {
+                std::future::pending::<()>().await;
+            }
+            self.remaining -= 1;
+            self.inner.next_batch().await
+        }
+
+        fn retain_for_retry(&mut self, batch: Vec<String>) {
+            self.remaining += 1;
+            self.inner.retain_for_retry(batch);
+        }
+
+        async fn commit(&mut self) -> anyhow::Result<()> {
+            self.inner.commit().await
+        }
+
+        fn close(self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Every XADD takes `delay`.
+    #[derive(Default)]
+    struct SlowSink {
+        delay: Duration,
+        inner: FakeEventSink,
+    }
+
+    #[async_trait::async_trait]
+    impl EventSink for SlowSink {
+        async fn publish(&mut self, msg_type: &str, payload: &str) -> anyhow::Result<()> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.publish(msg_type, payload).await
+        }
+    }
+
+    fn progress() -> health_http::Progress {
+        health_http::Progress::new(Duration::from_secs(900))
+    }
+
+    /// SIGTERM while waiting for a record: stop at once, nothing to drain.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_while_waiting_for_a_record_stops_at_once() {
+        let mut source = QuietAfter::new(vec![movement_record("AAA")]);
+        let mut sink = FakeEventSink::default();
+
+        let stop = relay_until_shutdown(
+            &mut source,
+            &mut sink,
+            tokio::time::sleep(Duration::from_secs(1)),
+            &progress(),
+            DRAIN_TIMEOUT,
+        )
+        .await;
+
+        assert_eq!(stop, Stop::Idle);
+        assert_eq!(
+            source.inner.committed_offsets,
+            vec![0],
+            "AAA was relayed first"
+        );
+    }
+
+    /// SIGTERM mid-publish: the record finishes, and only then is its
+    /// offset committed (stored, for the final synchronous commit).
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_mid_publish_finishes_the_record_then_commits_it() {
+        let mut source = QuietAfter::new(vec![movement_record("AAA")]);
+        let mut sink = SlowSink {
+            delay: Duration::from_secs(3),
+            ..SlowSink::default()
+        };
+
+        let stop = relay_until_shutdown(
+            &mut source,
+            &mut sink,
+            tokio::time::sleep(Duration::from_secs(1)),
+            &progress(),
+            DRAIN_TIMEOUT,
+        )
+        .await;
+
+        assert_eq!(stop, Stop::Drained(Cycle::Committed));
+        assert_eq!(
+            published_train_ids(&sink.inner.published),
+            vec!["AAA".to_string()]
+        );
+        assert_eq!(source.inner.committed_offsets, vec![0]);
+    }
+
+    /// A record that cannot finish within the drain window is abandoned
+    /// with NO offset committed, so the restart re-reads it.
+    #[tokio::test(start_paused = true)]
+    async fn a_record_that_outlasts_the_drain_window_is_abandoned_uncommitted() {
+        let mut source = QuietAfter::new(vec![movement_record("AAA")]);
+        let mut sink = SlowSink {
+            delay: Duration::from_secs(60),
+            ..SlowSink::default()
+        };
+
+        let stop = relay_until_shutdown(
+            &mut source,
+            &mut sink,
+            tokio::time::sleep(Duration::from_secs(1)),
+            &progress(),
+            DRAIN_TIMEOUT,
+        )
+        .await;
+
+        assert_eq!(stop, Stop::Abandoned);
+        assert_eq!(source.inner.committed_offsets, Vec::<i64>::new());
+        assert_eq!(source.inner.committed_count, 0);
+    }
+
+    /// SIGTERM during the backoff after a failed publish stops without
+    /// committing the retained record.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_a_failed_publish_backoff_commits_nothing() {
+        let mut source = QuietAfter::new(vec![movement_record("AAA")]);
+        let mut sink = FakeEventSink {
+            fail_next: true,
+            ..FakeEventSink::default()
+        };
+
+        let stop = relay_until_shutdown(
+            &mut source,
+            &mut sink,
+            tokio::time::sleep(ERROR_BACKOFF / 2),
+            &progress(),
+            DRAIN_TIMEOUT,
+        )
+        .await;
+
+        assert_eq!(stop, Stop::Idle);
+        assert_eq!(source.inner.committed_count, 0);
+    }
+
+    #[tokio::test]
+    async fn close_within_reports_how_the_close_ended() {
+        assert_eq!(
+            close_within(Duration::from_secs(5), || Ok(())).await,
+            Closed::Done
+        );
+        assert_eq!(
+            close_within(Duration::from_secs(5), || Err(anyhow::anyhow!(
+                "commit failed"
+            )))
+            .await,
+            Closed::Failed
+        );
+        assert_eq!(
+            close_within(Duration::from_millis(50), || {
+                std::thread::sleep(Duration::from_secs(2));
+                Ok(())
+            })
+            .await,
+            Closed::TimedOut,
+            "a close that hangs must not hold the process past its budget"
+        );
     }
 
     /// Regression test for the Signal Box Audit's "lag gauge omits a real
