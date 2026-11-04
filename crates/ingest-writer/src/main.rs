@@ -170,6 +170,7 @@ fn start_streams(
     tracing::info!(
         modes = %config.streams,
         consumer = %runtime.consumer,
+        pod = config.pod_name.as_deref().unwrap_or_default(),
         tasks = streams.len(),
         "ingest stream consumers started"
     );

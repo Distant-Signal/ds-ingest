@@ -8,6 +8,9 @@ use ds_runtime::secret::Secret;
 
 use crate::stream::StreamModes;
 
+/// [`Config::stream_consumer`]'s default.
+pub const DEFAULT_STREAM_CONSUMER: &str = "ingest-writer";
+
 /// `Debug` is safe to log: the one credential is a [`Secret`] (SVC-12).
 #[derive(Debug, Parser)]
 #[command(name = "ingest-writer")]
@@ -119,10 +122,32 @@ pub struct Config {
     #[arg(long, env)]
     pub redis_username: Option<String>,
 
-    /// This writer's consumer name in each stream's group: the pod name
-    /// (`POD_NAME`, else `HOSTNAME`, which Kubernetes sets to it).
+    /// This pod's name (`POD_NAME`), logged at startup. It used to be the
+    /// stream consumer name; see `stream_consumer`.
     #[arg(long, env = "POD_NAME")]
     pub pod_name: Option<String>,
+
+    /// This writer's consumer name in every stream's group. **Fixed**
+    /// (`ingest-writer` by default), not the pod name, so a restarted or
+    /// replaced writer reads the entries its predecessor left pending
+    /// (read, not yet applied and acknowledged) straight away, as its own
+    /// pending-entries list, instead of waiting for `XAUTOCLAIM` to move
+    /// them from a dead pod's name (5 minutes idle, swept every 60 s: up to
+    /// about 6 minutes late).
+    ///
+    /// Assumption: one writer at a time (`replicas: 1`, `Recreate`). It is
+    /// still gap-free if two pods overlap (a deleted pod being replaced, a
+    /// node drain): both read as one consumer, so an entry may be applied
+    /// by both, and the dedup claim (`ingest_dedup`) makes the second a
+    /// no-op; nothing is skipped. To run more than one writer, give each
+    /// its own name (`$(POD_NAME)` brings back the old behaviour, with the
+    /// `XAUTOCLAIM` sweep as the recovery path).
+    #[arg(
+        long,
+        env = "INGEST_WRITER_STREAM_CONSUMER",
+        default_value = DEFAULT_STREAM_CONSUMER
+    )]
+    pub stream_consumer: String,
     /// The train-event outbox loop's interval (plan 3b.3; see
     /// `ds_store::loops::TRAIN_EVENT_OUTBOX_DEFAULT_INTERVAL` for the 5 s).
     #[arg(
@@ -218,6 +243,10 @@ impl Config {
         ] {
             anyhow::ensure!(value > 0, "{name} must be greater than zero");
         }
+        anyhow::ensure!(
+            !self.stream_consumer.trim().is_empty(),
+            "INGEST_WRITER_STREAM_CONSUMER must not be empty"
+        );
         if self.streams.any_active() {
             anyhow::ensure!(
                 self.redis_url.as_deref().is_some_and(|url| !url.is_empty()),
@@ -228,18 +257,9 @@ impl Config {
         Ok(())
     }
 
-    /// The consumer name: `POD_NAME`, else `HOSTNAME`, else
-    /// `ingest-writer`.
+    /// The stream consumer name ([`Config::stream_consumer`]).
     pub fn consumer_name(&self) -> String {
-        self.pod_name
-            .clone()
-            .filter(|name| !name.is_empty())
-            .or_else(|| {
-                std::env::var("HOSTNAME")
-                    .ok()
-                    .filter(|name| !name.is_empty())
-            })
-            .unwrap_or_else(|| "ingest-writer".to_owned())
+        self.stream_consumer.clone()
     }
 
     /// The three periodic sweeps' intervals, as `ds_store::loops` takes
@@ -377,6 +397,27 @@ mod tests {
         assert_eq!(env("redis_username").as_deref(), Some("REDIS_USERNAME"));
         assert_eq!(env("redis_password").as_deref(), Some("REDIS_PASSWORD"));
         assert_eq!(env("pod_name").as_deref(), Some("POD_NAME"));
+        assert_eq!(
+            env("stream_consumer").as_deref(),
+            Some("INGEST_WRITER_STREAM_CONSUMER")
+        );
+    }
+
+    /// The consumer name is fixed, whatever the pod is called, so a new pod
+    /// owns the entries the old one left pending; it can be overridden, but
+    /// not to nothing.
+    #[test]
+    fn the_stream_consumer_name_is_fixed_not_the_pod_name() {
+        let config = Config::try_parse_from(args(&["--pod-name", "writer-7c9d-abcde"])).unwrap();
+        assert_eq!(config.consumer_name(), DEFAULT_STREAM_CONSUMER);
+        assert_eq!(DEFAULT_STREAM_CONSUMER, "ingest-writer");
+
+        let config =
+            Config::try_parse_from(args(&["--stream-consumer", "ingest-writer-b"])).unwrap();
+        assert_eq!(config.consumer_name(), "ingest-writer-b");
+
+        let config = Config::try_parse_from(args(&["--stream-consumer", " "])).unwrap();
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -400,7 +441,7 @@ mod tests {
         ]))
         .unwrap();
         config.validate().unwrap();
-        assert_eq!(config.consumer_name(), "writer-0");
+        assert_eq!(config.consumer_name(), DEFAULT_STREAM_CONSUMER);
         assert!(Config::try_parse_from(args(&["--streams", "nope:apply"])).is_err());
     }
 

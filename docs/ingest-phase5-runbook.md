@@ -944,7 +944,14 @@ rollout strategy)".
   extracted, and paid for, twice.
 - **ingest-writer** (already Recreate): its loops take Postgres advisory
   locks, released when the old pod's session ends; its streams are
-  consumer groups as above.
+  consumer groups as above, read under one fixed consumer name
+  (`ingest-writer`, `INGEST_WRITER_STREAM_CONSUMER`), so the new pod
+  replays what the old one left pending at startup. It used to be the pod
+  name, which left those entries to the `XAUTOCLAIM` sweep (5 minutes
+  idle, every 60 s). The fixed name assumes one writer at a time
+  (`replicas: 1`, `Recreate`); an overlap (a deleted pod being replaced)
+  can apply an entry twice, which the dedup claim absorbs, but skips
+  nothing.
 - **pollers, schedulefeed, aggregator, notifier** (already Recreate):
   the next poll or cycle picks up where the last left off.
 
