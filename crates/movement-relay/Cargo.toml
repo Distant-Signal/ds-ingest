@@ -23,6 +23,8 @@ tracing = "0.1.44"
 trust-schema = { workspace = true }
 
 [dev-dependencies]
+# The Kafka metrics' unit tests read a local recorder.
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "test-util", "net", "io-util"] }
 
 [lints]

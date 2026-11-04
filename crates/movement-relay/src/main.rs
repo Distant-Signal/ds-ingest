@@ -10,6 +10,7 @@ mod config;
 mod deadletter;
 mod event_sink;
 mod health;
+mod kafka_metrics;
 mod kafka_source;
 
 use std::time::Duration;
@@ -46,6 +47,7 @@ async fn run() -> anyhow::Result<()> {
     let config = Config::parse();
     if config.metrics_enabled {
         ds_runtime::metrics::install(config.metrics_port)?;
+        kafka_metrics::register();
     }
 
     // Readiness (`/healthz`) stays "confirmed Kafka partition assignment"
@@ -194,6 +196,7 @@ where
         source.retain_for_retry(batch);
         return Cycle::CommitFailed;
     }
+    kafka_metrics::records_committed(batch.len());
     Cycle::Committed
 }
 
@@ -1024,6 +1027,43 @@ mod tests {
             vec!["AAA".to_string()]
         );
         assert_eq!(source.committed_count, 1);
+    }
+
+    /// `movement_relay_records_committed_total` counts a record only once
+    /// its offset committed: a failed publish or a failed commit (both
+    /// retried) counts nothing, so "assigned but not committing" shows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_record_is_counted_only_once_its_offset_commits() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let committed = || {
+            handle
+                .render()
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("distant_signal_movement_relay_records_committed_total ")?
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                })
+                .unwrap_or(0)
+        };
+        let mut source = FakeRawSource::new(vec![vec![movement_record("AAA")]]);
+        let mut sink = FakeEventSink {
+            fail_next: true,
+            ..FakeEventSink::default()
+        };
+
+        assert_eq!(run_cycle(&mut source, &mut sink).await, Cycle::Failed);
+        assert_eq!(committed(), 0, "a failed publish is not counted");
+
+        source.fail_next_commit = true;
+        assert_eq!(run_cycle(&mut source, &mut sink).await, Cycle::CommitFailed);
+        assert_eq!(committed(), 0, "a failed commit is not counted");
+
+        assert_eq!(run_cycle(&mut source, &mut sink).await, Cycle::Committed);
+        assert_eq!(committed(), 1);
     }
 
     #[tokio::test]
