@@ -33,6 +33,8 @@ trust-schema = { workspace = true }
 
 [dev-dependencies]
 movement-feed = { path = "../movement-feed", features = ["test-util"] }
+# Paused time for the SIGTERM drain tests.
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "test-util"] }
 # The DB sink tests' fixtures and cleanup.
 ds-store = { workspace = true, features = ["test-support"] }
 

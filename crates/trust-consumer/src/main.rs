@@ -24,6 +24,7 @@ use config::{Config, MovementFeedBackend};
 use feed::MovementFeed;
 use movement_feed::ActiveFeed;
 use movement_feed::redis_stream::RedisStreamMovementFeed;
+use movement_feed::shutdown::{DRAIN_TIMEOUT, Finished, Shutdown, finish_within};
 use sink::{DbSink, TrainEventSink};
 
 /// Registers `trust_consumer_errors_total{operation="parse_envelope",msg_type}`
@@ -190,7 +191,16 @@ async fn run() -> anyhow::Result<()> {
     // Consecutive failed cycles; see `CYCLE_RETRY_BACKOFF`.
     let mut cycle_failures = ds_runtime::backoff::FailureStreak::new(CYCLE_RETRY_BACKOFF);
 
+    // SIGTERM is handled from here on: the cycle in flight finishes (write,
+    // then XACK) and the loop stops (`movement_feed::shutdown`). Before
+    // this, the default action exits, which is safe: nothing is ACKed.
+    let mut shutdown = Shutdown::on_sigterm();
+
     loop {
+        if shutdown.is_requested() {
+            tracing::info!("shutdown requested between cycles; stopping");
+            break;
+        }
         if reference_reload.is_due() {
             match reads.tracked_trains().await {
                 Ok(refs) => {
@@ -243,7 +253,7 @@ async fn run() -> anyhow::Result<()> {
             last_redis_gap_check = tokio::time::Instant::now();
         }
 
-        let outcome = run_cycle(
+        let cycle = run_cycle(
             &mut feed,
             &reference,
             &mut state,
@@ -253,8 +263,14 @@ async fn run() -> anyhow::Result<()> {
                 sink.write(events, &reference.trains_id_by_tracked_train_id)
                     .await
             },
-        )
-        .await;
+        );
+        let outcome = match finish_within(&mut shutdown, DRAIN_TIMEOUT, cycle).await {
+            Finished::Ran(outcome) => outcome,
+            stopped => {
+                movement_feed::shutdown::log_stop("trust-consumer", &stopped);
+                break;
+            }
+        };
 
         if let Some(wait) = cycle_wait(&outcome, &mut cycle_failures) {
             // Nothing here waits on anything: `run_once` returns as soon as
@@ -268,12 +284,19 @@ async fn run() -> anyhow::Result<()> {
                 retry_in_ms = wait.as_millis() as u64,
                 "cycle failed; backing off before the redelivery"
             );
-            progress.idle(tokio::time::sleep(wait)).await;
+            if !shutdown
+                .wait_unless_requested(progress.idle(tokio::time::sleep(wait)))
+                .await
+            {
+                tracing::info!("shutdown requested during the retry backoff; stopping");
+                break;
+            }
         }
         // One loop iteration completed, however it went -- see
         // `health_http::Progress`.
         progress.beat();
     }
+    Ok(())
 }
 
 /// The Redis Streams backend, connected once Redis is reachable. Redis
@@ -694,6 +717,63 @@ mod tests {
             feed.committed_count, 0,
             "a batch that never reached api must not be committed"
         );
+    }
+
+    /// SIGTERM mid-cycle: the write in flight finishes, then the batch is
+    /// `XACKed`, then the loop stops.
+    #[tokio::test(start_paused = true)]
+    async fn sigterm_mid_cycle_finishes_the_write_then_acks() {
+        let mut feed = FakeMovementFeed::new(vec![vec![ORIGIN_DEPARTURE.to_string()]]);
+        let reference = one_pending_pin();
+        let mut state = process::ProcessorState::default();
+        let (trigger, mut shutdown) = Shutdown::manual();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            trigger.trigger();
+        });
+
+        let cycle = run_cycle(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            &sink::DB_OPERATIONS,
+            async |_| {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                Ok(Vec::new())
+            },
+        );
+        let finished = finish_within(&mut shutdown, DRAIN_TIMEOUT, cycle).await;
+
+        assert_eq!(finished, Finished::Drained(Cycle::Committed));
+        assert_eq!(feed.committed_count, 1);
+    }
+
+    /// A write that cannot finish within the drain window is dropped and
+    /// its batch is NOT `XACKed`: it stays pending for the next pod.
+    #[tokio::test(start_paused = true)]
+    async fn sigterm_with_a_write_that_outlasts_the_drain_acks_nothing() {
+        let mut feed = FakeMovementFeed::new(vec![vec![ORIGIN_DEPARTURE.to_string()]]);
+        let reference = one_pending_pin();
+        let mut state = process::ProcessorState::default();
+        let (trigger, mut shutdown) = Shutdown::manual();
+        trigger.trigger();
+
+        let cycle = run_cycle(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            &sink::DB_OPERATIONS,
+            async |_| {
+                std::future::pending::<()>().await;
+                Ok(Vec::new())
+            },
+        );
+        let finished = finish_within(&mut shutdown, DRAIN_TIMEOUT, cycle).await;
+
+        assert_eq!(finished, Finished::Abandoned);
+        assert_eq!(feed.committed_count, 0, "nothing XACKed");
     }
 
     /// And the same batch, posted successfully, does commit -- otherwise the
