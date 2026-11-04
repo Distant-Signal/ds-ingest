@@ -15,8 +15,10 @@
 //! `set_connected`) now lives in `health-http`; only this crate's own
 //! Kafka-rebalance-driven state transitions stay here.
 
-use rdkafka::ClientContext;
-use rdkafka::consumer::{BaseConsumer, ConsumerContext, Rebalance};
+use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext, Rebalance};
+use rdkafka::{ClientContext, Statistics};
+
+use crate::kafka_metrics;
 
 /// `rdkafka::ClientConfig::create_with_context` target -- flips `ready`
 /// true on a non-empty partition assignment (`post_rebalance`'s `Assign`
@@ -26,10 +28,32 @@ pub(crate) struct RelayContext {
     pub ready: health_http::ConnectionState,
 }
 
-impl ClientContext for RelayContext {}
+impl ClientContext for RelayContext {
+    /// The per-partition consumer-lag gauge (`kafka_metrics::CONSUMER_LAG`), from
+    /// librdkafka's statistics (`statistics.interval.ms`).
+    fn stats(&self, statistics: Statistics) {
+        let partitions = statistics.topics.values().flat_map(|topic| {
+            topic
+                .partitions
+                .iter()
+                .map(|(partition, stats)| (*partition, stats.consumer_lag))
+        });
+        for (partition, lag) in kafka_metrics::lag_samples(partitions) {
+            kafka_metrics::set_consumer_lag(partition, lag);
+        }
+    }
+}
 
 impl ConsumerContext for RelayContext {
-    fn post_rebalance(&self, _base_consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
+    fn post_rebalance(&self, base_consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
+        // The assignment as it stands after this rebalance, whatever the
+        // protocol (an eager revoke empties it; an incremental one may not).
+        match base_consumer.assignment() {
+            Ok(assignment) => kafka_metrics::set_assigned_partitions(assignment.count()),
+            Err(err) => {
+                tracing::warn!(error = ?err, "movement-relay: could not read the Kafka assignment after a rebalance");
+            }
+        }
         match rebalance {
             Rebalance::Assign(partitions) if !partitions.elements().is_empty() => {
                 health_http::set_connected(&self.ready, "movement_relay_ready", true);

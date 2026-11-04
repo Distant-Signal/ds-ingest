@@ -1692,6 +1692,7 @@ dependencies = [
  "ds-runtime",
  "health-http",
  "metrics",
+ "metrics-exporter-prometheus",
  "rdkafka",
  "redis",
  "serde_json",

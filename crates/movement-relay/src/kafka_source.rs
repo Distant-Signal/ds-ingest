@@ -296,6 +296,11 @@ impl KafkaRawSource {
             .set("enable.auto.commit", "false")
             .set("enable.auto.offset.store", "false")
             .set("max.poll.interval.ms", MAX_POLL_INTERVAL_MS)
+            // The consumer-lag gauge (`crate::kafka_metrics::CONSUMER_LAG`).
+            .set(
+                "statistics.interval.ms",
+                crate::kafka_metrics::STATISTICS_INTERVAL_MS,
+            )
             // A lost group offset replays rather than skips; see above.
             .set("auto.offset.reset", &config.kafka_auto_offset_reset);
         client_config
@@ -597,6 +602,16 @@ fn test_config() -> Config {
         movement_consumer_groups: Vec::new(),
         deadletter_max_age_secs: crate::deadletter::MAX_DEADLETTER_AGE_SECS,
     }
+}
+
+/// The lag gauge needs librdkafka's statistics callback, which is off
+/// unless `statistics.interval.ms` is set.
+#[test]
+fn statistics_are_enabled_for_the_lag_gauge() {
+    assert_eq!(
+        KafkaRawSource::client_config(&test_config()).get("statistics.interval.ms"),
+        Some(crate::kafka_metrics::STATISTICS_INTERVAL_MS)
+    );
 }
 
 /// A lost group offset must replay from the earliest retained message, not
