@@ -58,6 +58,16 @@ pub(crate) trait RawKafkaSource: Send {
     fn retain_for_retry(&mut self, batch: Vec<String>);
 
     async fn commit(&mut self) -> anyhow::Result<()>;
+
+    /// Shutdown: a SYNCHRONOUS commit of the offsets already stored (every
+    /// one belongs to a record published in full; a retained or in-flight
+    /// record never had its offset stored), then the consumer is closed so
+    /// it leaves the group at once instead of holding its partitions until
+    /// the session timeout. Blocking: call it off the async runtime
+    /// (`main::close_within`).
+    fn close(self) -> anyhow::Result<()>
+    where
+        Self: Sized;
 }
 
 /// The handful of librdkafka consumer operations `KafkaRawSource` needs,
@@ -80,6 +90,9 @@ pub(crate) trait ConsumerOps: Send + Sync {
     /// commits `offset + 1` (see `commit`'s doc on `KafkaRawSource`).
     fn store_offset(&self, topic: &str, partition: i32, offset: i64) -> anyhow::Result<()>;
     fn commit_stored(&self) -> anyhow::Result<()>;
+    /// Commits the stored offsets and waits for the broker's answer. Nothing
+    /// stored since the last commit is not an error.
+    fn commit_stored_sync(&self) -> anyhow::Result<()>;
 }
 
 /// `(topic, partition)`.
@@ -135,6 +148,18 @@ impl ConsumerOps for StreamConsumer<RelayContext> {
 
     fn commit_stored(&self) -> anyhow::Result<()> {
         Ok(self.commit_consumer_state(rdkafka::consumer::CommitMode::Async)?)
+    }
+
+    fn commit_stored_sync(&self) -> anyhow::Result<()> {
+        match self.commit_consumer_state(rdkafka::consumer::CommitMode::Sync) {
+            // "Local: No offset stored": everything stored was already
+            // committed by the per-record async commits.
+            Ok(())
+            | Err(rdkafka::error::KafkaError::ConsumerCommit(
+                rdkafka::types::RDKafkaErrorCode::NoOffset,
+            )) => Ok(()),
+            Err(err) => Err(err.into()),
+        }
     }
 }
 
@@ -576,6 +601,29 @@ impl<C: ConsumerOps> RawKafkaSource for KafkaRawSource<C> {
         self.resume_if_drained();
         Ok(())
     }
+
+    /// See the trait. Dropping the consumer closes it: rust-rdkafka's
+    /// `BaseConsumer` drop closes the consumer queue and polls until
+    /// librdkafka reports it closed, which revokes the assignment and sends
+    /// the `LeaveGroup`, so the group rebalances now rather than after
+    /// `session.timeout.ms`. Records in `pending_retry` and an abandoned
+    /// in-flight record were never stored, so they are not committed: the
+    /// next owner re-reads them (duplicates at worst, never a gap).
+    fn close(self) -> anyhow::Result<()> {
+        if !self.pending_retry.is_empty() {
+            tracing::warn!(
+                retained = self.pending_retry.len(),
+                "closing with records still awaiting redelivery; their offsets are not \
+                 committed, so they are re-read after the restart"
+            );
+        }
+        let committed = self.consumer.commit_stored_sync();
+        if let Err(err) = &committed {
+            tracing::error!(error = ?err, "final synchronous Kafka offset commit failed; the records since the last commit are re-read after the restart");
+        }
+        drop(self.consumer);
+        committed
+    }
 }
 
 #[cfg(test)]
@@ -740,6 +788,10 @@ impl RawKafkaSource for FakeRawSource {
         self.last_received = None;
         Ok(())
     }
+
+    fn close(self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Fake librdkafka consumer for `KafkaRawSource`'s own retry logic: models
@@ -769,6 +821,9 @@ mod consumer_tests {
         /// Models a pause that silently does not take effect.
         pause_is_noop: bool,
         stored: Vec<(String, i32, i64)>,
+        /// What shutdown did, in order; shared so a test can read it after
+        /// the consumer is dropped.
+        journal: std::sync::Arc<Mutex<Vec<String>>>,
     }
 
     #[derive(Default)]
@@ -777,6 +832,15 @@ mod consumer_tests {
     impl FakeConsumer {
         fn state(&self) -> std::sync::MutexGuard<'_, FakeState> {
             self.0.lock().unwrap()
+        }
+    }
+
+    /// Dropping the real consumer closes it (leaves the group).
+    impl Drop for FakeConsumer {
+        fn drop(&mut self) {
+            if let Ok(state) = self.0.get_mut() {
+                state.journal.lock().unwrap().push("closed".to_string());
+            }
         }
     }
 
@@ -845,6 +909,22 @@ mod consumer_tests {
         }
 
         fn commit_stored(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn commit_stored_sync(&self) -> anyhow::Result<()> {
+            let state = self.state();
+            let last = state
+                .stored
+                .iter()
+                .map(|(_, partition, offset)| format!("{partition}@{offset}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            state
+                .journal
+                .lock()
+                .unwrap()
+                .push(format!("sync commit [{last}]"));
             Ok(())
         }
     }
@@ -1031,6 +1111,44 @@ mod consumer_tests {
             source.pending_retry.front().unwrap().batch,
             vec!["A"],
             "still redelivering the original record first"
+        );
+    }
+
+    /// Shutdown commits synchronously what was stored -- the published
+    /// record, not the retained one whose XADD failed -- and only then
+    /// closes the consumer.
+    #[tokio::test(start_paused = true)]
+    async fn close_commits_stored_offsets_synchronously_then_leaves_the_group() {
+        let mut source = source_with(vec![tp(0)], vec![(tp(0), vec![(0, "A"), (1, "B")])]);
+        let journal = std::sync::Arc::clone(&source.consumer.state().journal);
+
+        assert_eq!(source.next_batch().await.unwrap(), vec!["A"]);
+        source.commit().await.unwrap();
+        assert_eq!(source.next_batch().await.unwrap(), vec!["B"]);
+        source.retain_for_retry(vec!["B".to_string()]);
+
+        source.close().expect("close");
+
+        assert_eq!(
+            *journal.lock().unwrap(),
+            vec!["sync commit [0@0]".to_string(), "closed".to_string()],
+            "B was never published, so its offset is not committed"
+        );
+    }
+
+    /// A record received but not yet published (shutdown abandoned it) has
+    /// no stored offset either.
+    #[tokio::test(start_paused = true)]
+    async fn close_does_not_commit_a_record_in_flight() {
+        let mut source = source_with(vec![tp(0)], vec![(tp(0), vec![(0, "A")])]);
+        let journal = std::sync::Arc::clone(&source.consumer.state().journal);
+
+        assert_eq!(source.next_batch().await.unwrap(), vec!["A"]);
+        source.close().expect("close");
+
+        assert_eq!(
+            *journal.lock().unwrap(),
+            vec!["sync commit []".to_string(), "closed".to_string()]
         );
     }
 }
