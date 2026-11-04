@@ -184,6 +184,7 @@ pub fn registry_with(options: snapshots::Options) -> Registry {
             &v1("ioi-station-samples"),
             island_of_ireland::StationSamples,
         ),
+        registry.register(&v1("ioi-live-stations"), island_of_ireland::LiveStations),
         registry.register(&v1(common::transit::schema::TIMETABLE), transit::Timetable),
         registry.register(
             &v1(common::transit::schema::TIMETABLE_COMMIT),
@@ -459,6 +460,7 @@ mod tests {
                 "full-coverage-stats/1",
                 "full-coverage-window-stats/1",
                 "ioi-lines/1",
+                "ioi-live-stations/1",
                 "ioi-station-samples/1",
                 "ioi-stations/1",
                 "station-full-coverage-samples/1",

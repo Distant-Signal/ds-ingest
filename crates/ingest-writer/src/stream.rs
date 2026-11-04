@@ -152,7 +152,7 @@ pub const STREAMS: [StreamSpec; 12] = [
     StreamSpec {
         name: "ioi-live",
         stream: streams::IOI_LIVE,
-        schemas: &["ioi-station-samples"],
+        schemas: &["ioi-station-samples", "ioi-live-stations"],
     },
     // One stream per transit network (transit spec §5, §9.1), off by
     // default.
@@ -660,6 +660,7 @@ mod tests {
         assert_eq!(StreamSpec::by_stream("ds:ingest:island-of-ireland"), None);
         let live = StreamSpec::by_stream(streams::IOI_LIVE).unwrap();
         assert!(live.carries("ioi-station-samples"));
+        assert!(live.carries("ioi-live-stations"));
         assert!(!live.carries("ioi-stations"));
         let transit = StreamSpec::by_stream(streams::TRANSIT_METROLINK).unwrap();
         assert_eq!(transit.name, "transit-metrolink");

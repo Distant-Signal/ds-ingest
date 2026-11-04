@@ -7,8 +7,16 @@
 //! | `ioi-stations/1` | `Vec<IslandOfIrelandStation>` | `upsert_stations_observed` |
 //! | `ioi-lines/1` | `Vec<IslandOfIrelandLineDefinition>` | `upsert_lines_observed` |
 //! | `ioi-station-samples/1` | `Vec<IslandOfIrelandStationSample>` | `upsert_station_samples_observed` |
+//! | `ioi-live-stations/1` | `Vec<IslandOfIrelandLiveStation>` | `upsert_live_stations_observed` |
 //!
-//! all in `ds_store::samples::island_of_ireland`. Observed times (D13):
+//! all in `ds_store::samples::island_of_ireland`. After a Republic of
+//! Ireland stations snapshot or a live station list, the same transaction
+//! re-matches the catalogue to the live codes (`refresh_live_codes`,
+//! [`refresh_live_codes`]), so `island_of_ireland_stations.live_code`
+//! follows whichever side changed; the match is logged and exported as
+//! `distant_signal_island_of_ireland_live_codes{outcome}`. A line's
+//! `replaces` deletes the directional rows a merged corridor replaces
+//! (in `upsert_lines_observed`). Observed times (D13):
 //! stations and lines have none of their own, so a changed row's
 //! `fetched_at` and the freshness marker are the envelope's `produced_at`;
 //! a station sample's is its own `polled_at`, clamped to the writer's
@@ -28,9 +36,10 @@
 //! an existing row to the other network (`ds_store`'s guard), so a poller
 //! cannot take over the other network's row by its id either.
 
+use common::island_of_ireland::live_codes::{LiveCodeOutcome, LiveCodeReport, Unmatched};
 use common::island_of_ireland::{
-    IslandOfIrelandLineDefinition, IslandOfIrelandNetwork, IslandOfIrelandStation,
-    IslandOfIrelandStationSample,
+    IslandOfIrelandLineDefinition, IslandOfIrelandLiveStation, IslandOfIrelandNetwork,
+    IslandOfIrelandStation, IslandOfIrelandStationSample,
 };
 use ds_store::samples::island_of_ireland as store;
 use ingest_stream::{HandlerError, StreamEntry, streams};
@@ -106,10 +115,13 @@ impl SchemaHandler for Stations {
     ) -> BoxFuture<'a, Result<Applied, HandlerError>> {
         Box::pin(async move {
             let stations: Vec<IslandOfIrelandStation> = decode(entry)?;
-            pin_stations(entry, &stations)?;
+            let network = pin_stations(entry, &stations)?;
             let written = store::upsert_stations_observed(conn, &stations, observed.produced_at())
                 .await
                 .map_err(|err| classify_anyhow(&err))?;
+            if network == IslandOfIrelandNetwork::RepublicOfIreland {
+                refresh_live_codes(conn).await?;
+            }
             count_apply(entry, stations.len(), written);
             Ok(Applied::All)
         })
@@ -162,6 +174,113 @@ impl SchemaHandler for StationSamples {
     }
 }
 
+/// `ioi-live-stations/1`: Iarnród Éireann's live station list, from
+/// `ds:ingest:ioi-live` only (the stream's schema list).
+pub struct LiveStations;
+
+impl SchemaHandler for LiveStations {
+    fn apply<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        entry: &'a StreamEntry,
+        observed: &'a Observed,
+    ) -> BoxFuture<'a, Result<Applied, HandlerError>> {
+        Box::pin(async move {
+            let stations: Vec<IslandOfIrelandLiveStation> = decode(entry)?;
+            let written =
+                store::upsert_live_stations_observed(conn, &stations, observed.produced_at())
+                    .await
+                    .map_err(|err| classify_anyhow(&err))?;
+            refresh_live_codes(conn).await?;
+            count_apply(entry, stations.len(), written);
+            Ok(Applied::All)
+        })
+    }
+}
+
+/// The live-code metric: catalogue stations by match outcome.
+pub const LIVE_CODES_METRIC: &str = "island_of_ireland_live_codes";
+
+/// Re-matches the catalogue to the live codes in the caller's transaction
+/// and reports the result: the gauge, and one log line naming every
+/// station left unmatched (each needs an override in
+/// `common::island_of_ireland::live_codes::OVERRIDES`, or has no board).
+async fn refresh_live_codes(conn: &mut PgConnection) -> Result<(), HandlerError> {
+    let (report, changed) = store::refresh_live_codes(conn)
+        .await
+        .map_err(|err| classify_anyhow(&err))?;
+    if let Some(report) = report {
+        record_live_codes(&report, changed);
+    }
+    Ok(())
+}
+
+/// The gauge and log line for one refresh.
+fn record_live_codes(report: &LiveCodeReport, changed: u64) {
+    for (outcome, count) in outcome_counts(report) {
+        metrics::gauge!(
+            ds_runtime::metrics::metric_name(LIVE_CODES_METRIC),
+            "outcome" => outcome
+        )
+        .set(f64::from(u32::try_from(count).unwrap_or(u32::MAX)));
+    }
+    let unmatched = describe_unmatched(report);
+    if unmatched.is_empty() {
+        tracing::info!(
+            changed,
+            "island-of-Ireland live codes refreshed; every station matched"
+        );
+    } else {
+        tracing::warn!(
+            changed,
+            unmatched = %unmatched.join(" "),
+            "island-of-Ireland stations without a live code; add an override once confirmed"
+        );
+    }
+}
+
+/// Every outcome label with its station count (zero included, so a
+/// fixed station drops its series to 0 rather than leaving it stale).
+fn outcome_counts(report: &LiveCodeReport) -> Vec<(&'static str, usize)> {
+    use common::island_of_ireland::live_codes::MatchMethod;
+    let mut counts: Vec<(&'static str, usize)> = [
+        MatchMethod::Override,
+        MatchMethod::Name,
+        MatchMethod::NamePrefix,
+        MatchMethod::Coordinates,
+    ]
+    .iter()
+    .map(|m| (m.label(), 0))
+    .chain([("no_board", 0), ("unmatched", 0), ("ambiguous", 0)])
+    .collect();
+    for (_, outcome) in &report.outcomes {
+        let label = match outcome {
+            LiveCodeOutcome::Matched { method, .. } => method.label(),
+            LiveCodeOutcome::NoBoard => "no_board",
+            LiveCodeOutcome::Unmatched(Unmatched::Ambiguous(_)) => "ambiguous",
+            LiveCodeOutcome::Unmatched(_) => "unmatched",
+        };
+        if let Some(entry) = counts.iter_mut().find(|(l, _)| *l == label) {
+            entry.1 += 1;
+        }
+    }
+    counts
+}
+
+/// `id(why)` for each unmatched station, sorted.
+fn describe_unmatched(report: &LiveCodeReport) -> Vec<String> {
+    let mut out: Vec<String> = report
+        .unmatched()
+        .map(|(id, why)| match why {
+            Unmatched::NoCandidate => format!("{id}(no-candidate)"),
+            Unmatched::Ambiguous(codes) => format!("{id}(ambiguous:{})", codes.join("|")),
+            Unmatched::OverrideCodeMissing(code) => format!("{id}(override-code-missing:{code})"),
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
@@ -176,6 +295,7 @@ mod tests {
             network,
             latitude: None,
             longitude: None,
+            raw_name: None,
         }
     }
 
@@ -185,7 +305,48 @@ mod tests {
             name: id.into(),
             network,
             stations: vec![],
+            short_name: None,
+            agency: None,
+            color: None,
+            text_color: None,
+            replaces: vec![],
         }
+    }
+
+    #[test]
+    fn the_live_code_report_counts_every_outcome_and_names_the_unmatched() {
+        use common::island_of_ireland::live_codes::MatchMethod;
+        let report = LiveCodeReport {
+            outcomes: vec![
+                (
+                    "A".into(),
+                    LiveCodeOutcome::Matched {
+                        code: "AAA".into(),
+                        method: MatchMethod::Name,
+                    },
+                ),
+                (
+                    "B".into(),
+                    LiveCodeOutcome::Unmatched(Unmatched::NoCandidate),
+                ),
+                (
+                    "C".into(),
+                    LiveCodeOutcome::Unmatched(Unmatched::Ambiguous(vec!["X".into(), "Y".into()])),
+                ),
+                ("D".into(), LiveCodeOutcome::NoBoard),
+            ],
+        };
+        let counts = outcome_counts(&report);
+        let count = |label: &str| counts.iter().find(|(l, _)| *l == label).unwrap().1;
+        assert_eq!(count("name"), 1);
+        assert_eq!(count("override"), 0);
+        assert_eq!(count("unmatched"), 1);
+        assert_eq!(count("ambiguous"), 1);
+        assert_eq!(count("no_board"), 1);
+        assert_eq!(
+            describe_unmatched(&report),
+            ["B(no-candidate)", "C(ambiguous:X|Y)"]
+        );
     }
 
     fn entry<T: serde::Serialize>(stream: &str, schema: &str, body: &T) -> StreamEntry {
