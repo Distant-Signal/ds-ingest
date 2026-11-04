@@ -1,8 +1,8 @@
 # Ingest architecture, phase 5: removing `/private` and locking down
 
 This runbook prepares phase 5 of
-[the ingest architecture plan](superpowers/plans/2026-10-06-ingest-architecture-plan.md)
-(spec: [design](superpowers/specs/2026-10-06-ingest-architecture-design.md),
+[the ingest architecture plan](https://github.com/Distant-Signal/distant-signal/blob/main/docs/superpowers/plans/2026-10-06-ingest-architecture-plan.md)
+(spec: [design](https://github.com/Distant-Signal/distant-signal/blob/main/docs/superpowers/specs/2026-10-06-ingest-architecture-design.md),
 §13, §15.1, §6.4 and §16). It was written on 2026-10-08 against `main` at
 `8e42554e`. File and line references are to that commit.
 

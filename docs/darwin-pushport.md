@@ -1,7 +1,7 @@
 # Darwin Push Port and arrival boards (DS-152)
 
 Pre-departure prediction phases 2 and 3
-([spec](superpowers/specs/2026-10-21-pre-departure-prediction-design.md)):
+([spec](https://github.com/Distant-Signal/distant-signal/blob/main/docs/superpowers/specs/2026-10-21-pre-departure-prediction-design.md)):
 live platforms with Darwin's confirmed and suppressed flags at every stop,
 Darwin's live next-working links for the late-start prediction, the
 timetable's joins and divides as a cap on the inferred links, and arrival
