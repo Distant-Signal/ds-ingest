@@ -21,14 +21,14 @@ members = [
 # default features are off here, so a member that wants them lists
 # "default". To build against a local ds-core checkout, see README.md.
 [workspace.dependencies]
-common = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.1.0", default-features = false }
-ds-runtime = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.1.0", default-features = false }
-health-http = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.1.0" }
-trust-schema = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.1.0" }
-schedule-query = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.1.0" }
-ingest-stream = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.1.0" }
-ds-store = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.1.0" }
-ds-lines = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.1.0" }
+common = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.1.2", default-features = false }
+ds-runtime = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.1.2", default-features = false }
+health-http = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.1.2" }
+trust-schema = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.1.2" }
+schedule-query = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.1.2" }
+ingest-stream = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.1.2" }
+ds-store = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.1.2" }
+ds-lines = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.1.2" }
 
 [workspace.package]
 edition = "2024"
