@@ -71,7 +71,7 @@ jobs:
             dockerfile: docker/trust-backlog-consumer.Dockerfile
           - service: full-coverage-consumer
             dockerfile: docker/full-coverage-consumer.Dockerfile
-    uses: Distant-Signal/ci/.github/workflows/image.yml@076703ad053c64bdef82ac934e5cfe1d185be567 # main
+    uses: Distant-Signal/ci/.github/workflows/image.yml@f405ba7d7d51df62ad597f8fc1e56070abafca64 # main
     with:
       service: ${{ matrix.service }}
       dockerfile: ${{ matrix.dockerfile }}
