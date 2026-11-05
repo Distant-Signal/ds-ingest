@@ -110,6 +110,21 @@ pub struct Config {
     )]
     pub ioi_train_history_retention_days: u32,
 
+    /// Days of `train_date` the Iarnród Éireann board history keeps for a
+    /// train someone tracks (an `ie:` `trains` row with a subscription),
+    /// counting back from Dublin's today. 30 is what the aggregator keeps
+    /// of a tracked GB train (`trainsRetentionDays`; distant-signal's
+    /// docs/superpowers/specs/2026-11-05-irish-rail-train-tracking-design.md
+    /// §4.3). A value under `--ioi-train-history-retention-days` is
+    /// treated as that: a tracked train is never pruned sooner.
+    #[arg(
+        long,
+        env = "IOI_TRACKED_TRAIN_HISTORY_RETENTION_DAYS",
+        default_value_t = crate::handlers::island_of_ireland::DEFAULT_TRACKED_TRAIN_HISTORY_RETENTION_DAYS,
+        value_parser = clap::value_parser!(u32).range(1..=3650)
+    )]
+    pub ioi_tracked_train_history_retention_days: u32,
+
     /// An entry left pending because this writer does not know its schema
     /// version or envelope version (the producer is newer) is
     /// dead-lettered, reason `unsupported_expired`, once it is this many
