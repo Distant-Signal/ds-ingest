@@ -472,6 +472,8 @@ async fn island_of_ireland_schemas_are_applied_under_the_guard() {
     db.cleanup().await;
     db.age_freshness("island_of_ireland_stations_nir").await;
     db.age_freshness("island_of_ireland_lines_nir").await;
+    db.age_freshness("island_of_ireland_station_samples_live")
+        .await;
     // Stations and lines on poller-nir-stations' stream, samples on
     // poller-irish-rail-live's (security review H1: one stream per poller).
     let stream = "ds:ingest:ioi-nir";
@@ -544,6 +546,25 @@ async fn island_of_ireland_schemas_are_applied_under_the_guard() {
     };
     let newer = db.entry(live, "ioi-station-samples", "s-new", t0, &[sample(t0)]);
     db.applied(&newer).await;
+    // The live feed's marker, at the entry's produced_at (DS-363).
+    assert_eq!(
+        db.freshness("island_of_ireland_station_samples_live").await,
+        Some(t0)
+    );
+    // An empty batch says nothing about the feed.
+    let empty: [IslandOfIrelandStationSample; 0] = [];
+    let nothing = db.entry(
+        live,
+        "ioi-station-samples",
+        "s-empty",
+        t0 + TimeDelta::minutes(1),
+        &empty,
+    );
+    db.applied(&nothing).await;
+    assert_eq!(
+        db.freshness("island_of_ireland_station_samples_live").await,
+        Some(t0)
+    );
     let older = db.entry(
         live,
         "ioi-station-samples",
