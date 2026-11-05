@@ -6,7 +6,7 @@
 //! |---|---|---|
 //! | `ioi-stations/1` | `Vec<IslandOfIrelandStation>` | `upsert_stations_observed` |
 //! | `ioi-lines/1` | `Vec<IslandOfIrelandLineDefinition>` | `upsert_lines_observed` |
-//! | `ioi-station-samples/1` | `Vec<IslandOfIrelandStationSample>` | `upsert_station_samples_observed`, then `record_train_history` and `prune_train_history` |
+//! | `ioi-station-samples/1` | `Vec<IslandOfIrelandStationSample>` | `upsert_station_samples_observed`, then `record_train_history`, `prune_train_history` and the `island_of_ireland_station_samples_live` freshness marker |
 //! | `ioi-live-stations/1` | `Vec<IslandOfIrelandLiveStation>` | `upsert_live_stations_observed` |
 //!
 //! all in `ds_store::samples::island_of_ireland`. After a Republic of
@@ -204,6 +204,18 @@ impl SchemaHandler for StationSamples {
                 store::prune_train_history(conn, cutoff, cutoff, store::TRAIN_HISTORY_PRUNE_BATCH)
                     .await
                     .map_err(|err| classify_anyhow(&err))?;
+            // The live feed's freshness marker (DS-363): "data as of" the
+            // entry's produced_at, for DistantSignalIngestSourceStale. An
+            // empty batch says nothing about the feed, so records nothing.
+            if !samples.is_empty() {
+                ds_store::freshness::record_ingest(
+                    conn,
+                    store::sources::STATION_SAMPLES_LIVE,
+                    Some(observed.produced_at()),
+                )
+                .await
+                .map_err(|err| classify_anyhow(&err))?;
+            }
             record_history(&samples, history, pruned);
             count_apply(entry, samples.len(), written);
             Ok(Applied::All)
