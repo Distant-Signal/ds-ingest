@@ -196,13 +196,14 @@ impl SchemaHandler for StationSamples {
             let history = store::record_train_history(conn, &samples)
                 .await
                 .map_err(|err| classify_anyhow(&err))?;
-            let pruned = store::prune_train_history(
-                conn,
-                history_cutoff(chrono::Utc::now(), self.history_retention_days),
-                store::TRAIN_HISTORY_PRUNE_BATCH,
-            )
-            .await
-            .map_err(|err| classify_anyhow(&err))?;
+            // ds-core v0.4's prune takes a separate cutoff for tracked
+            // trains; until the writer tracks Irish trains they share the
+            // one window, as before.
+            let cutoff = history_cutoff(chrono::Utc::now(), self.history_retention_days);
+            let pruned =
+                store::prune_train_history(conn, cutoff, cutoff, store::TRAIN_HISTORY_PRUNE_BATCH)
+                    .await
+                    .map_err(|err| classify_anyhow(&err))?;
             record_history(&samples, history, pruned);
             count_apply(entry, samples.len(), written);
             Ok(Applied::All)
