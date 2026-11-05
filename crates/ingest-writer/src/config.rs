@@ -93,6 +93,23 @@ pub struct Config {
     #[arg(long, env = "INGEST_WRITER_CHANGED_ROWS_ONLY", default_value_t = false)]
     pub changed_rows_only: bool,
 
+    /// Days of `train_date` the Iarnród Éireann board history
+    /// (`island_of_ireland_trains`, `island_of_ireland_train_calls`) keeps,
+    /// counting back from Dublin's today, pruned as each
+    /// `ioi-station-samples/1` entry is applied. 14 is what the aggregator
+    /// keeps of an untracked GB train and its movements
+    /// (`untrackedTrainsRetentionDays`), the data this history plays the
+    /// same part as (distant-signal's
+    /// docs/superpowers/specs/2026-11-05-irish-rail-train-tracking-design.md
+    /// §4.3). At least 1, so a train running today is never pruned.
+    #[arg(
+        long,
+        env = "IOI_TRAIN_HISTORY_RETENTION_DAYS",
+        default_value_t = crate::handlers::island_of_ireland::DEFAULT_TRAIN_HISTORY_RETENTION_DAYS,
+        value_parser = clap::value_parser!(u32).range(1..=3650)
+    )]
+    pub ioi_train_history_retention_days: u32,
+
     /// An entry left pending because this writer does not know its schema
     /// version or envelope version (the producer is newer) is
     /// dead-lettered, reason `unsupported_expired`, once it is this many

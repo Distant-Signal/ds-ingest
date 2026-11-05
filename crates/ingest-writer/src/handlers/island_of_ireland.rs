@@ -6,7 +6,7 @@
 //! |---|---|---|
 //! | `ioi-stations/1` | `Vec<IslandOfIrelandStation>` | `upsert_stations_observed` |
 //! | `ioi-lines/1` | `Vec<IslandOfIrelandLineDefinition>` | `upsert_lines_observed` |
-//! | `ioi-station-samples/1` | `Vec<IslandOfIrelandStationSample>` | `upsert_station_samples_observed` |
+//! | `ioi-station-samples/1` | `Vec<IslandOfIrelandStationSample>` | `upsert_station_samples_observed`, then `record_train_history` and `prune_train_history` |
 //! | `ioi-live-stations/1` | `Vec<IslandOfIrelandLiveStation>` | `upsert_live_stations_observed` |
 //!
 //! all in `ds_store::samples::island_of_ireland`. After a Republic of
@@ -150,8 +150,33 @@ impl SchemaHandler for Lines {
     }
 }
 
-/// `ioi-station-samples/1`.
-pub struct StationSamples;
+/// [`StationSamples`]' default history window: 14 days, what the
+/// aggregator keeps of an untracked GB train and its movements.
+pub const DEFAULT_TRAIN_HISTORY_RETENTION_DAYS: u32 = 14;
+
+/// Departures the board history left out (no `Traindate`, or a train code
+/// the history refuses), by the counter's only label, `reason`.
+pub const TRAIN_HISTORY_SKIPPED_METRIC: &str = "island_of_ireland_history_skipped_departures_total";
+
+/// Departures whose `Status` is not one `train_state` knows. They are
+/// stored as sent and read as unknown; a rise means the feed has a word we
+/// should learn (design §6.2). No label: the text is the feed's.
+pub const UNRECOGNISED_STATUS_METRIC: &str = "island_of_ireland_unrecognised_status_total";
+
+/// History rows pruned past the retention window.
+pub const TRAIN_HISTORY_PRUNED_METRIC: &str = "island_of_ireland_history_pruned_rows_total";
+
+/// `ioi-station-samples/1`: the latest board per station, then, in the same
+/// transaction, the board history by train (`record_train_history`) and
+/// its prune: rows whose `train_date` is more than `history_retention_days`
+/// before Dublin's today, at most `TRAIN_HISTORY_PRUNE_BATCH` per table per
+/// entry (distant-signal's
+/// docs/superpowers/specs/2026-11-05-irish-rail-train-tracking-design.md
+/// §4). The prune runs where the history is written, so a writer whose
+/// live poller is off neither writes nor prunes anything.
+pub struct StationSamples {
+    pub history_retention_days: u32,
+}
 
 impl SchemaHandler for StationSamples {
     fn apply<'a>(
@@ -168,10 +193,68 @@ impl SchemaHandler for StationSamples {
             let written = store::upsert_station_samples_observed(conn, &samples)
                 .await
                 .map_err(|err| classify_anyhow(&err))?;
+            let history = store::record_train_history(conn, &samples)
+                .await
+                .map_err(|err| classify_anyhow(&err))?;
+            let pruned = store::prune_train_history(
+                conn,
+                history_cutoff(chrono::Utc::now(), self.history_retention_days),
+                store::TRAIN_HISTORY_PRUNE_BATCH,
+            )
+            .await
+            .map_err(|err| classify_anyhow(&err))?;
+            record_history(&samples, history, pruned);
             count_apply(entry, samples.len(), written);
             Ok(Applied::All)
         })
     }
+}
+
+/// The first `train_date` the history keeps: `retention_days` before
+/// Dublin's date at `now` (Irish trains' service dates are Dublin's).
+pub fn history_cutoff(
+    now: chrono::DateTime<chrono::Utc>,
+    retention_days: u32,
+) -> chrono::NaiveDate {
+    let today = now.with_timezone(&chrono_tz::Europe::Dublin).date_naive();
+    today - chrono::Days::new(u64::from(retention_days))
+}
+
+/// The history's counters for one entry.
+fn record_history(
+    samples: &[IslandOfIrelandStationSample],
+    history: store::TrainHistoryWrite,
+    pruned: u64,
+) {
+    if history.skipped > 0 {
+        metrics::counter!(
+            ds_runtime::metrics::metric_name(TRAIN_HISTORY_SKIPPED_METRIC),
+            "reason" => "no_train_date_or_bad_code"
+        )
+        .increment(history.skipped);
+    }
+    let unrecognised = samples
+        .iter()
+        .flat_map(|s| &s.departures)
+        .filter(|d| !common::island_of_ireland::train_state::is_known_status(&d.status))
+        .count();
+    if unrecognised > 0 {
+        metrics::counter!(ds_runtime::metrics::metric_name(UNRECOGNISED_STATUS_METRIC))
+            .increment(u64::try_from(unrecognised).unwrap_or(u64::MAX));
+    }
+    if pruned > 0 {
+        metrics::counter!(ds_runtime::metrics::metric_name(
+            TRAIN_HISTORY_PRUNED_METRIC
+        ))
+        .increment(pruned);
+    }
+    tracing::debug!(
+        trains = history.trains,
+        calls = history.calls,
+        skipped = history.skipped,
+        pruned,
+        "island-of-Ireland board history recorded"
+    );
 }
 
 /// `ioi-live-stations/1`: Iarnród Éireann's live station list, from
@@ -283,6 +366,23 @@ fn describe_unmatched(report: &LiveCodeReport) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Dublin's date, not UTC's: at 23:30 UTC in summer it is already
+    /// tomorrow in Dublin.
+    #[test]
+    fn the_history_cutoff_counts_back_from_dublins_date() {
+        let summer_night: chrono::DateTime<Utc> = "2026-07-01T23:30:00Z".parse().unwrap();
+        assert_eq!(
+            history_cutoff(summer_night, 14),
+            chrono::NaiveDate::from_ymd_opt(2026, 6, 18).unwrap()
+        );
+        let winter_night: chrono::DateTime<Utc> = "2026-12-01T23:30:00Z".parse().unwrap();
+        assert_eq!(
+            history_cutoff(winter_night, 14),
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 17).unwrap()
+        );
+    }
+
     use chrono::Utc;
     use ingest_stream::{Envelope, SchemaId};
 

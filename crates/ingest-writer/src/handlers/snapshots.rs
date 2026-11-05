@@ -67,11 +67,25 @@ use super::{Applied, BoxFuture, SchemaHandler, apply_batch, classify_anyhow, dec
 use crate::observed::{Observed, derived_guard, guard};
 
 /// The handlers' settings, from the writer's configuration.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct Options {
     /// `INGEST_WRITER_CHANGED_ROWS_ONLY` (plan 3a.9). **Off by default**:
     /// every handler writes as the api route does.
     pub changed_rows_only: bool,
+    /// `IOI_TRAIN_HISTORY_RETENTION_DAYS`: how many days of `train_date` the
+    /// `ioi-station-samples/1` handler keeps in the Irish board history
+    /// ([`super::island_of_ireland::StationSamples`]).
+    pub ioi_train_history_retention_days: u32,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            changed_rows_only: false,
+            ioi_train_history_retention_days:
+                super::island_of_ireland::DEFAULT_TRAIN_HISTORY_RETENTION_DAYS,
+        }
+    }
 }
 
 /// Writes a batch of rows (already given their observed times) on the

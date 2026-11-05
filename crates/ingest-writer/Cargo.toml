@@ -28,6 +28,8 @@ path = "src/bin/writer_maintenance.rs"
 anyhow = "1.0.102"
 # The reconciliation sweep's grace period (`chrono::Duration`).
 chrono = "0.4.44"
+# Dublin's date, for the Irish board history's retention cutoff.
+chrono-tz = "0.10"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 # `redis`: the bounded Redis connection and the ACL-user URL for the stream
 # consumers (plan 3a.3).

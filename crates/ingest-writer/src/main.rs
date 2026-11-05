@@ -137,6 +137,7 @@ fn start_streams(
     let registry =
         ingest_writer::handlers::registry_with(ingest_writer::handlers::snapshots::Options {
             changed_rows_only: config.changed_rows_only,
+            ioi_train_history_retention_days: config.ioi_train_history_retention_days,
         });
     if config.changed_rows_only {
         tracing::info!(
