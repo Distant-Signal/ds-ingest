@@ -716,6 +716,7 @@ async fn full_coverage_window_stats_apply_once_in_order_clamped_with_freshness()
 fn changed_rows_only() -> ingest_writer::handlers::snapshots::Options {
     ingest_writer::handlers::snapshots::Options {
         changed_rows_only: true,
+        ..Default::default()
     }
 }
 

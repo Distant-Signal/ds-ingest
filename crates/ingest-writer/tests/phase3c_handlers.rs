@@ -149,6 +149,8 @@ impl Db {
             "DELETE FROM island_of_ireland_lines WHERE id LIKE 'TEST-3C-%' AND $1 <> ''",
             "DELETE FROM island_of_ireland_station_samples WHERE station_id LIKE 'TEST-3C-%' AND $1 <> ''",
             "DELETE FROM island_of_ireland_live_stations WHERE code LIKE 'TEST-3C-%' AND $1 <> ''",
+            "DELETE FROM island_of_ireland_train_calls WHERE train_code LIKE 'Z3C%' AND $1 <> ''",
+            "DELETE FROM island_of_ireland_trains WHERE train_code LIKE 'Z3C%' AND $1 <> ''",
         ] {
             sqlx::query(sql)
                 .bind(&self.prefix)
@@ -573,6 +575,94 @@ async fn island_of_ireland_schemas_are_applied_under_the_guard() {
     assert_eq!(polled_at(&db).await, t0, "the older sample changed nothing");
     db.applied(&ahead).await;
     assert!(polled_at(&db).await <= Utc::now() + TimeDelta::minutes(2));
+    db.cleanup().await;
+}
+
+/// `ioi-station-samples/1` also records the board history by train, as
+/// the writer role, and prunes what is older than the retention window
+/// (14 days by default) in the same transaction.
+#[tokio::test]
+#[ignore = "requires a live database (DATABASE_URL)"]
+async fn island_of_ireland_samples_record_and_prune_the_train_history() {
+    let db = Db::new().await;
+    db.cleanup().await;
+    let live = "ds:ingest:ioi-live";
+    let t0 = at_millis(Utc::now() - TimeDelta::minutes(20));
+    let today = ingest_writer::handlers::island_of_ireland::history_cutoff(Utc::now(), 0);
+    let expired = today - chrono::Days::new(15);
+    for sql in [
+        "INSERT INTO island_of_ireland_trains (network, train_code, train_date, origin, \
+         destination, status, first_seen_at, last_seen_at, changed_at) VALUES \
+         ('republic-of-ireland', 'Z3C2', $1, 'A', 'B', 'En Route', now(), now(), now())",
+        "INSERT INTO island_of_ireland_train_calls (network, train_code, train_date, \
+         station_code, first_seen_at, changed_at) VALUES \
+         ('republic-of-ireland', 'Z3C2', $1, 'TEST-3C-OLD', now(), now())",
+    ] {
+        sqlx::query(sql)
+            .bind(expired)
+            .execute(&db.admin)
+            .await
+            .unwrap();
+    }
+
+    let departure = common::island_of_ireland::IslandOfIrelandDeparture {
+        train_code: "Z3C1".into(),
+        origin: "Dublin Connolly".into(),
+        destination: "Belfast".into(),
+        scheduled_arrival: Some("00:00".into()),
+        scheduled_departure: Some("15:50".into()),
+        expected_arrival: Some("00:00".into()),
+        expected_departure: Some("15:54".into()),
+        late_minutes: 4,
+        status: "En Route".into(),
+        due_in_minutes: Some(3),
+        train_date: Some(today),
+        origin_time: Some("15:50".into()),
+        destination_time: Some("17:58".into()),
+        last_location: Some("Departed Dublin Connolly".into()),
+    };
+    let sample = IslandOfIrelandStationSample {
+        station_id: "TEST-3C-HIST".into(),
+        network: IslandOfIrelandNetwork::RepublicOfIreland,
+        polled_at: t0,
+        departures: vec![departure],
+    };
+    let entry = db.entry(live, "ioi-station-samples", "hist", t0, &[sample]);
+    db.applied(&entry).await;
+
+    let train: (String, Option<i32>, Option<String>, DateTime<Utc>) = sqlx::query_as(
+        "SELECT status, late_minutes, last_location, last_seen_at \
+         FROM island_of_ireland_trains WHERE train_code = 'Z3C1' AND train_date = $1",
+    )
+    .bind(today)
+    .fetch_one(&db.admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        train,
+        (
+            "En Route".into(),
+            Some(4),
+            Some("Departed Dublin Connolly".into()),
+            t0
+        )
+    );
+    let call: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT scheduled_arrival, expected_departure FROM island_of_ireland_train_calls \
+         WHERE train_code = 'Z3C1' AND station_code = 'TEST-3C-HIST'",
+    )
+    .fetch_one(&db.admin)
+    .await
+    .unwrap();
+    assert_eq!(call, (None, Some("15:54".into())));
+    let expired_left: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM island_of_ireland_trains WHERE train_code = 'Z3C2') \
+              + (SELECT COUNT(*) FROM island_of_ireland_train_calls WHERE train_code = 'Z3C2')",
+    )
+    .fetch_one(&db.admin)
+    .await
+    .unwrap();
+    assert_eq!(expired_left, 0, "rows past the 14-day window are pruned");
     db.cleanup().await;
 }
 
