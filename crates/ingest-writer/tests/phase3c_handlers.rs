@@ -24,8 +24,8 @@ use std::sync::Arc;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use common::island_of_ireland::{
-    IslandOfIrelandLineDefinition, IslandOfIrelandNetwork, IslandOfIrelandStation,
-    IslandOfIrelandStationSample,
+    IslandOfIrelandLineDefinition, IslandOfIrelandLiveStation, IslandOfIrelandNetwork,
+    IslandOfIrelandStation, IslandOfIrelandStationSample,
 };
 use common::{LineStatus, LineStatusReport, TocReference};
 use ingest_stream::{Envelope, Handled, Handler, HandlerError, SchemaId, StreamEntry};
@@ -148,6 +148,7 @@ impl Db {
             "DELETE FROM island_of_ireland_stations WHERE id LIKE 'TEST-3C-%' AND $1 <> ''",
             "DELETE FROM island_of_ireland_lines WHERE id LIKE 'TEST-3C-%' AND $1 <> ''",
             "DELETE FROM island_of_ireland_station_samples WHERE station_id LIKE 'TEST-3C-%' AND $1 <> ''",
+            "DELETE FROM island_of_ireland_live_stations WHERE code LIKE 'TEST-3C-%' AND $1 <> ''",
         ] {
             sqlx::query(sql)
                 .bind(&self.prefix)
@@ -155,6 +156,21 @@ impl Db {
                 .await
                 .unwrap_or_else(|err| panic!("{sql}: {err}"));
         }
+    }
+}
+
+/// A line with every optional field empty, for `..test_line()`.
+fn test_line() -> IslandOfIrelandLineDefinition {
+    IslandOfIrelandLineDefinition {
+        id: String::new(),
+        name: String::new(),
+        network: IslandOfIrelandNetwork::RepublicOfIreland,
+        stations: vec![],
+        short_name: None,
+        agency: None,
+        color: None,
+        text_color: None,
+        replaces: vec![],
     }
 }
 
@@ -448,6 +464,7 @@ async fn tocs_rows_are_counted_written_then_skipped() {
 /// time, and an older sample never overwrites a newer one.
 #[tokio::test]
 #[ignore = "requires a live database (DATABASE_URL)"]
+#[expect(clippy::too_many_lines, reason = "one end-to-end scenario")]
 async fn island_of_ireland_schemas_are_applied_under_the_guard() {
     let db = Db::new().await;
     db.cleanup().await;
@@ -464,6 +481,7 @@ async fn island_of_ireland_schemas_are_applied_under_the_guard() {
         network: IslandOfIrelandNetwork::NorthernIreland,
         latitude: Some(54.6),
         longitude: Some(-5.9),
+        raw_name: None,
     };
     let new_stations = db.entry(stream, "ioi-stations", "stn-new", t0, &[station("New")]);
     assert!(matches!(
@@ -503,6 +521,7 @@ async fn island_of_ireland_schemas_are_applied_under_the_guard() {
         name: "Test line".into(),
         network: IslandOfIrelandNetwork::NorthernIreland,
         stations: vec!["TEST-3C-STN".into()],
+        ..test_line()
     }];
     let lines_entry = db.entry(stream, "ioi-lines", "lines", t0, &lines);
     db.applied(&lines_entry).await;
@@ -573,6 +592,7 @@ async fn island_of_ireland_catalogues_are_pinned_to_their_streams_network() {
         network,
         latitude: None,
         longitude: None,
+        raw_name: None,
     };
     let row = |db: &Db, id: &'static str| {
         let pool = db.pool.clone();
@@ -639,6 +659,7 @@ async fn island_of_ireland_catalogues_are_pinned_to_their_streams_network() {
             name: "Forged line".into(),
             network: IslandOfIrelandNetwork::RepublicOfIreland,
             stations: vec![],
+            ..test_line()
         }],
     );
     poison(db.apply(&lines).await);
@@ -664,5 +685,134 @@ async fn island_of_ireland_catalogues_are_pinned_to_their_streams_network() {
         .execute(&db.admin)
         .await
         .unwrap();
+    db.cleanup().await;
+}
+
+/// `ioi-live-stations/1` on poller-irish-rail-live's stream is applied and
+/// joins the GTFS catalogue to the live codes, whichever side arrives
+/// last; a merged corridor deletes the directional rows it replaces.
+#[tokio::test]
+#[ignore = "requires a live database (DATABASE_URL)"]
+#[expect(clippy::too_many_lines, reason = "one end-to-end scenario")]
+async fn live_stations_join_the_catalogue_and_merged_lines_replace_directions() {
+    let db = Db::new().await;
+    db.cleanup().await;
+    let gtfs = "ds:ingest:ioi-gtfs";
+    let live = "ds:ingest:ioi-live";
+    let t0 = at_millis(Utc::now() - TimeDelta::minutes(20));
+    let station = |id: &str, name: &str, lat: f64| IslandOfIrelandStation {
+        id: id.into(),
+        name: name.into(),
+        network: IslandOfIrelandNetwork::RepublicOfIreland,
+        latitude: Some(lat),
+        longitude: Some(-6.0),
+        raw_name: None,
+    };
+    let code = |db: &Db, id: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT live_code FROM island_of_ireland_stations WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    // The catalogue first: no live list yet, so no codes.
+    db.applied(&db.entry(
+        gtfs,
+        "ioi-stations",
+        "lc-stations",
+        t0,
+        &[
+            station("TEST-3C-ZST", "Zesttown Kent", 53.0),
+            station("TEST-3C-ZRH", "Zorough", 53.2),
+        ],
+    ))
+    .await;
+    assert_eq!(code(&db, "TEST-3C-ZST").await, None);
+
+    // Then the live list (also refused on any other stream).
+    let list = [
+        IslandOfIrelandLiveStation {
+            code: "TEST-3C-ZESTN".into(),
+            name: "Zesttown".into(),
+            alias: None,
+            latitude: Some(53.0004),
+            longitude: Some(-6.0),
+        },
+        IslandOfIrelandLiveStation {
+            code: "TEST-3C-ZORGH".into(),
+            name: "Zorough".into(),
+            alias: None,
+            latitude: Some(53.2),
+            longitude: Some(-6.0),
+        },
+    ];
+    assert!(matches!(
+        db.apply(&db.entry(gtfs, "ioi-live-stations", "lc-wrong", t0, &list))
+            .await,
+        Err(HandlerError::Poison(_))
+    ));
+    db.applied(&db.entry(live, "ioi-live-stations", "lc-live", t0, &list))
+        .await;
+    assert_eq!(
+        code(&db, "TEST-3C-ZST").await.as_deref(),
+        Some("TEST-3C-ZESTN")
+    );
+    assert_eq!(
+        code(&db, "TEST-3C-ZRH").await.as_deref(),
+        Some("TEST-3C-ZORGH")
+    );
+
+    // A new catalogue station is matched as its snapshot lands.
+    db.applied(&db.entry(
+        gtfs,
+        "ioi-stations",
+        "lc-stations-2",
+        t0 + TimeDelta::minutes(1),
+        &[station("TEST-3C-ZR2", "Zorough", 53.2001)],
+    ))
+    .await;
+    assert_eq!(
+        code(&db, "TEST-3C-ZR2").await.as_deref(),
+        Some("TEST-3C-ZORGH")
+    );
+
+    // The directional rows, then the merged corridor that replaces them.
+    let directional = ["TEST-3C-DIR-I", "TEST-3C-DIR-O"].map(|id| IslandOfIrelandLineDefinition {
+        id: id.into(),
+        name: id.into(),
+        stations: vec!["TEST-3C-ZST".into()],
+        ..test_line()
+    });
+    db.applied(&db.entry(gtfs, "ioi-lines", "lc-lines", t0, &directional))
+        .await;
+    let merged = [IslandOfIrelandLineDefinition {
+        id: "TEST-3C-DIR".into(),
+        name: "Zesttown - Zorough".into(),
+        stations: vec!["TEST-3C-ZST".into(), "TEST-3C-ZRH".into()],
+        color: Some("#00A651".into()),
+        replaces: vec!["TEST-3C-DIR-O".into(), "TEST-3C-DIR-I".into()],
+        ..test_line()
+    }];
+    db.applied(&db.entry(
+        gtfs,
+        "ioi-lines",
+        "lc-lines-2",
+        t0 + TimeDelta::minutes(1),
+        &merged,
+    ))
+    .await;
+    let lines: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT id, color FROM island_of_ireland_lines WHERE id LIKE 'TEST-3C-DIR%' ORDER BY id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(lines, [("TEST-3C-DIR".into(), Some("#00A651".into()))]);
     db.cleanup().await;
 }
