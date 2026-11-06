@@ -151,6 +151,9 @@ impl Db {
             "DELETE FROM island_of_ireland_live_stations WHERE code LIKE 'TEST-3C-%' AND $1 <> ''",
             "DELETE FROM island_of_ireland_train_calls WHERE train_code LIKE 'Z3C%' AND $1 <> ''",
             "DELETE FROM island_of_ireland_trains WHERE train_code LIKE 'Z3C%' AND $1 <> ''",
+            "DELETE FROM train_subscriptions WHERE user_id = 'test-3c-ioi-user' AND $1 <> ''",
+            "DELETE FROM users WHERE id = 'test-3c-ioi-user' AND $1 <> ''",
+            "DELETE FROM trains WHERE train_uid LIKE 'ie:Z3C%' AND $1 <> ''",
         ] {
             sqlx::query(sql)
                 .bind(&self.prefix)
@@ -684,6 +687,151 @@ async fn island_of_ireland_samples_record_and_prune_the_train_history() {
     .await
     .unwrap();
     assert_eq!(expired_left, 0, "rows past the 14-day window are pruned");
+    db.cleanup().await;
+}
+
+/// `ioi-station-samples/1` derives a tracked Iarnród Éireann train's
+/// `train_current_state` and queues one notifier signal, as the writer
+/// role; an untracked train gets no state; and a tracked train's history
+/// outlives the 14-day window (kept to 30 days) while an untracked one's
+/// doesn't (distant-signal's
+/// docs/superpowers/specs/2026-11-05-irish-rail-train-tracking-design.md
+/// §4.2, §4.3).
+#[tokio::test]
+#[ignore = "requires a live database (DATABASE_URL)"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario: seed, apply, read back"
+)]
+async fn island_of_ireland_samples_derive_tracked_state_and_keep_tracked_history() {
+    let db = Db::new().await;
+    db.cleanup().await;
+    let live = "ds:ingest:ioi-live";
+    let t0 = at_millis(Utc::now() - TimeDelta::minutes(2));
+    let today = ingest_writer::handlers::island_of_ireland::history_cutoff(Utc::now(), 0);
+    let expired = today - chrono::Days::new(15);
+
+    // Two trains 15 days old: Z3C5 tracked, Z3C6 not.
+    sqlx::query("INSERT INTO users (id, name) VALUES ('test-3c-ioi-user', 'test')")
+        .execute(&db.admin)
+        .await
+        .unwrap();
+    for code in ["Z3C5", "Z3C6"] {
+        for sql in [
+            "INSERT INTO island_of_ireland_trains (network, train_code, train_date, origin, \
+             destination, status, first_seen_at, last_seen_at, changed_at) VALUES \
+             ('republic-of-ireland', $2, $1, 'A', 'B', 'En Route', now(), now(), now())",
+            "INSERT INTO island_of_ireland_train_calls (network, train_code, train_date, \
+             station_code, first_seen_at, changed_at) VALUES \
+             ('republic-of-ireland', $2, $1, 'TEST-3C-OLD', now(), now())",
+        ] {
+            sqlx::query(sql)
+                .bind(expired)
+                .bind(code)
+                .execute(&db.admin)
+                .await
+                .unwrap();
+        }
+    }
+    let track = |uid: &'static str, date: chrono::NaiveDate| {
+        let admin = db.admin.clone();
+        async move {
+            let trains_id: i64 = sqlx::query_scalar(
+                "INSERT INTO trains (train_uid, service_date) VALUES ($1, $2) RETURNING id",
+            )
+            .bind(uid)
+            .bind(date)
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO train_subscriptions (user_id, service_date, trains_id, \
+                 resolution_status, pin_origin_ref) \
+                 VALUES ('test-3c-ioi-user', $1, $2, 'resolved', 'ie:CNLLY')",
+            )
+            .bind(date)
+            .bind(trains_id)
+            .execute(&admin)
+            .await
+            .unwrap();
+            trains_id
+        }
+    };
+    track("ie:Z3C5", expired).await;
+    let tracked = track("ie:Z3C3", today).await;
+
+    let departure = |code: &str| common::island_of_ireland::IslandOfIrelandDeparture {
+        train_code: code.into(),
+        origin: "Dublin Connolly".into(),
+        destination: "Belfast".into(),
+        scheduled_arrival: Some("16:40".into()),
+        scheduled_departure: Some("16:41".into()),
+        expected_arrival: Some("16:56".into()),
+        expected_departure: Some("16:57".into()),
+        late_minutes: 16,
+        status: "En Route".into(),
+        due_in_minutes: Some(3),
+        train_date: Some(today),
+        origin_time: Some("15:50".into()),
+        destination_time: Some("17:58".into()),
+        last_location: Some("Departed Drogheda".into()),
+    };
+    let sample = IslandOfIrelandStationSample {
+        station_id: "TEST-3C-TRK".into(),
+        network: IslandOfIrelandNetwork::RepublicOfIreland,
+        polled_at: t0,
+        departures: vec![departure("Z3C3"), departure("Z3C4")],
+    };
+    let entry = db.entry(live, "ioi-station-samples", "tracked", t0, &[sample]);
+    db.applied(&entry).await;
+
+    let state: (String, Option<i32>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT status, delay_minutes, last_reported_location, last_event_type \
+         FROM train_current_state WHERE trains_id = $1",
+    )
+    .bind(tracked)
+    .fetch_one(&db.admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        state,
+        (
+            "en_route".into(),
+            Some(16),
+            Some("Drogheda".into()),
+            Some("DEPARTURE".into())
+        )
+    );
+    let signals: Vec<String> =
+        sqlx::query_scalar("SELECT dedup_key FROM notifier_forward_queue WHERE trains_id = $1")
+            .bind(tracked)
+            .fetch_all(&db.admin)
+            .await
+            .unwrap();
+    assert_eq!(signals, [format!("ie:Z3C3:{today}:en_route:16")]);
+    let untracked_states: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM train_current_state cs JOIN trains t ON t.id = cs.trains_id \
+         WHERE t.train_uid = 'ie:Z3C4'",
+    )
+    .fetch_one(&db.admin)
+    .await
+    .unwrap();
+    assert_eq!(untracked_states, 0, "an untracked train gets no state");
+
+    let left: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT train_code FROM island_of_ireland_trains \
+         WHERE train_code IN ('Z3C5', 'Z3C6') \
+         UNION SELECT DISTINCT train_code FROM island_of_ireland_train_calls \
+         WHERE train_code IN ('Z3C5', 'Z3C6') ORDER BY 1",
+    )
+    .fetch_all(&db.admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        left,
+        ["Z3C5"],
+        "only the tracked train's old history is kept"
+    );
     db.cleanup().await;
 }
 

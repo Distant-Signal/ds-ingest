@@ -6,7 +6,7 @@
 //! |---|---|---|
 //! | `ioi-stations/1` | `Vec<IslandOfIrelandStation>` | `upsert_stations_observed` |
 //! | `ioi-lines/1` | `Vec<IslandOfIrelandLineDefinition>` | `upsert_lines_observed` |
-//! | `ioi-station-samples/1` | `Vec<IslandOfIrelandStationSample>` | `upsert_station_samples_observed`, then `record_train_history`, `prune_train_history` and the `island_of_ireland_station_samples_live` freshness marker |
+//! | `ioi-station-samples/1` | `Vec<IslandOfIrelandStationSample>` | `upsert_station_samples_observed`, then `record_train_history`, `tracked::derive_for_samples`, `prune_train_history` and the `island_of_ireland_station_samples_live` freshness marker |
 //! | `ioi-live-stations/1` | `Vec<IslandOfIrelandLiveStation>` | `upsert_live_stations_observed` |
 //!
 //! all in `ds_store::samples::island_of_ireland`. After a Republic of
@@ -154,6 +154,10 @@ impl SchemaHandler for Lines {
 /// aggregator keeps of an untracked GB train and its movements.
 pub const DEFAULT_TRAIN_HISTORY_RETENTION_DAYS: u32 = 14;
 
+/// [`StationSamples`]' default history window for a tracked train: 30
+/// days, what the aggregator keeps of a tracked GB train.
+pub const DEFAULT_TRACKED_TRAIN_HISTORY_RETENTION_DAYS: u32 = 30;
+
 /// Departures the board history left out (no `Traindate`, or a train code
 /// the history refuses), by the counter's only label, `reason`.
 pub const TRAIN_HISTORY_SKIPPED_METRIC: &str = "island_of_ireland_history_skipped_departures_total";
@@ -166,16 +170,30 @@ pub const UNRECOGNISED_STATUS_METRIC: &str = "island_of_ireland_unrecognised_sta
 /// History rows pruned past the retention window.
 pub const TRAIN_HISTORY_PRUNED_METRIC: &str = "island_of_ireland_history_pruned_rows_total";
 
+/// Tracked trains' `train_current_state` rows written from the boards.
+pub const TRACKED_STATES_METRIC: &str = "island_of_ireland_tracked_states_written_total";
+
 /// `ioi-station-samples/1`: the latest board per station, then, in the same
-/// transaction, the board history by train (`record_train_history`) and
-/// its prune: rows whose `train_date` is more than `history_retention_days`
-/// before Dublin's today, at most `TRAIN_HISTORY_PRUNE_BATCH` per table per
-/// entry (distant-signal's
-/// docs/superpowers/specs/2026-11-05-irish-rail-train-tracking-design.md
-/// §4). The prune runs where the history is written, so a writer whose
-/// live poller is off neither writes nor prunes anything.
+/// transaction:
+///
+/// 1. the board history by train (`record_train_history`);
+/// 2. the `train_current_state` of each tracked train (`ie:` uid) the
+///    boards showed, queueing a notifier signal when its status or delay
+///    changes (`tracked::derive_for_samples`; design §4.2 and §6);
+/// 3. the history's prune, in two tiers: a tracked train's rows once its
+///    `train_date` is more than `tracked_history_retention_days` before
+///    Dublin's today, every other train's after `history_retention_days`,
+///    at most `TRAIN_HISTORY_PRUNE_BATCH` per table per entry (§4.3);
+/// 4. the live feed's freshness marker
+///    (`island_of_ireland_station_samples_live`), for a non-empty batch.
+///
+/// (distant-signal's
+/// docs/superpowers/specs/2026-11-05-irish-rail-train-tracking-design.md.)
+/// The prune runs where the history is written, so a writer whose live
+/// poller is off neither writes nor prunes anything.
 pub struct StationSamples {
     pub history_retention_days: u32,
+    pub tracked_history_retention_days: u32,
 }
 
 impl SchemaHandler for StationSamples {
@@ -196,14 +214,18 @@ impl SchemaHandler for StationSamples {
             let history = store::record_train_history(conn, &samples)
                 .await
                 .map_err(|err| classify_anyhow(&err))?;
-            // ds-core v0.4's prune takes a separate cutoff for tracked
-            // trains; until the writer tracks Irish trains they share the
-            // one window, as before.
-            let cutoff = history_cutoff(chrono::Utc::now(), self.history_retention_days);
-            let pruned =
-                store::prune_train_history(conn, cutoff, cutoff, store::TRAIN_HISTORY_PRUNE_BATCH)
-                    .await
-                    .map_err(|err| classify_anyhow(&err))?;
+            let now = chrono::Utc::now();
+            let tracked = store::tracked::derive_for_samples(conn, &samples, now)
+                .await
+                .map_err(|err| classify_anyhow(&err))?;
+            let pruned = store::prune_train_history(
+                conn,
+                history_cutoff(now, self.history_retention_days),
+                history_cutoff(now, self.tracked_history_retention_days),
+                store::TRAIN_HISTORY_PRUNE_BATCH,
+            )
+            .await
+            .map_err(|err| classify_anyhow(&err))?;
             // The live feed's freshness marker (DS-363): "data as of" the
             // entry's produced_at, for DistantSignalIngestSourceStale. An
             // empty batch says nothing about the feed, so records nothing.
@@ -217,6 +239,7 @@ impl SchemaHandler for StationSamples {
                 .map_err(|err| classify_anyhow(&err))?;
             }
             record_history(&samples, history, pruned);
+            record_tracked(tracked);
             count_apply(entry, samples.len(), written);
             Ok(Applied::All)
         })
@@ -268,6 +291,21 @@ fn record_history(
         pruned,
         "island-of-Ireland board history recorded"
     );
+}
+
+/// The tracked-state counters for one entry.
+fn record_tracked(tracked: store::tracked::TrackedStateWrite) {
+    if tracked.states > 0 {
+        metrics::counter!(ds_runtime::metrics::metric_name(TRACKED_STATES_METRIC))
+            .increment(tracked.states);
+    }
+    if tracked.states > 0 || tracked.signals > 0 {
+        tracing::debug!(
+            states = tracked.states,
+            signals = tracked.signals,
+            "island-of-Ireland tracked train states derived"
+        );
+    }
 }
 
 /// `ioi-live-stations/1`: Iarnród Éireann's live station list, from

@@ -76,6 +76,9 @@ pub struct Options {
     /// `ioi-station-samples/1` handler keeps in the Irish board history
     /// ([`super::island_of_ireland::StationSamples`]).
     pub ioi_train_history_retention_days: u32,
+    /// `IOI_TRACKED_TRAIN_HISTORY_RETENTION_DAYS`: the same for a tracked
+    /// train.
+    pub ioi_tracked_train_history_retention_days: u32,
 }
 
 impl Default for Options {
@@ -84,6 +87,8 @@ impl Default for Options {
             changed_rows_only: false,
             ioi_train_history_retention_days:
                 super::island_of_ireland::DEFAULT_TRAIN_HISTORY_RETENTION_DAYS,
+            ioi_tracked_train_history_retention_days:
+                super::island_of_ireland::DEFAULT_TRACKED_TRAIN_HISTORY_RETENTION_DAYS,
         }
     }
 }
