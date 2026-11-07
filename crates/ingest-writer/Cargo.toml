@@ -22,8 +22,8 @@ path = "src/main.rs"
 name = "writer-maintenance"
 path = "src/bin/writer_maintenance.rs"
 
-# Every dependency is already in the workspace and Cargo.lock, at the
-# versions and features its other users take. No new crate.
+# Every dependency but tikv-jemallocator is already in the workspace and
+# Cargo.lock, at the versions and features its other users take.
 [dependencies]
 anyhow = "1.0.102"
 # The reconciliation sweep's grace period (`chrono::Duration`).
@@ -47,6 +47,10 @@ ingest-stream = { workspace = true }
 metrics = "0.24"
 redis ={ version = "1.8", features = ["tokio-comp", "connection-manager"] }
 serde = { version = "1.0.228", features = ["derive"] }
+# The global allocator (`main.rs`, DS-390): glibc malloc kept every large
+# one-off load (the CORPUS comparison) in a thread arena it never gave
+# back; jemalloc, with its background purge thread, returns it.
+tikv-jemallocator = "0.6.1"
 # `raw_value`: the payload of rejected rows for the dead-letter stream.
 serde_json = { version = "1.0.149", features = ["raw_value"] }
 sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio", "tls-native-tls"] }
