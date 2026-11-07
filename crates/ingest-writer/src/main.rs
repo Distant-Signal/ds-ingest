@@ -12,6 +12,36 @@ use clap::Parser;
 use ds_store::loops::{LockSession, LoopRunner};
 use ingest_writer::config::Config;
 
+/// jemalloc, not glibc malloc (DS-390). The writer runs on 16 tokio
+/// workers, and a large one-off job (the CORPUS crosswalk comparison reads
+/// every CORPUS row and the timetable, about 60 MiB) lands on whichever
+/// worker polls it. glibc grows that thread's arena and does not shrink it,
+/// so RSS stepped up with each run on a new thread and never came down.
+/// jemalloc purges freed pages back to the OS ([`MALLOC_CONF`]).
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// jemalloc's options, which it reads from this symbol when it starts:
+/// a background thread purges unused pages (without it, purging only
+/// happens when memory is allocated or freed, so an idle writer keeps the
+/// last job's pages). Freed pages go back to the OS about a second after a
+/// job (`dirty_decay_ms`), skipping the lazy `MADV_FREE` stage
+/// (`muzzy_decay_ms:0`), which would still count in the pod's RSS. On a
+/// synthetic CORPUS-sized load run 24 times on 16 workers, idle RSS was
+/// 125 MiB with glibc (148 MiB with `MALLOC_ARENA_MAX=2`) and 10 MiB with
+/// this, and peak RSS 151 MiB against 81 MiB. `_RJEM_MALLOC_CONF` in the
+/// environment still overrides it.
+#[expect(
+    unsafe_code,
+    reason = "jemalloc reads its options from an exported C symbol"
+)]
+// SAFETY: a NUL-terminated byte string with 'static lifetime that nothing
+// writes; jemalloc only reads it, as the `const char *` its
+// `_rjem_malloc_conf` (tikv-jemalloc-sys' prefixed `malloc_conf`) is. No
+// other symbol in the binary has this name.
+#[unsafe(export_name = "_rjem_malloc_conf")]
+static MALLOC_CONF: &[u8; 60] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+
 const APPLICATION_NAME: &str = "distant-signal-ingest-writer";
 /// The lock session's `pg_stat_activity.application_name`, so whoever holds
 /// a loop lock is visible beside `pg_locks`.
