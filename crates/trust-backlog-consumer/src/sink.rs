@@ -21,7 +21,7 @@ use sqlx::PgPool;
 
 /// What a sink's failures count as: `trust_backlog_consumer_errors_total`
 /// operations (each in `API_CALL_OPERATIONS`, so the chart's
-/// `DistantSignalConsumerApiCallsFailing` sums it) and the dead-letter
+/// `DistantSignalConsumerDbCallsFailing` sums it) and the dead-letter
 /// reason of a row the write refused for a data error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Operations {

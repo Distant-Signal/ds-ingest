@@ -140,9 +140,13 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// (`RawKafkaSource::close`) may take before the process exits anyway.
 /// Both are blocking librdkafka calls, so they run on their own thread.
 ///
+/// It includes the wait for held offsets to become durable
+/// (`kafka_source::CLOSE_DURABILITY_WAIT_MAX`, 15 s at most; the default
+/// `--kafka-commit-delay-secs` is 10).
+///
 /// The pod's `terminationGracePeriodSeconds` must exceed
-/// `DRAIN_TIMEOUT + CLOSE_TIMEOUT` (25 s) with room to spare: 45.
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
+/// `DRAIN_TIMEOUT + CLOSE_TIMEOUT` (35 s) with room to spare: 45.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// Why [`relay_until_shutdown`] returned.
 #[derive(Debug, PartialEq, Eq)]

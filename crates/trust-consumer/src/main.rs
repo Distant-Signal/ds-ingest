@@ -45,7 +45,7 @@ fn register_parse_envelope_counters() {
 /// Every `trust_consumer_errors_total` operation that is a failed read or
 /// a failed DB write (not a data rejection, which is `post_rejected`),
 /// registered at 0 and summed by the chart's
-/// `DistantSignalConsumerApiCallsFailing` alert (2026-10-01: ~23.6k failed
+/// `DistantSignalConsumerDbCallsFailing` alert (2026-10-01: ~23.6k failed
 /// tracked-trains reloads raised nothing). `db_write` is the sink's
 /// (ingest architecture plan 3b.4; `sink::Operations`). Release B (ingest
 /// phase 5) removed the HTTP sink's `post_train_events`. The chart's
@@ -77,7 +77,7 @@ fn config_defaults() -> ds_runtime::service_args::ConfigDefaults {
             Some(&ds_store::corpus::parse_fallback_flag(None).unwrap_or_default().to_string()),
         )
         .db_role(ds_store::schema::DbRole::TrustConsumer.key())
-        // The chart's DistantSignalConsumerApiCallsFailing sums exactly these.
+        // The chart's DistantSignalConsumerDbCallsFailing sums exactly these.
         .contract("api_call_operations", API_CALL_OPERATIONS.to_vec())
 }
 
@@ -167,12 +167,14 @@ async fn run() -> anyhow::Result<()> {
     let mut state = process::ProcessorState::new(config.trust_timestamp_correction_enabled);
 
     // PL-11: nothing is read from the feed until the first reference load
-    // has succeeded. Consuming with the empty `Reference` above matched
-    // nothing and XACKed everything, so after a reboot (api and the SSO
-    // token endpoint usually come up after the consumers) every movement in
-    // the first `reference_reload_secs` -- an origin DEPARTURE for a pinned
-    // train among them -- was lost from the live path. Retried on a short,
-    // doubling backoff rather than the 60s reload interval.
+    // (the tracked trains, read from Postgres) has succeeded. Consuming
+    // with the empty `Reference` above matches nothing and XACKs
+    // everything, so a consumer that came up before its reference source
+    // (it once read it from the api, which usually came up later after a
+    // reboot) lost every movement in the first `reference_reload_secs` --
+    // an origin DEPARTURE for a pinned train among them -- from the live
+    // path. Retried on a short, doubling backoff rather than the 60s
+    // reload interval.
     let refs = load_reference_until_ok(
         async || reads.tracked_trains().await,
         STARTUP_RETRY_MIN,

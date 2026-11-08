@@ -34,7 +34,7 @@ use sink::{BacklogSink, DbSink, Operations};
 /// Every `trust_backlog_consumer_errors_total` operation that is a failed
 /// write or read through the sink (not a data rejection, which is
 /// `post_rejected`), registered at 0 and summed by the chart's
-/// `DistantSignalConsumerApiCallsFailing` alert (2026-10-01: ~2,200 failed
+/// `DistantSignalConsumerDbCallsFailing` alert (2026-10-01: ~2,200 failed
 /// backlog POSTs raised nothing). `db_*` are the sink's (ingest
 /// architecture plan 3b.2; `sink::Operations`); the HTTP sink's `post_*`
 /// went in release B. The chart's template lists the same operations; a
@@ -55,7 +55,7 @@ fn config_defaults() -> ds_runtime::service_args::ConfigDefaults {
             Some(&ds_store::corpus::parse_fallback_flag(None).unwrap_or_default().to_string()),
         )
         .db_role(ds_store::schema::DbRole::TrustBacklog.key())
-        // The chart's DistantSignalConsumerApiCallsFailing sums exactly these.
+        // The chart's DistantSignalConsumerDbCallsFailing sums exactly these.
         .contract("api_call_operations", API_CALL_OPERATIONS.to_vec())
 }
 

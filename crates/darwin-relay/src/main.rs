@@ -127,6 +127,7 @@ async fn run() -> anyhow::Result<()> {
         }
     };
     tracing::info!("darwin-relay stopping; an uncommitted batch is re-read on the next start");
+    source.finish().await;
     producer
         .shutdown(producer_task, Duration::from_secs(10))
         .await;

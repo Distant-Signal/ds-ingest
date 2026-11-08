@@ -28,7 +28,7 @@ use crate::process;
 
 /// What a sink's failures count as: the `trust_consumer_errors_total`
 /// operation of a failed write (in `API_CALL_OPERATIONS`, so the chart's
-/// `DistantSignalConsumerApiCallsFailing` sums it) and the dead-letter
+/// `DistantSignalConsumerDbCallsFailing` sums it) and the dead-letter
 /// reason of an event the write refused for a data error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Operations {

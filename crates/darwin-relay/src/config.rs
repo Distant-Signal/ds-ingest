@@ -74,6 +74,19 @@ pub(crate) struct Config {
     /// ... or once it holds this many records, whichever comes first.
     #[arg(long, env, default_value_t = 5000)]
     pub batch_max_records: usize,
+    /// How long a published batch is held before its Kafka offsets are
+    /// committed: Redis fsyncs its AOF about once a second
+    /// (`appendfsync everysec`), so offsets committed as soon as the write
+    /// returns can cover a batch a hard crash then loses. A relay crash
+    /// re-reads up to this much, which the writer's Darwin timestamp guards
+    /// absorb. 0 commits at once. See `durable_offsets`.
+    #[arg(
+        long,
+        env,
+        default_value_t = durable_offsets::DEFAULT_DELAY_SECS,
+        value_parser = durable_offsets::parse_delay_secs
+    )]
+    pub kafka_commit_delay_secs: u64,
 
     #[command(flatten)]
     pub health: ds_runtime::service_args::HealthArgs,
@@ -135,6 +148,17 @@ mod tests {
         assert_eq!(config.kafka_auto_offset_reset, "latest");
         assert_eq!(config.batch_max_secs, 30);
         assert!(config.sasl_credentials().is_none());
+    }
+
+    /// Offsets wait for the AOF fsync (several `everysec` intervals) unless
+    /// an operator turns the hold off.
+    #[test]
+    fn commits_are_held_for_the_fsync_window_by_default() {
+        assert_eq!(parse(&[]).kafka_commit_delay_secs, 10);
+        assert_eq!(
+            parse(&["--kafka-commit-delay-secs", "0"]).kafka_commit_delay_secs,
+            0
+        );
     }
 
     #[test]

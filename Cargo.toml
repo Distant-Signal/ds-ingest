@@ -8,6 +8,7 @@ members = [
     "crates/ingest-writer",
     "crates/movement-relay",
     "crates/darwin-relay",
+    "crates/durable-offsets",
     "crates/trust-consumer",
     "crates/trust-backlog-consumer",
     "crates/full-coverage-consumer",

@@ -27,9 +27,12 @@ RDM Push Port JSON topic (Kafka, SASL_SSL)
   `bytes` may be base64. It keeps `schedule`, `TS`, `association` and
   `deactivated` from each update (`uR`, and a snapshot's `sR`), merges up
   to 30 seconds of them so each key appears once, and produces one entry.
-  Offsets are committed only once Redis has the entry: a restart re-reads
-  at most one batch, and every stored row is guarded by its Darwin
-  timestamp, so a duplicate changes nothing. A record that cannot be
+  Offsets are committed only once Redis has the entry, and then only once
+  that write is `KAFKA_COMMIT_DELAY_SECS` (10) old: Redis fsyncs its AOF
+  about once a second, so an entry it has acknowledged can still be lost to
+  a hard crash for a second or two (`crates/durable-offsets`). A restart
+  re-reads the batch in flight and those still held, and every stored row
+  is guarded by its Darwin timestamp, so a duplicate changes nothing. A record that cannot be
   decoded is logged, counted and skipped. Unlike movement-relay it rolls
   out with `Recreate`: the topic has one partition, so a surge pod can
   wait forever for the assignment the old pod holds (build 833's stalled

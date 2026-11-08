@@ -113,7 +113,7 @@ fn config_defaults() -> ds_runtime::service_args::ConfigDefaults {
             Some(&ds_store::corpus::parse_fallback_flag(None).unwrap_or_default().to_string()),
         )
         .db_role(ds_store::schema::DbRole::FullCoverageRo.key())
-        // The chart's DistantSignalConsumerApiCallsFailing sums exactly these.
+        // The chart's DistantSignalConsumerDbCallsFailing sums exactly these.
         .contract("api_call_operations", API_CALL_OPERATIONS.to_vec())
 }
 
@@ -401,7 +401,7 @@ async fn run() -> anyhow::Result<()> {
 /// running).
 /// Every `full_coverage_consumer_errors_total` operation that is a failed
 /// read, registered at 0 and summed by the chart's
-/// `DistantSignalConsumerApiCallsFailing` alert (2026-10-01: ~516k failed
+/// `DistantSignalConsumerDbCallsFailing` alert (2026-10-01: ~516k failed
 /// population reloads raised nothing). Release B (ingest phase 5) removed
 /// the HTTP sink's `post_line_stats`, `post_station_samples` and
 /// `post_window_stats`: the stats go to the stream, whose failures
@@ -435,7 +435,7 @@ fn init_metrics() {
         )
         .increment(0);
     }
-    // DistantSignalConsumerApiCallsFailing.
+    // DistantSignalConsumerDbCallsFailing.
     ds_runtime::metrics::register_operation_counters(
         "full_coverage_consumer_errors_total",
         API_CALL_OPERATIONS,

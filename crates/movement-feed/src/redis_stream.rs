@@ -319,7 +319,20 @@ impl RedisStreamMovementFeed {
         let mut conn = ds_runtime::redis_conn::connect(client).await?;
         let group = group.into();
 
-        ensure_group(&mut conn, stream, &group, "$").await?;
+        // A group missing at startup is created at `0`, the stream's
+        // first retained entry, never at `$`: a consumer started after
+        // Redis lost its groups (or before movement-relay's D2 creation
+        // ran) would otherwise skip everything published in between.
+        // Replaying what the stream retains is duplicates at worst, which
+        // every consumer absorbs by its dedup key.
+        if ensure_group(&mut conn, stream, &group, STARTUP_START_ID).await? {
+            tracing::warn!(
+                stream,
+                group = %group,
+                "the consumer group was missing at startup; created it at the stream's first \
+                 entry, so every retained entry is read (duplicates are absorbed by the dedup key)"
+            );
+        }
         let last_delivered_id = seed_last_delivered_id(&mut conn, stream, &group).await;
 
         // Register the dead-letter counters at 0 for this group, so the
@@ -628,19 +641,25 @@ impl DeadLetterSink for RedisStreamMovementFeed {
     }
 }
 
+/// Where a group missing at startup is created: the stream's first entry
+/// (see `connect_to_stream`).
+const STARTUP_START_ID: &str = "0";
+
 /// Idempotent group creation, `MKSTREAM`-backed -- verbatim in spirit from
 /// `crates/enricher/src/stream.rs::ensure_group`, generalized over the
 /// stream/group name (this crate serves two different group names -- and,
 /// in tests, many different stream names -- from one implementation,
 /// unlike enricher's single hardcoded `STREAM`/`GROUP`). A new group starts
-/// after `start_id`: `$` (the stream's tail) at startup, see
-/// [`recreate_start_id`] after `NOGROUP`.
+/// after `start_id`: [`STARTUP_START_ID`] at startup, see
+/// [`recreate_start_id`] after `NOGROUP`. Returns whether the group was
+/// created (`false`: it already existed, `BUSYGROUP`, and keeps its
+/// position).
 async fn ensure_group(
     conn: &mut RedisConn,
     stream: &str,
     group: &str,
     start_id: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let result: redis::RedisResult<()> = redis::cmd("XGROUP")
         .arg("CREATE")
         .arg(stream)
@@ -651,8 +670,8 @@ async fn ensure_group(
         .await;
 
     match result {
-        Ok(()) => Ok(()),
-        Err(err) if err.to_string().contains("BUSYGROUP") => Ok(()),
+        Ok(()) => Ok(true),
+        Err(err) if err.to_string().contains("BUSYGROUP") => Ok(false),
         Err(err) => Err(err.into()),
     }
 }
@@ -733,7 +752,10 @@ async fn stream_last_generated_id(
 ///   (as `0` would), nothing added since is skipped (as `$` would).
 ///
 /// With no `last_delivered` known (it could not be read at connect) this
-/// falls back to `$`, the stream's tail, as at startup.
+/// falls back to `0`, the stream's first retained entry, as at startup:
+/// a replay of what the stream retains is duplicates, which every consumer
+/// absorbs by its dedup key, where `$` (the tail) would silently skip
+/// whatever was added since the group was lost.
 ///
 /// Not recoverable either way: the lost group's pending-entries list.
 /// Entries delivered but not yet `ACKed` are not redelivered (after an empty
@@ -746,7 +768,7 @@ fn recreate_start_id(last_delivered: Option<&str>, stream_last_generated: Option
         return "0".to_string();
     };
     match last_delivered {
-        None => "$".to_string(),
+        None => STARTUP_START_ID.to_string(),
         Some(last) if stream_id_less_than(last_generated, last) => "0".to_string(),
         Some(last) => last.to_string(),
     }
@@ -897,9 +919,9 @@ impl MovementFeed for RedisStreamMovementFeed {
     /// recreates the group, so the next call reads again instead of every
     /// call failing `NOGROUP` until someone restarts the pod -- which
     /// `/livez` never would, since each failed cycle beats progress. It is
-    /// recreated where the lost one stood, not at the stream's tail as a
-    /// restart would, so entries added before the recreate are not skipped
-    /// (see [`recreate_start_id`]). The error is still returned, so the
+    /// recreated where the lost one stood (or, with that unknown, at the
+    /// stream's first entry), so entries added before the recreate are not
+    /// skipped (see [`recreate_start_id`]). The error is still returned, so the
     /// caller's loop backs off as for any failed read.
     ///
     /// Any other failure makes the next call first check that the group did
@@ -1712,8 +1734,9 @@ mod recreate_start_id_tests {
     }
 
     #[test]
-    fn an_unknown_position_falls_back_to_the_tail_while_the_stream_exists() {
-        assert_eq!(recreate_start_id(None, Some("250-0")), "$");
+    fn an_unknown_position_replays_the_stream_rather_than_skipping_to_its_tail() {
+        assert_eq!(recreate_start_id(None, Some("250-0")), "0");
+        assert_eq!(recreate_start_id(None, Some("0-0")), "0");
     }
 
     #[test]
@@ -3083,12 +3106,22 @@ mod redis_tests {
     #[ignore = "needs REDIS_URL"]
     async fn the_recovery_position_is_seeded_at_connect() {
         let stream = unique_stream("nogroup-seeded");
-        xadd(&stream, "old").await; // before the group: never visible to it
+        xadd(&stream, "old").await;
+        let client = redis::Client::open(redis_url()).unwrap();
+        let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
+        // The group already exists, past "old" (created at the tail): the
+        // connect keeps its position and seeds it.
+        let (): () = redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(&stream)
+            .arg("test-group")
+            .arg("$")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
         let mut feed = connect(&stream).await;
         assert!(feed.last_delivered_id.is_some());
 
-        let client = redis::Client::open(redis_url()).unwrap();
-        let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
         let _: i64 = redis::cmd("XGROUP")
             .arg("DESTROY")
             .arg(&stream)
@@ -3102,6 +3135,70 @@ mod redis_tests {
         let err = feed.next_batch().await.expect_err("the group is gone");
         assert!(is_nogroup(&err), "{err:?}");
         assert_eq!(drain(&mut feed).await, vec!["new"]);
+        cleanup(&stream).await;
+    }
+
+    /// A group missing at startup (Redis lost its groups but the relay
+    /// already published, or the group was deleted while the consumer was
+    /// down) is created at the stream's first entry, so nothing published
+    /// before the consumer started is skipped. It used to be created at
+    /// `$` and skip all of it.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn a_group_missing_at_startup_reads_the_entries_published_before_it() {
+        let stream = unique_stream("startup-missing-group");
+        xadd(&stream, "before-1").await;
+        xadd(&stream, "before-2").await;
+        let mut feed = connect(&stream).await;
+        xadd(&stream, "after").await;
+        assert_eq!(
+            drain(&mut feed).await,
+            vec!["before-1", "before-2", "after"]
+        );
+        cleanup(&stream).await;
+    }
+
+    /// An existing group keeps its position at startup: a restart does not
+    /// replay what the group already delivered.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn an_existing_group_keeps_its_position_at_startup() {
+        let stream = unique_stream("startup-existing-group");
+        xadd(&stream, "read").await;
+        let mut feed = connect(&stream).await;
+        assert_eq!(drain(&mut feed).await, vec!["read"]);
+        drop(feed);
+        xadd(&stream, "unread").await;
+        let mut feed = connect(&stream).await;
+        assert_eq!(drain(&mut feed).await, vec!["unread"]);
+        cleanup(&stream).await;
+    }
+
+    /// `NOGROUP` with no known position (`XINFO GROUPS` could not be read
+    /// at connect) recreates the group at the stream's first entry, not at
+    /// its tail: what was added since the group was lost is read, not
+    /// skipped.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn a_lost_group_with_an_unknown_position_is_recreated_at_the_start() {
+        let stream = unique_stream("nogroup-unknown-position");
+        let mut feed = connect(&stream).await;
+        feed.last_delivered_id = None;
+
+        let client = redis::Client::open(redis_url()).unwrap();
+        let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
+        let _: i64 = redis::cmd("XGROUP")
+            .arg("DESTROY")
+            .arg(&stream)
+            .arg("test-group")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        xadd(&stream, "while-lost").await;
+
+        let err = feed.next_batch().await.expect_err("the group is gone");
+        assert!(is_nogroup(&err), "{err:?}");
+        assert_eq!(drain(&mut feed).await, vec!["while-lost"]);
         cleanup(&stream).await;
     }
 }
