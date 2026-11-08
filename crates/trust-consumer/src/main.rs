@@ -167,12 +167,14 @@ async fn run() -> anyhow::Result<()> {
     let mut state = process::ProcessorState::new(config.trust_timestamp_correction_enabled);
 
     // PL-11: nothing is read from the feed until the first reference load
-    // has succeeded. Consuming with the empty `Reference` above matched
-    // nothing and XACKed everything, so after a reboot (api and the SSO
-    // token endpoint usually come up after the consumers) every movement in
-    // the first `reference_reload_secs` -- an origin DEPARTURE for a pinned
-    // train among them -- was lost from the live path. Retried on a short,
-    // doubling backoff rather than the 60s reload interval.
+    // (the tracked trains, read from Postgres) has succeeded. Consuming
+    // with the empty `Reference` above matches nothing and XACKs
+    // everything, so a consumer that came up before its reference source
+    // (it once read it from the api, which usually came up later after a
+    // reboot) lost every movement in the first `reference_reload_secs` --
+    // an origin DEPARTURE for a pinned train among them -- from the live
+    // path. Retried on a short, doubling backoff rather than the 60s
+    // reload interval.
     let refs = load_reference_until_ok(
         async || reads.tracked_trains().await,
         STARTUP_RETRY_MIN,
