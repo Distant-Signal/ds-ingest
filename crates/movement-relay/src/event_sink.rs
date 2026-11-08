@@ -98,15 +98,15 @@ fn is_oom(err: &redis::RedisError) -> bool {
 /// already exists) is success: an existing group keeps its position.
 /// Returns how many groups were newly created.
 ///
-/// **Why the relay does this (D2, 2026-09-30).** A consumer creates its
-/// own group at startup at `$`, the stream's tail
-/// (`movement_feed::redis_stream`). After Redis loses its data, the relay's
-/// next `XADD` used to recreate the stream with no groups at all; a
-/// consumer (re)started after that created its group at `$` and silently
-/// skipped everything the relay had published in between -- after an
-/// outage, a Kafka backlog drained as fast as Redis would take it. With
-/// the groups created at `0` before the first entry, no entry predates
-/// them.
+/// **Why the relay does this (D2, 2026-09-30).** After Redis loses its
+/// data, the relay's next `XADD` used to recreate the stream with no groups
+/// at all; a consumer (re)started after that created its group at `$`, the
+/// stream's tail, and silently skipped everything the relay had published
+/// in between -- after an outage, a Kafka backlog drained as fast as Redis
+/// would take it. With the groups created at `0` before the first entry,
+/// no entry predates them. (A consumer now also creates a missing group at
+/// `0`, `movement_feed::redis_stream`; this still covers a group whose
+/// consumer is down.)
 pub(crate) async fn create_groups<C: redis::aio::ConnectionLike + Send>(
     conn: &mut C,
     stream: &str,
