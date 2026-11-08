@@ -13,6 +13,7 @@ clap = { version = "4.6.6", features = ["derive", "env"] }
 common = { workspace = true, features = ["default", "redis"] }
 ds-runtime = { workspace = true, features = ["default", "redis"] }
 dotenvy = "0.15.7"
+durable-offsets = { path = "../durable-offsets" }
 health-http = { workspace = true }
 metrics = "0.24"
 rdkafka = { version = "0.39.0", features = ["cmake-build", "ssl", "sasl"] }

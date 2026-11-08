@@ -581,6 +581,7 @@ dependencies = [
  "common",
  "dotenvy",
  "ds-runtime",
+ "durable-offsets",
  "flate2",
  "health-http",
  "ingest-stream",
@@ -708,6 +709,13 @@ dependencies = [
  "once_cell",
  "os_pipe",
  "shared_child",
+]
+
+[[package]]
+name = "durable-offsets"
+version = "0.1.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]
@@ -1693,6 +1701,7 @@ dependencies = [
  "common",
  "dotenvy",
  "ds-runtime",
+ "durable-offsets",
  "health-http",
  "metrics",
  "metrics-exporter-prometheus",

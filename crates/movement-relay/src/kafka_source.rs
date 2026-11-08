@@ -20,6 +20,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use durable_offsets::DurableOffsets;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
 use rdkafka::{ClientConfig, TopicPartitionList};
@@ -57,11 +58,17 @@ pub(crate) trait RawKafkaSource: Send {
     /// `commit()` stores the right offset.
     fn retain_for_retry(&mut self, batch: Vec<String>);
 
+    /// Confirms the batch `next_batch` last returned as published in full.
+    /// Its offset is committed once its `XADD`s are durable (see
+    /// `KafkaRawSource::commit`). An `Err` leaves the batch unconfirmed: the
+    /// caller hands it back with `retain_for_retry`.
     async fn commit(&mut self) -> anyhow::Result<()>;
 
-    /// Shutdown: a SYNCHRONOUS commit of the offsets already stored (every
-    /// one belongs to a record published in full; a retained or in-flight
-    /// record never had its offset stored), then the consumer is closed so
+    /// Shutdown: waits out the durability delay of the offsets still held
+    /// (bounded), stores them, then a SYNCHRONOUS commit of the offsets
+    /// stored (every one belongs to a record published in full; a retained
+    /// or in-flight record never had its offset stored), then the consumer
+    /// is closed so
     /// it leaves the group at once instead of holding its partitions until
     /// the session timeout. Blocking: call it off the async runtime
     /// (`main::close_within`).
@@ -213,6 +220,11 @@ pub(crate) struct KafkaRawSource<C = StreamConsumer<RelayContext>> {
     /// `consumer.recv()` for the next record is idle time, not a stall: a
     /// quiet feed must never get the relay restarted.
     progress: health_http::Progress,
+    /// Offsets of records published in full, held until their `XADD`s are
+    /// durable (`durable_offsets`: Redis fsyncs its AOF about once a
+    /// second, so an acknowledged `XADD` can still be lost to a hard
+    /// crash). Only these are ever stored with librdkafka.
+    durable: DurableOffsets,
 }
 
 /// One retained-or-incidentally-received Kafka record awaiting redelivery,
@@ -243,6 +255,15 @@ const KEEPALIVE_POLL_TIMEOUT: Duration = Duration::from_millis(200);
 /// whose records `reconcile_assignment` then drops for the new owner to
 /// redeliver.
 const MAX_PENDING_RETRY: usize = 256;
+
+/// How long the idle wait for the next record backs off after a failed
+/// store or commit of durable offsets, before it tries them again.
+const FLUSH_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
+/// The longest `close` waits for held offsets to become durable before it
+/// commits what is due and leaves the rest to be re-read (duplicates).
+/// `main::CLOSE_TIMEOUT` leaves room for it.
+const CLOSE_DURABILITY_WAIT_MAX: Duration = Duration::from_secs(15);
 
 /// Worst-case time `run_cycle` can spend doing inline downstream work
 /// between one `consumer.recv()` and the next, so librdkafka's own
@@ -347,18 +368,88 @@ impl KafkaRawSource {
 
         consumer.subscribe(&[&config.kafka.kafka_topic])?;
 
-        Ok(Self::with_consumer(consumer, progress))
+        Ok(Self::with_consumer(
+            consumer,
+            progress,
+            Duration::from_secs(config.kafka_commit_delay_secs),
+        ))
     }
 }
 
 impl<C: ConsumerOps> KafkaRawSource<C> {
-    fn with_consumer(consumer: C, progress: health_http::Progress) -> Self {
+    fn with_consumer(consumer: C, progress: health_http::Progress, commit_delay: Duration) -> Self {
         Self {
             consumer,
             last_received: None,
             pending_retry: VecDeque::new(),
             paused: false,
             progress,
+            durable: DurableOffsets::new(commit_delay),
+        }
+    }
+
+    /// Stores, then commits, the held offsets that are durable at `now`
+    /// (`DurableOffsets::flush`). An offset on a partition revoked since is
+    /// skipped: the partition's new owner re-reads from the last commit
+    /// (duplicates, never a gap).
+    fn flush_durable(&mut self, now: tokio::time::Instant) -> anyhow::Result<()> {
+        let flushed = self.durable.flush(&StoreOn(&self.consumer), now)?;
+        for (topic, partition, offset) in flushed.revoked {
+            tracing::warn!(
+                topic,
+                partition,
+                offset,
+                "Kafka partition was revoked before its offset could be stored; leaving the \
+                 records to the partition's new owner"
+            );
+        }
+        Ok(())
+    }
+
+    /// [`Self::flush_durable`] where its failure must not fail the caller:
+    /// logged and counted, and the offsets are tried again later.
+    fn flush_durable_logged(&mut self) -> bool {
+        match self.flush_durable(tokio::time::Instant::now()) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::error!(error = ?err, "failed to store or commit durable Kafka offsets; retrying");
+                metrics::counter!(
+                    ds_runtime::metrics::metric_name("movement_relay_errors_total"),
+                    "operation" => "commit_offsets"
+                )
+                .increment(1);
+                false
+            }
+        }
+    }
+
+    /// The next record from Kafka, committing held offsets as they become
+    /// durable while it waits: on a quiet feed nothing else would.
+    async fn recv_flushing(&mut self) -> anyhow::Result<ReceivedRecord> {
+        /// What woke the wait.
+        enum Woke {
+            Record(anyhow::Result<ReceivedRecord>),
+            Due,
+        }
+        let mut backoff_until = None;
+        loop {
+            let wake_at = match (self.durable.next_due(), backoff_until) {
+                (None, _) => return self.progress.idle(self.consumer.recv()).await,
+                (Some(due), None) => due,
+                (Some(due), Some(until)) => due.max(until),
+            };
+            let woke = tokio::select! {
+                biased;
+                record = self.progress.idle(self.consumer.recv()) => Woke::Record(record),
+                () = tokio::time::sleep_until(wake_at) => Woke::Due,
+            };
+            match woke {
+                Woke::Record(record) => return record,
+                Woke::Due => {
+                    backoff_until = (!self.flush_durable_logged())
+                        .then(|| tokio::time::Instant::now() + FLUSH_RETRY_BACKOFF);
+                }
+            }
         }
     }
 
@@ -490,6 +581,29 @@ impl<C: ConsumerOps> KafkaRawSource<C> {
     }
 }
 
+/// `DurableOffsets::flush`'s view of a consumer. A store refused because
+/// the partition is no longer assigned (librdkafka's `__STATE`) is a
+/// revocation, not an error.
+struct StoreOn<'a, C>(&'a C);
+
+impl<C: ConsumerOps> durable_offsets::OffsetSink for StoreOn<'_, C> {
+    type Error = anyhow::Error;
+
+    fn store(&self, (topic, partition, offset): &durable_offsets::Offset) -> anyhow::Result<bool> {
+        match self.0.store_offset(topic, *partition, *offset) {
+            Ok(()) => Ok(true),
+            Err(err) => match self.0.assignment() {
+                Ok(assignment) if !is_assigned(&assignment, topic, *partition) => Ok(false),
+                _ => Err(err),
+            },
+        }
+    }
+
+    fn commit(&self) -> anyhow::Result<()> {
+        self.0.commit_stored()
+    }
+}
+
 fn is_assigned(assignment: &[TopicPartition], topic: &str, partition: i32) -> bool {
     assignment
         .iter()
@@ -499,6 +613,11 @@ fn is_assigned(assignment: &[TopicPartition], topic: &str, partition: i32) -> bo
 #[async_trait]
 impl<C: ConsumerOps> RawKafkaSource for KafkaRawSource<C> {
     async fn next_batch(&mut self) -> anyhow::Result<Vec<String>> {
+        // Held offsets that have become durable go out first, on every
+        // path (a long Redis retry included).
+        if self.durable.next_due().is_some() {
+            self.flush_durable_logged();
+        }
         // A previously-received batch whose downstream write failed is
         // re-delivered before anything new is fetched: a real `recv()` here
         // would advance the fetch position past it and overwrite
@@ -527,7 +646,7 @@ impl<C: ConsumerOps> RawKafkaSource for KafkaRawSource<C> {
             // is over, so resume and fetch normally.
             self.resume_if_drained();
         }
-        let message = self.progress.idle(self.consumer.recv()).await?;
+        let message = self.recv_flushing().await?;
         let payload = message
             .payload
             .ok_or_else(|| anyhow::anyhow!("empty Kafka message payload"))?;
@@ -553,52 +672,47 @@ impl<C: ConsumerOps> RawKafkaSource for KafkaRawSource<C> {
         }
     }
 
-    /// Stores and commits `last_received`'s offset AS GIVEN, which is
-    /// correct: rust-rdkafka 0.39's `Consumer::store_offset` calls the
-    /// legacy `rd_kafka_offset_store(rkt, partition, offset)`, which itself
-    /// stores `offset + 1` (librdkafka `rdkafka_offset.c`:
+    /// Confirms `last_received` as published in full. Its offset is not
+    /// stored straight away: it is held in `durable` until its `XADD`s are
+    /// at least `--kafka-commit-delay-secs` old, so a hard Redis crash
+    /// within the AOF's fsync window cannot lose records Kafka already
+    /// counts as consumed (`durable_offsets`). Held offsets are stored and
+    /// committed by `flush_durable`, here and while `next_batch` waits.
+    ///
+    /// Offsets are stored AS GIVEN, which is correct: rust-rdkafka 0.39's
+    /// `Consumer::store_offset` calls the legacy
+    /// `rd_kafka_offset_store(rkt, partition, offset)`, which itself stores
+    /// `offset + 1` (librdkafka `rdkafka_offset.c`:
     /// `RD_KAFKA_FETCH_POS(offset + 1, -1)`), i.e. the next offset to
     /// consume. Only `rd_kafka_offsets_store` (`store_offsets`, a TPL)
     /// expects the caller to add 1 itself.
     ///
-    /// If `last_received`'s partition is no longer assigned (revoked by a
-    /// rebalance), the store fails with `__STATE` and can never succeed
-    /// again. That record is then dropped -- the partition's new owner
-    /// redelivers it from the committed offset, a duplicate the
-    /// at-least-once stream already tolerates -- instead of being handed
-    /// back for a retry that would loop forever.
+    /// The offsets already due are flushed BEFORE this record is
+    /// confirmed, and a failure there is returned with `last_received`
+    /// untouched, so a store that keeps failing still surfaces as
+    /// `Cycle::CommitFailed` (no liveness beat) with the record handed
+    /// back, as before. Once confirmed, a failure only delays its commit.
+    ///
+    /// A held offset whose partition is revoked by a rebalance before it is
+    /// stored is dropped at the flush: the partition's new owner redelivers
+    /// the records from the committed offset, a duplicate the at-least-once
+    /// stream already tolerates.
     async fn commit(&mut self) -> anyhow::Result<()> {
-        let Some((topic, partition, offset)) = self.last_received.clone() else {
+        let now = tokio::time::Instant::now();
+        self.flush_durable(now)?;
+        let Some(received) = self.last_received.take() else {
             return Ok(());
         };
-        if let Err(err) = self.consumer.store_offset(&topic, partition, offset) {
-            let revoked = matches!(
-                self.consumer.assignment(),
-                Ok(assignment) if !is_assigned(&assignment, &topic, partition)
-            );
-            if !revoked {
-                return Err(err);
-            }
-            tracing::warn!(
-                topic,
-                partition,
-                offset,
-                error = ?err,
-                "Kafka partition was revoked before its offset could be stored; leaving the \
-                 record to the partition's new owner"
-            );
-            self.last_received = None;
-            self.reconcile_assignment();
-            self.resume_if_drained();
-            return Ok(());
-        }
-        self.consumer.commit_stored()?;
-        self.last_received = None;
+        self.durable.written(vec![received], now);
         // Only safe to resume once nothing is left awaiting redelivery --
         // `pending_retry` can still hold a keepalive-caught message even
         // after the originally retained batch commits (see `next_batch`'s
         // own doc).
         self.resume_if_drained();
+        // With no delay configured the offset is due now.
+        if self.durable.delay().is_zero() {
+            self.flush_durable_logged();
+        }
         Ok(())
     }
 
@@ -609,7 +723,25 @@ impl<C: ConsumerOps> RawKafkaSource for KafkaRawSource<C> {
     /// `session.timeout.ms`. Records in `pending_retry` and an abandoned
     /// in-flight record were never stored, so they are not committed: the
     /// next owner re-reads them (duplicates at worst, never a gap).
-    fn close(self) -> anyhow::Result<()> {
+    fn close(mut self) -> anyhow::Result<()> {
+        // Held offsets are of records published in full: wait (bounded)
+        // until they are durable, then store them. Any not durable by then
+        // stay uncommitted and are re-read after the restart.
+        if let Some(last_due) = self.durable.last_due() {
+            let wait = last_due.saturating_duration_since(tokio::time::Instant::now());
+            if wait > CLOSE_DURABILITY_WAIT_MAX {
+                tracing::warn!(
+                    held = self.durable.len(),
+                    wait_secs = wait.as_secs(),
+                    "held Kafka offsets will not be durable within the close budget; committing \
+                     only those that are, the rest are re-read after the restart"
+                );
+            }
+            std::thread::sleep(wait.min(CLOSE_DURABILITY_WAIT_MAX));
+        }
+        if let Err(err) = self.flush_durable(tokio::time::Instant::now()) {
+            tracing::error!(error = ?err, "failed to store the durable Kafka offsets at shutdown; their records are re-read after the restart");
+        }
         if !self.pending_retry.is_empty() {
             tracing::warn!(
                 retained = self.pending_retry.len(),
@@ -649,6 +781,7 @@ fn test_config() -> Config {
         movement_stream_maxlen: crate::config::DEFAULT_STREAM_MAXLEN,
         movement_consumer_groups: Vec::new(),
         deadletter_max_age_secs: crate::deadletter::MAX_DEADLETTER_AGE_SECS,
+        kafka_commit_delay_secs: durable_offsets::DEFAULT_DELAY_SECS,
     }
 }
 
@@ -933,9 +1066,19 @@ mod consumer_tests {
         ("t".to_string(), partition)
     }
 
+    /// A source that commits offsets at once (no durability delay), as the
+    /// relay did before it held them.
     fn source_with(
         assignment: Vec<TopicPartition>,
         log: Vec<(TopicPartition, Vec<(i64, &str)>)>,
+    ) -> KafkaRawSource<FakeConsumer> {
+        source_with_delay(assignment, log, Duration::ZERO)
+    }
+
+    fn source_with_delay(
+        assignment: Vec<TopicPartition>,
+        log: Vec<(TopicPartition, Vec<(i64, &str)>)>,
+        commit_delay: Duration,
     ) -> KafkaRawSource<FakeConsumer> {
         let consumer = FakeConsumer::default();
         {
@@ -954,7 +1097,94 @@ mod consumer_tests {
         KafkaRawSource::with_consumer(
             consumer,
             health_http::Progress::new(Duration::from_secs(900)),
+            commit_delay,
         )
+    }
+
+    const DELAY: Duration = Duration::from_secs(10);
+
+    /// The loss window: an offset committed the moment its XADD returned
+    /// could cover records Redis had not yet fsynced. It is now stored
+    /// only once the write is `DELAY` old.
+    #[tokio::test(start_paused = true)]
+    async fn an_offset_is_stored_only_once_its_writes_are_durable() {
+        let mut source =
+            source_with_delay(vec![tp(0)], vec![(tp(0), vec![(0, "A"), (1, "B")])], DELAY);
+
+        assert_eq!(source.next_batch().await.unwrap(), vec!["A"]);
+        source.commit().await.unwrap();
+        assert_eq!(source.consumer.state().stored, [], "held, not stored");
+        assert!(source.last_received.is_none(), "confirmed");
+
+        tokio::time::advance(Duration::from_millis(9_999)).await;
+        assert_eq!(source.next_batch().await.unwrap(), vec!["B"]);
+        assert_eq!(source.consumer.state().stored, [], "not durable yet");
+        source.commit().await.unwrap();
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        source.commit().await.unwrap();
+        assert_eq!(
+            source.consumer.state().stored,
+            vec![("t".to_string(), 0, 0)],
+            "A is durable; B, written later, is still held"
+        );
+    }
+
+    /// On a quiet feed nothing calls `commit` again: the wait for the next
+    /// record commits the held offsets once they are durable.
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_feed_still_commits_held_offsets() {
+        let mut source = source_with_delay(vec![tp(0)], vec![(tp(0), vec![(0, "A")])], DELAY);
+
+        assert_eq!(source.next_batch().await.unwrap(), vec!["A"]);
+        source.commit().await.unwrap();
+        let waited =
+            tokio::time::timeout(DELAY + Duration::from_secs(1), source.next_batch()).await;
+        assert!(waited.is_err(), "no record arrives");
+        assert_eq!(
+            source.consumer.state().stored,
+            vec![("t".to_string(), 0, 0)]
+        );
+        assert!(source.durable.is_empty());
+    }
+
+    /// A held offset whose partition is revoked before it is durable is
+    /// left to the new owner (a re-read), not retried forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_offset_on_a_revoked_partition_is_dropped() {
+        let mut source = source_with_delay(
+            vec![tp(0), tp(1)],
+            vec![(tp(0), vec![(0, "A")]), (tp(1), vec![(4, "B")])],
+            DELAY,
+        );
+
+        assert_eq!(source.next_batch().await.unwrap(), vec!["A"]);
+        source.commit().await.unwrap();
+        source.consumer.state().assignment = vec![tp(1)];
+        tokio::time::advance(DELAY).await;
+        assert_eq!(source.next_batch().await.unwrap(), vec!["B"]);
+        assert_eq!(source.consumer.state().stored, []);
+        assert!(source.durable.is_empty(), "dropped, not requeued");
+    }
+
+    /// Shutdown waits for the held offsets to become durable, then commits
+    /// them, so a clean restart does not re-read them.
+    #[tokio::test]
+    async fn close_waits_for_held_offsets_to_become_durable() {
+        let delay = Duration::from_millis(200);
+        let mut source = source_with_delay(vec![tp(0)], vec![(tp(0), vec![(0, "A")])], delay);
+        let journal = std::sync::Arc::clone(&source.consumer.state().journal);
+
+        assert_eq!(source.next_batch().await.unwrap(), vec!["A"]);
+        source.commit().await.unwrap();
+        let started = std::time::Instant::now();
+        source.close().expect("close");
+
+        assert!(started.elapsed() >= delay / 2, "waited for the delay");
+        assert_eq!(
+            *journal.lock().unwrap(),
+            vec!["sync commit [0@0]".to_string(), "closed".to_string()]
+        );
     }
 
     /// The wedge: a retained record whose partition was revoked used to fail

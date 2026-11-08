@@ -4,13 +4,16 @@
 //! a consumer-lag gauge from librdkafka's statistics.
 //!
 //! Offsets are committed only after the batch holding their records is in
-//! Redis ([`crate::relay`]), so a crash or restart re-reads at most the
-//! records of the batch in flight; their rows are idempotent (Darwin
-//! timestamp guards in the writer).
+//! Redis ([`crate::relay`]), and then only once that write is
+//! `--kafka-commit-delay-secs` old, so durable in the AOF
+//! (`durable_offsets`). A crash or restart re-reads the records of the
+//! batch in flight and of the batches still held; their rows are
+//! idempotent (Darwin timestamp guards in the writer).
 
 use std::time::Duration;
 
 use async_trait::async_trait;
+use durable_offsets::DurableOffsets;
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext, Rebalance, StreamConsumer};
 use rdkafka::message::Message;
@@ -33,9 +36,10 @@ pub(crate) struct Record {
 pub(crate) trait RecordSource: Send {
     /// The next record; `None` if none arrives within `timeout`.
     async fn recv(&mut self, timeout: Option<Duration>) -> anyhow::Result<Option<Record>>;
-    /// Stores `offset` as processed (the commit is `offset + 1`), then
-    /// commits. A partition revoked in the meantime is skipped: its new
-    /// owner re-reads from the last commit.
+    /// Marks `offsets` as processed: each is stored (the commit is
+    /// `offset + 1`) and committed once the batch's write is durable. A
+    /// partition revoked in the meantime is skipped: its new owner re-reads
+    /// from the last commit.
     fn commit(&mut self, offsets: &[(String, i32, i64)]) -> anyhow::Result<()>;
 }
 
@@ -215,6 +219,44 @@ pub(crate) fn client_config(config: &Config) -> anyhow::Result<ClientConfig> {
 pub(crate) struct KafkaSource {
     consumer: StreamConsumer<RelayContext>,
     progress: health_http::Progress,
+    /// Offsets of published batches, held until the writes are durable.
+    durable: DurableOffsets,
+}
+
+/// How long the wait for a batch's first record backs off after a failed
+/// store or commit of held offsets.
+const FLUSH_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
+/// The longest [`KafkaSource::finish`] waits for held offsets to become
+/// durable.
+const FINISH_WAIT_MAX: Duration = Duration::from_secs(15);
+
+/// `DurableOffsets::flush`'s view of the consumer: a partition no longer
+/// assigned is skipped.
+struct StoreOn<'a>(&'a StreamConsumer<RelayContext>);
+
+impl durable_offsets::OffsetSink for StoreOn<'_> {
+    type Error = anyhow::Error;
+
+    fn store(&self, (topic, partition, offset): &durable_offsets::Offset) -> anyhow::Result<bool> {
+        let assigned = self
+            .0
+            .assignment()?
+            .elements()
+            .iter()
+            .any(|e| e.topic() == topic && e.partition() == *partition);
+        if !assigned {
+            return Ok(false);
+        }
+        self.0.store_offset(topic, *partition, *offset)?;
+        Ok(true)
+    }
+
+    fn commit(&self) -> anyhow::Result<()> {
+        Ok(self
+            .0
+            .commit_consumer_state(rdkafka::consumer::CommitMode::Async)?)
+    }
 }
 
 impl KafkaSource {
@@ -229,7 +271,88 @@ impl KafkaSource {
                 auto_offset_reset: config.kafka_auto_offset_reset.clone(),
             })?;
         consumer.subscribe(&[&config.kafka_topic])?;
-        Ok(Self { consumer, progress })
+        Ok(Self {
+            consumer,
+            progress,
+            durable: DurableOffsets::new(Duration::from_secs(config.kafka_commit_delay_secs)),
+        })
+    }
+
+    /// Stores and commits the held offsets durable at `now`.
+    fn flush(&mut self, now: tokio::time::Instant) -> anyhow::Result<()> {
+        let flushed = self.durable.flush(&StoreOn(&self.consumer), now)?;
+        for (topic, partition, offset) in flushed.revoked {
+            tracing::warn!(
+                topic,
+                partition,
+                offset,
+                "Kafka partition revoked before its offset was stored; its new owner re-reads it"
+            );
+        }
+        Ok(())
+    }
+
+    /// The first record of a batch, however long the topic is quiet,
+    /// committing held offsets as they become durable meanwhile.
+    async fn recv_idle(
+        &mut self,
+    ) -> Result<rdkafka::message::OwnedMessage, rdkafka::error::KafkaError> {
+        let mut backoff_until = None;
+        loop {
+            let wake_at = match (self.durable.next_due(), backoff_until) {
+                (None, _) => {
+                    return self
+                        .progress
+                        .idle(self.consumer.recv())
+                        .await
+                        .map(|m| m.detach());
+                }
+                (Some(due), None) => due,
+                (Some(due), Some(until)) => due.max(until),
+            };
+            let received = tokio::select! {
+                biased;
+                message = self.progress.idle(self.consumer.recv()) => Some(message.map(|m| m.detach())),
+                () = tokio::time::sleep_until(wake_at) => None,
+            };
+            if let Some(message) = received {
+                return message;
+            }
+            backoff_until = match self.flush(tokio::time::Instant::now()) {
+                Ok(()) => None,
+                Err(err) => {
+                    tracing::error!(error = ?err, "failed to store or commit durable Kafka offsets; retrying");
+                    metrics::error("commit");
+                    Some(tokio::time::Instant::now() + FLUSH_RETRY_BACKOFF)
+                }
+            };
+        }
+    }
+
+    /// Shutdown: waits (bounded) for the held offsets to become durable,
+    /// then stores them and commits synchronously, so a clean restart does
+    /// not re-read them. Offsets not durable in time stay uncommitted and
+    /// are re-read (duplicates the writer absorbs).
+    pub(crate) async fn finish(&mut self) {
+        if let Some(last_due) = self.durable.last_due() {
+            let wait = last_due.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::sleep(wait.min(FINISH_WAIT_MAX)).await;
+        }
+        if let Err(err) = self.flush(tokio::time::Instant::now()) {
+            tracing::error!(error = ?err, "failed to store the durable Kafka offsets at shutdown; their records are re-read");
+        }
+        match self
+            .consumer
+            .commit_consumer_state(rdkafka::consumer::CommitMode::Sync)
+        {
+            Ok(())
+            | Err(rdkafka::error::KafkaError::ConsumerCommit(
+                rdkafka::types::RDKafkaErrorCode::NoOffset,
+            )) => {}
+            Err(err) => {
+                tracing::error!(error = ?err, "final Kafka offset commit failed; the records since the last commit are re-read");
+            }
+        }
     }
 }
 
@@ -239,10 +362,11 @@ impl RecordSource for KafkaSource {
         let received = match timeout {
             // Waiting for the first record of a batch is idle time, not a
             // stall: a quiet topic must not get the relay restarted.
-            None => Some(self.progress.idle(self.consumer.recv()).await),
+            None => Some(self.recv_idle().await),
             Some(timeout) => tokio::time::timeout(timeout, self.consumer.recv())
                 .await
-                .ok(),
+                .ok()
+                .map(|message| message.map(|m| m.detach())),
         };
         let Some(message) = received else {
             return Ok(None);
@@ -257,30 +381,9 @@ impl RecordSource for KafkaSource {
     }
 
     fn commit(&mut self, offsets: &[(String, i32, i64)]) -> anyhow::Result<()> {
-        let assignment = self.consumer.assignment()?;
-        let mut stored = 0;
-        for (topic, partition, offset) in offsets {
-            let assigned = assignment
-                .elements()
-                .iter()
-                .any(|e| e.topic() == topic && e.partition() == *partition);
-            if !assigned {
-                tracing::warn!(
-                    topic,
-                    partition,
-                    offset,
-                    "Kafka partition revoked before its offset was stored; its new owner re-reads it"
-                );
-                continue;
-            }
-            self.consumer.store_offset(topic, *partition, *offset)?;
-            stored += 1;
-        }
-        if stored > 0 {
-            self.consumer
-                .commit_consumer_state(rdkafka::consumer::CommitMode::Async)?;
-        }
-        Ok(())
+        let now = tokio::time::Instant::now();
+        self.durable.written(offsets.to_vec(), now);
+        self.flush(now)
     }
 }
 

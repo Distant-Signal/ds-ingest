@@ -121,6 +121,22 @@ pub(crate) struct Config {
         )
     )]
     pub deadletter_max_age_secs: u64,
+
+    /// How long a record's `XADD`s are held before its Kafka offset is
+    /// committed: Redis fsyncs its AOF about once a second
+    /// (`appendfsync everysec`), so an offset committed as soon as the
+    /// `XADD` returns can cover records a hard crash then loses, and Kafka
+    /// would never redeliver them. Several fsync intervals; a relay crash
+    /// re-reads up to this much, as duplicates the consumers absorb. 0
+    /// commits at once (only for a Redis on `appendfsync always`). See
+    /// `durable_offsets`.
+    #[arg(
+        long,
+        env,
+        default_value_t = durable_offsets::DEFAULT_DELAY_SECS,
+        value_parser = durable_offsets::parse_delay_secs
+    )]
+    pub kafka_commit_delay_secs: u64,
 }
 
 /// Memory the `movement-events` stream is allowed to occupy in Redis at
@@ -217,6 +233,18 @@ mod tests {
     fn stream_maxlen_is_overridable_from_the_cli() {
         let config = parse(&["--movement-stream-maxlen", "250000"]).unwrap();
         assert_eq!(config.movement_stream_maxlen, 250_000);
+    }
+
+    /// Offsets wait for the AOF fsync (several `everysec` intervals) unless
+    /// an operator turns the hold off; an absurd hold is refused.
+    #[test]
+    fn commits_are_held_for_the_fsync_window_by_default() {
+        if std::env::var_os("KAFKA_COMMIT_DELAY_SECS").is_none() {
+            assert_eq!(parse(&[]).unwrap().kafka_commit_delay_secs, 10);
+        }
+        let config = parse(&["--kafka-commit-delay-secs", "0"]).unwrap();
+        assert_eq!(config.kafka_commit_delay_secs, 0);
+        assert!(parse(&["--kafka-commit-delay-secs", "86400"]).is_err());
     }
 
     #[test]
