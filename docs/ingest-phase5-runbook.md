@@ -16,11 +16,16 @@ alternative, Q1; Q8's `INGEST_SINK`/`*_SOURCE` parsing) are built
 narrowing: [Release D cleanup](#release-d-cleanup-built-2026-10-21).** Left
 after it: **5.5**. Phase 0b is done (the four services connect as their
 own roles since 2026-10-21); the narrowing's code prerequisites are built
-(2026-10-23, DS-118). The 7-day role-usage report came back clean and the
-release D change (step 3) is done (2026-10-28, DS-118); Ranma's release of
-it is next:
+(2026-10-23, DS-118). The 7-day role-usage report came back clean, the
+release D change (step 3) is done (2026-10-28, DS-118) and Ranma released
+it the same day (deploy 2czq, build 715):
 [Release D (narrowing)](#release-d-narrowing-prepared-2026-10-23-ds-118).
-Then the `app` drop; and Ranma's `allow-egress-same-namespace` (5.6). The earlier prep that changed no
+**As of 2026-11-10** the four roles are out of `distant_signal_app` in
+production, no session has used `distant_signal_app` since 2026-10-21, and
+no service log shows SQLSTATE 42501; the negative checks (step 5) wait on
+Lucy's go-ahead (RANMA-226). Left: those checks, then release E (the `app`
+drop, step 6; [Release D status, 2026-11-10](#release-d-status-2026-11-10)),
+and Ranma's `allow-egress-same-namespace` (5.6). The earlier prep that changed no
 default (batch 53, 2026-10-08) was 5.1's
 `API_PRIVATE_ROUTES` fallback (routes stay on), Q1's dual-prefix alert
 rules, 5.4b's new backfill entry points (the api binaries stay, deprecated),
@@ -54,6 +59,7 @@ caller-less routes (Q9) have been deleted ahead of phase 5 (§1.1).
 ## Contents
 
 - [Release D (narrowing): prepared 2026-10-23 (DS-118)](#release-d-narrowing-prepared-2026-10-23-ds-118)
+- [Release D status, 2026-11-10](#release-d-status-2026-11-10)
 - [Release D cleanup: built 2026-10-21](#release-d-cleanup-built-2026-10-21)
 - [Release C (phase 5): built 2026-10-14](#release-c-phase-5-built-2026-10-14)
 - [5.5 status (2026-10-14): blocked on phase 0b](#55-status-2026-10-14-blocked-on-phase-0b)
@@ -293,6 +299,35 @@ On or after **2026-10-28 07:58 UTC**:
      per-role counts are confirmed.
 6. **Release E** (Q5), 7 days after step 4: drop `distant_signal_app`, as
    5.5 step 4 below describes.
+
+### Release D status, 2026-11-10
+
+Read-only checks on production (DS-118):
+
+- **Done:** steps 1 to 4. Release D is live since 2026-10-28; the four roles
+  hold no `distant_signal_app` membership, and `has_table_privilege` shows
+  what the narrowing intends (the api has no table-level `INSERT` or `UPDATE`
+  on `train_movement_events` or `train_current_state`; the enricher's
+  `UPDATE` on `incidents` is the five extraction columns only).
+- **Watch (step 5), clean so far:** no 42501 in the logs of any DS
+  Deployment or in Postgres's own log (container logs reach back to the node
+  restart of 2026-11-09, so this is not the full 7 days); the
+  `DistantSignalTrainEventOutboxStuck` and
+  `DistantSignalDbRoleNearConnectionLimit` alerts have not fired;
+  `train_event_outbox` is empty; the busiest 14 days of sessions per role
+  were the api 17 of 36, the aggregator 6 of 13, the notifier 6 of 6 and
+  the enricher 4 of 6.
+- **Pending, the user's:** the write-attempt negative checks (RANMA-226
+  waits for the go-ahead).
+- **Release E's entry criterion is met:** the last `distant_signal_app`
+  session in Prometheus's `pg_stat_activity_count` was 2026-10-21 07:54 UTC
+  and `pg_stat_activity` shows none now. `distant_signal_app` owns no
+  objects and has no members; what it still holds is its table, sequence and
+  function grants, the default privileges for `distant_signal_owner`, and
+  `CONNECT` and a connection limit of 5.
+- **DS-97:** the interim `connectionLimit` overrides are no longer needed
+  for every role but the writer (see "Production's interim overrides");
+  Ranma-Config PR 126 removes them.
 
 **Rollback** of step 4: re-release the previous `db-grants.yaml` (the four
 roles `observed`). The setup Job re-grants the memberships idempotently;
@@ -955,7 +990,10 @@ rollout strategy)".
 - **pollers, schedulefeed, aggregator, notifier** (already Recreate):
   the next poll or cycle picks up where the last left off.
 
-**Production's interim overrides.** Production carries
+**Production's interim overrides.** (Dropped for every role but the writer
+on 2026-11-10, DS-97: the chart's computed limits, counting surge pods,
+exceed each role's 14-day peak. The writer keeps 12: its peak was 9, above
+the computed 8.) Production carried
 `connectionLimit` overrides of 2 × pool + 1 for every per-service role
 (writer 2 × pool) since the incident. With this release the defaults rely
 on `Recreate` (no overlap), not on surge room, so the overrides are no
