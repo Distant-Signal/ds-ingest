@@ -1828,9 +1828,17 @@ own `BEGIN; … ROLLBACK;`:
 
 - `CREATE TABLE x (i int)`, `TRUNCATE stations` and
   `ALTER TABLE incidents ADD COLUMN y int` must all fail;
-- `DELETE FROM users WHERE false` must fail for every role but the api,
-  which owns `users` (`SIUD`): never run it as the api without the
-  `WHERE false`;
+- a statement that tests a verb on a table must fail for every role whose
+  grant for that table lacks the verb, and succeed for every role whose
+  grant has it. There is no blanket rule: read the expected result per
+  table and role from ds-core's `crates/ds-store/db-grants.yaml` (the
+  rendered `postgres-grants.sql` agrees with it). For example, `DELETE FROM
+  users WHERE false` fails for every role but the api (`SIUD`), but
+  `DELETE FROM trains WHERE false` succeeds for the api (`SIUD`) and the
+  aggregator (`D`, plus `U` on `id` only), and fails for the others. A
+  column grant such as the aggregator's `U` on `trains(id)` allows
+  `UPDATE trains SET id = id WHERE false` and refuses any other column.
+  Run a `DELETE` as a role that holds the verb only with `WHERE false`;
 - the api role: `UPDATE incidents SET summary = summary WHERE false` must
   fail;
 - the enricher: `UPDATE incidents SET summary = …` must fail, while
