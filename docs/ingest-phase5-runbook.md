@@ -1828,9 +1828,22 @@ own `BEGIN; … ROLLBACK;`:
 
 - `CREATE TABLE x (i int)`, `TRUNCATE stations` and
   `ALTER TABLE incidents ADD COLUMN y int` must all fail;
-- `DELETE FROM users WHERE false` must fail for every role but the api,
-  which owns `users` (`SIUD`): never run it as the api without the
-  `WHERE false`;
+- `DELETE ... WHERE false` fails exactly where the role's grants do not
+  include `D` on that table, so derive each expectation from ds-core's
+  `crates/ds-store/db-grants.yaml` (the generated `postgres-grants.sql` at
+  the pinned release) rather than assuming a blanket failure. No service
+  role owns a table (the owner is `distant_signal_owner`) and none holds
+  `TRUNCATE` or DDL rights, which is why the first bullet always fails.
+  The statement fails with SQLSTATE 42501 where `D` is absent and succeeds
+  (deleting nothing) where it is granted. For example:
+  - `DELETE FROM users WHERE false` succeeds only for the api (`SIUD`) and
+    fails for every other role. Never run it as the api without the
+    `WHERE false`;
+  - `DELETE FROM trains WHERE false` succeeds for the api (`SIUD`) and the
+    aggregator (`S`, `D`, and `U` on `id`, because it prunes trains), and
+    fails for the writer, `trust_backlog` and the notifier (`SIU`). Checked
+    on production on 2026-11-11: it succeeded as `distant_signal_api` and
+    `distant_signal_aggregator`;
 - the api role: `UPDATE incidents SET summary = summary WHERE false` must
   fail;
 - the enricher: `UPDATE incidents SET summary = …` must fail, while
