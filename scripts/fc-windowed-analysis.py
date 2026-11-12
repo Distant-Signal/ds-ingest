@@ -8,7 +8,7 @@ docs/superpowers/specs/2026-09-27-full-coverage-windowed-stats-design.md.
 Works on CSV exports of production tables; it never connects to anything.
 The exports were taken with plain SELECTs (\copy ... TO STDOUT), e.g.
 
-  K='kubectl --context mine-bringer-ts -n distant-signal exec -i'
+  K='kubectl --context <cluster> -n distant-signal exec -i'
   K="$K distant-signal-postgres-0 -- psql -U distant_signal -d distant_signal -c"
   $K "\copy (SELECT train_id, train_uid, service_date, msg_type, event_type, crs,
                planned_timestamp, actual_timestamp, variation_status,

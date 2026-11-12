@@ -343,7 +343,7 @@ set no `INGEST_SINK` or `*_SOURCE` (no `extraEnv` entry either) and no
 retired `ingest.sink` / `internalReads.source` key, and the live
 Deployments carry neither variable. **Nothing has to be removed first.**
 Optional tidy-up, any time after this release: three Grafana panels in
-`clusters/mine-bringer/apps/distant-signal.yaml` (corpus age,
+`clusters/<cluster>/apps/distant-signal.yaml` (corpus age,
 `trust_event_backlog_uid_inferred_total`,
 `schedule_publish_staged_mismatch_total`) still query
 `{__name__=~"distant_signal_(api|store)_…"}`; they keep working, and can
@@ -422,7 +422,7 @@ release B's pods while they still serve: "Hook order" in
    `train_reasons_` or `schedule_publish_`) moves to the
    `{__name__=~"distant_signal_(api|store)_…"}` form (the repo has no
    dashboards).
-2. **Values** (`clusters/mine-bringer/apps/distant-signal.yaml`): delete
+2. **Values** (`clusters/<cluster>/apps/distant-signal.yaml`): delete
    `redis.acl.clients.api` (ignored if left).
 3. Release the chart and the images together. Restarts: Redis (once, the
    ACL file, via `checksum/redis-acl` or Reloader; every stream client
@@ -459,7 +459,7 @@ test pod (to the api). Narrow it in its own Ranma change after release C,
 in a quiet hour:
 
 ```yaml
-# clusters/mine-bringer/apps/netpol-distant-signal.yaml
+# clusters/<cluster>/apps/netpol-distant-signal.yaml
 spec:
   podSelector:
     matchExpressions:
@@ -565,7 +565,7 @@ soak and the two-release split of 5.2/5.3).
      `*_SOURCE` is `db` (§1.3 C); the writer's four streams are `apply`;
    - no `distant_signal_app` session from a producer
      (`SELECT usename, application_name FROM pg_stat_activity`).
-2. Values (Ranma-Config `clusters/mine-bringer/apps/distant-signal.yaml`
+2. Values (Ranma-Config `clusters/<cluster>/apps/distant-signal.yaml`
    and the sealed values overlay):
    - delete every `ingest.sink`, `internalReads.source` and
      `ingestWriter.streams.<x>: shadow` (a non-target value fails the
@@ -1116,7 +1116,7 @@ PodMonitor (`metrics.prometheusRule.api5xx.routeLabel`).
 min(prometheus_tsdb_lowest_timestamp_seconds)` was 8 days on 2026-10-08).
 A 7-day window is therefore right at the edge, and the spec's "every switch
 on its new value for 14 days" cannot come from Prometheus. Take the switch
-dates from Ranma-Config's `git log` on `clusters/mine-bringer/apps/distant-signal.yaml`.
+dates from Ranma-Config's `git log` on `clusters/<cluster>/apps/distant-signal.yaml`.
 
 **B. The rare routes need more than a zero count.** Several routes are
 called so rarely that 7 quiet days prove nothing:
@@ -1355,7 +1355,7 @@ binaries (5.4b) and the Redis client (5.4).
 the CI flags; `chart-values-doc.py check`; the alert-rules tests.
 
 **Ranma:** delete `api.internalOauth.groups.{incidents,stations,tocs,ldbws,tfl,trustConsumer}`
-from `clusters/mine-bringer/apps/distant-signal.yaml`. Keep `issuerUrl`,
+from `clusters/<cluster>/apps/distant-signal.yaml`. Keep `issuerUrl`,
 `clientId` and the MCP group. Delete `api.privateRoutes` once the chart
 no longer has it.
 
@@ -1430,7 +1430,7 @@ env.
    top-level `internalOauth` block from `distant-signal.yaml`.
 2. After 24 h with no `client_credentials` token issued to the ingest
    accounts (Authentik → Events, filter by user), decommission in
-   `clusters/mine-bringer/apps/authentik.yaml`:
+   `clusters/<cluster>/apps/authentik.yaml`:
    - the users `srv-ds-incidents-poller`, `srv-ds-stations-poller`,
      `srv-ds-tocs-poller`, `srv-ds-ldbws-poller`, `srv-ds-tfl-poller`,
      `srv-ds-trust-poller`, `srv-ds-schedule-ingest`,
@@ -1877,7 +1877,7 @@ plus Ranma's comments.
 **Ranma:**
 
 - update the flow comment in
-  `clusters/mine-bringer/apps/netpol-distant-signal.yaml` (lines ~24–40):
+  `clusters/<cluster>/apps/netpol-distant-signal.yaml` (lines ~24–40):
   api's in-namespace clients become the frontend and the helm test; Redis
   loses api and gains the stream producers; Postgres gains the producers;
 - **narrow or remove `allow-egress-same-namespace`** (decided, Q6). Today
