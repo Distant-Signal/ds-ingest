@@ -88,6 +88,12 @@ pub(crate) struct Config {
     )]
     pub kafka_commit_delay_secs: u64,
 
+    /// Count `TS` elements and `LateReason` elements, and log a few
+    /// anonymised samples, to learn whether the topic carries late
+    /// reasons (`sampling`). Changes nothing published.
+    #[arg(long, env, default_value_t = false)]
+    pub darwin_late_reason_sampling: bool,
+
     #[command(flatten)]
     pub health: ds_runtime::service_args::HealthArgs,
     #[command(flatten)]
@@ -147,6 +153,7 @@ mod tests {
         assert_eq!(config.kafka_security_protocol, "SASL_SSL");
         assert_eq!(config.kafka_auto_offset_reset, "latest");
         assert_eq!(config.batch_max_secs, 30);
+        assert!(!config.darwin_late_reason_sampling);
         assert!(config.sasl_credentials().is_none());
     }
 
