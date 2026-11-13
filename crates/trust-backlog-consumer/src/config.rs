@@ -133,6 +133,15 @@ pub(crate) struct Config {
     /// anyway).
     #[arg(long, env, default_value_t = 1, value_parser = clap::value_parser!(i64).range(0..))]
     pub trust_event_backlog_retention_days: i64,
+
+    /// Writes each Activation's service class (from its headcode) and
+    /// operator code to `train_service_labels` (DS-513; see `labels.rs`),
+    /// for internal reporting only. Off by default: it needs ds-core's
+    /// `20261113120000_train_service_labels` migration applied and the
+    /// `trust_backlog` role's grants on the table. A failed write is logged
+    /// and never holds a batch. No effect on any other write.
+    #[arg(long, env, default_value_t = false)]
+    pub train_service_labels_enabled: bool,
 }
 
 impl Config {
@@ -219,5 +228,16 @@ mod tests {
         let config = parse(&["--trust-event-backlog-retention-days", "0"]).unwrap();
         assert_eq!(config.trust_event_backlog_retention_days, 0);
         assert!(parse(&["--trust-event-backlog-retention-days", "-1"]).is_err());
+    }
+
+    /// The labels are off unless asked for.
+    #[test]
+    fn the_service_labels_are_off_by_default() {
+        assert!(!parse(&[]).unwrap().train_service_labels_enabled);
+        assert!(
+            parse(&["--train-service-labels-enabled"])
+                .unwrap()
+                .train_service_labels_enabled
+        );
     }
 }
