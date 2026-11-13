@@ -21,6 +21,7 @@ mod kafka;
 mod metrics;
 mod pushport;
 mod relay;
+mod sampling;
 
 use std::num::NonZeroUsize;
 use std::time::Duration;
@@ -47,6 +48,9 @@ async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     ds_runtime::logging::init("darwin-relay");
     let config = Config::parse();
+    if config.darwin_late_reason_sampling {
+        sampling::enable();
+    }
     if config.metrics.metrics_enabled {
         ds_runtime::metrics::install(config.metrics_port)?;
         metrics::register();

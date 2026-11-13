@@ -329,6 +329,7 @@ fn parse_platform(value: Option<&Value>) -> Option<Platform> {
 }
 
 fn parse_status(status: &Value, ts: DateTime<Utc>, batch: &mut Batch) {
+    crate::sampling::note_status(status);
     let Some((rid, uid, ssd)) = identity(status) else {
         return;
     };

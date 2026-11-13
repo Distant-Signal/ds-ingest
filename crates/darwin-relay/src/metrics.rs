@@ -17,6 +17,12 @@ pub(crate) const READY: &str = "darwin_relay_ready";
 pub(crate) const RECORDS: &str = "darwin_relay_records_total";
 /// `darwin_relay_rows_total{kind}`: rows produced, by kind.
 pub(crate) const ROWS: &str = "darwin_relay_rows_total";
+/// `darwin_relay_status_elements_total`: `TS` elements read while
+/// `DARWIN_LATE_REASON_SAMPLING` is on (`sampling`).
+pub(crate) const STATUS_ELEMENTS: &str = "darwin_relay_status_elements_total";
+/// `darwin_relay_late_reasons_total{level}`: `LateReason` elements read
+/// while sampling is on; `level` is `service` or `location`.
+pub(crate) const LATE_REASONS: &str = "darwin_relay_late_reasons_total";
 /// `darwin_relay_batches_published_total`.
 pub(crate) const BATCHES: &str = "darwin_relay_batches_published_total";
 /// `darwin_relay_last_message_timestamp_seconds`: the newest Darwin `ts`
@@ -49,6 +55,14 @@ pub(crate) fn rows(kind: &'static str, n: usize) {
     metrics::counter!(metric_name(ROWS), "kind" => kind).increment(n as u64);
 }
 
+pub(crate) fn status_element() {
+    metrics::counter!(metric_name(STATUS_ELEMENTS)).increment(1);
+}
+
+pub(crate) fn late_reason(level: &'static str) {
+    metrics::counter!(metric_name(LATE_REASONS), "level" => level).increment(1);
+}
+
 pub(crate) fn batch_published() {
     metrics::counter!(metric_name(BATCHES)).increment(1);
 }
@@ -76,6 +90,10 @@ pub(crate) fn register() {
         metrics::counter!(metric_name(RECORDS), "outcome" => outcome).increment(0);
     }
     metrics::counter!(metric_name(BATCHES)).increment(0);
+    metrics::counter!(metric_name(STATUS_ELEMENTS)).increment(0);
+    for level in ["service", "location"] {
+        metrics::counter!(metric_name(LATE_REASONS), "level" => level).increment(0);
+    }
     for reason in [RESET_NO_COMMITTED_OFFSET, RESET_AFTER_ERROR] {
         offset_resets(reason, 0);
     }

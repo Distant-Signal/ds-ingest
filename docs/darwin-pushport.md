@@ -143,6 +143,21 @@ rather than where it left off: with `latest`, the records in between were
 skipped. The first start of a new consumer group counts one
 `no_committed_offset` per partition.
 
+## Sampling `LateReason` (DS-512)
+
+DS keeps a service's cancel reason (`darwin_services.cancel_reason`) but not
+its late reason, and no stored row shows whether the JSON topic carries
+`LateReason` (the `TS` element's `LateReason`, a numeric reason code with
+optional `tiploc` and `near` attributes). `DARWIN_LATE_REASON_SAMPLING=true`
+(off by default; it changes nothing the relay publishes) counts `TS` elements
+(`distant_signal_darwin_relay_status_elements_total`) and `LateReason`
+elements by where they sat
+(`distant_signal_darwin_relay_late_reasons_total{level="service"|"location"}`),
+and logs up to 50 samples, at most one every 30 seconds, as
+`sampled a Push Port LateReason` with `code`, `tiploc`, `near` and `level`
+and no RID, UID or time. A day of data gives the share of `TS` elements that
+carry a reason and the codes seen; turn it off afterwards.
+
 ## Switching on the arrival boards
 
 poller-ldbws's tracked-stop lane can also poll the LDBWS arrivals product
