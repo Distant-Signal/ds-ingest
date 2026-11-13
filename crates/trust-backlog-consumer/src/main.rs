@@ -13,6 +13,7 @@
 
 mod config;
 mod crs_index;
+mod labels;
 mod process;
 mod reasons;
 mod sink;
@@ -144,7 +145,7 @@ async fn run() -> anyhow::Result<()> {
     );
 
     tracing::info!("writing the TRUST backlog to Postgres directly");
-    sink::register_db_write_metrics();
+    sink::register_db_write_metrics(config.train_service_labels_enabled);
     consume(&config, &crs_index, &mut feed, &progress, &DbSink { pool }).await
 }
 
@@ -352,6 +353,7 @@ async fn consume_cycle<S: BacklogSink>(
             let CollectedBatch {
                 events,
                 reasons,
+                labels,
                 unparseable,
             } = collect_batch(
                 &batch,
@@ -360,6 +362,7 @@ async fn consume_cycle<S: BacklogSink>(
                 crs_index,
                 now,
                 config.trust_event_backlog_retention_days,
+                config.train_service_labels_enabled,
             );
 
             // Reasons first, best-effort: a failure is logged and
@@ -379,7 +382,17 @@ async fn consume_cycle<S: BacklogSink>(
 
             let delivery =
                 deliver_batch(feed, &events, &unparseable, &operations, async |events| {
-                    sink.write_backlog(events).await
+                    let response = sink.write_backlog(events).await?;
+                    // After the backlog write, which makes the `trains`
+                    // rows the labels attach to. Best effort: a label is
+                    // internal enrichment, so a failure is logged and
+                    // counted (`db_writes_total` (operation train_service_labels))
+                    // and never holds the batch. A redelivered batch
+                    // writes them again, which is harmless.
+                    if let Err(err) = sink.write_labels(&labels).await {
+                        tracing::warn!(error = ?err, count = labels.len(), "failed to write train service labels; continuing");
+                    }
+                    Ok(response)
                 })
                 .await;
             let wait = delivery_wait(&delivery, delivery_failures);
@@ -652,6 +665,9 @@ fn arrival(
 struct CollectedBatch {
     events: Vec<common::TrustBacklogEventMessage>,
     reasons: Vec<common::TrainReasonMessage>,
+    /// An Activation's class and operator code, only when
+    /// `train_service_labels_enabled`.
+    labels: Vec<labels::TrainLabel>,
     unparseable: Vec<DeadLetter>,
 }
 
@@ -666,9 +682,11 @@ fn collect_batch(
     crs_index: &HashSet<String>,
     now: chrono::DateTime<chrono::Utc>,
     retention_days: i64,
+    label_trains: bool,
 ) -> CollectedBatch {
     let mut events = Vec::new();
     let mut reasons = Vec::new();
+    let mut labels = Vec::new();
     let mut unparseable = Vec::new();
     for entry in batch {
         let raw = &entry.payload;
@@ -714,6 +732,10 @@ fn collect_batch(
                             ))
                             .increment(1);
                         } else {
+                            if label_trains && let Some(label) = labels::label_for(&message, &event)
+                            {
+                                labels.push(label);
+                            }
                             events.push(event);
                         }
                     }
@@ -733,6 +755,7 @@ fn collect_batch(
     CollectedBatch {
         events,
         reasons,
+        labels,
         unparseable,
     }
 }
@@ -917,7 +940,7 @@ mod tests {
         let now = utc("2026-08-28T18:34:00Z");
 
         let mut state = process::ProcessorState::default();
-        let collected = collect_batch(&batch, &mut state, &stanox, &crs_index, now, 1);
+        let collected = collect_batch(&batch, &mut state, &stanox, &crs_index, now, 1, false);
         assert_eq!(collected.events.len(), 1, "{:?}", collected.events);
         // The fresh one (its timestamp after the Europe/London correction).
         assert_eq!(
@@ -930,8 +953,46 @@ mod tests {
         assert_eq!(collected.unparseable, []);
 
         let mut state = process::ProcessorState::default();
-        let collected = collect_batch(&batch, &mut state, &stanox, &crs_index, now, 0);
+        let collected = collect_batch(&batch, &mut state, &stanox, &crs_index, now, 0, false);
         assert_eq!(collected.events.len(), 2, "0 turns the check off");
+    }
+
+    /// A freight Activation is labelled only with the flag on, with the
+    /// class from its headcode and the operator code from the message; the
+    /// backlog events are the same either way.
+    #[test]
+    fn labels_are_collected_only_with_the_flag_on() {
+        let payload = r#"[{"header":{"msg_type":"0001"},"body":{
+            "train_id":"126X20AC15","train_uid":"C12345","toc_id":"55",
+            "tp_origin_timestamp":"2026-08-28"
+        }}]"#;
+        let batch = [movement_feed::FeedEntry {
+            payload: payload.to_string(),
+            received_at: Some(utc("2026-08-28T18:33:30Z")),
+        }];
+        let stanox = stanox_crs::StanoxCrsTable::from_records(Vec::new());
+        let crs_index: HashSet<String> = HashSet::new();
+        let now = utc("2026-08-28T18:34:00Z");
+
+        let mut state = process::ProcessorState::default();
+        let off = collect_batch(&batch, &mut state, &stanox, &crs_index, now, 1, false);
+        assert_eq!(off.labels, []);
+
+        let mut state = process::ProcessorState::default();
+        let on = collect_batch(&batch, &mut state, &stanox, &crs_index, now, 1, true);
+        assert_eq!(
+            serde_json::to_string(&on.events).unwrap(),
+            serde_json::to_string(&off.events).unwrap(),
+            "the backlog is unchanged by the flag"
+        );
+        assert_eq!(on.labels.len(), 1);
+        assert_eq!(on.labels[0].train_uid, "C12345");
+        assert_eq!(on.labels[0].service_date.to_string(), "2026-08-28");
+        assert_eq!(
+            on.labels[0].service_class,
+            labels::ServiceClass::FreightOrEngineering
+        );
+        assert_eq!(on.labels[0].toc_id.as_deref(), Some("55"));
     }
 
     fn entry_arrived_at(at: &str) -> movement_feed::FeedEntry {

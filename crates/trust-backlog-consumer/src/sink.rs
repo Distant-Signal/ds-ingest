@@ -5,6 +5,7 @@
 //! |---|---|
 //! | backlog events | `ds_store::backlog::ingest_trust_event_backlog` |
 //! | reason codes | `ds_store::backlog::reasons::upsert_reasons` |
+//! | service labels (flag) | `train_service_labels`, below |
 //! | STANOX/CRS reload | `ds_store::reference::list_stanox_crs` |
 //!
 //! The api's retired `POST /private/trust-event-backlog` and
@@ -14,6 +15,7 @@
 //! write committed, and a transient failure leaves it pending and backs off
 //! before the next read (`main.rs`'s `deliver_batch` and `delivery_wait`).
 
+use crate::labels::TrainLabel;
 use common::{
     StanoxCrsRecord, TrainReasonMessage, TrustBacklogEventMessage, TrustBacklogIngestResponse,
 };
@@ -51,6 +53,11 @@ pub(crate) trait BacklogSink {
     /// Files the batch's reason codes. An empty batch writes nothing.
     async fn write_reasons(&self, reasons: &[TrainReasonMessage]) -> anyhow::Result<()>;
 
+    /// Files each Activation's class and operator code under its `trains`
+    /// row (`train_service_labels`, DS-513), after the backlog write made
+    /// the row. An empty batch writes nothing.
+    async fn write_labels(&self, labels: &[TrainLabel]) -> anyhow::Result<()>;
+
     /// Writes one batch of backlog events: `Ok` with the rows refused for
     /// a data error (every other row landed), or `Err` for anything
     /// transient (nothing to `XACK`). An empty batch writes nothing.
@@ -66,11 +73,29 @@ pub(crate) trait BacklogSink {
 pub(crate) const DB_WRITE_BACKLOG: &str = "trust_event_backlog";
 /// As [`DB_WRITE_BACKLOG`], for a batch's reason codes.
 pub(crate) const DB_WRITE_REASONS: &str = "train_reasons";
+/// As [`DB_WRITE_BACKLOG`], for a batch's service labels (registered only
+/// when the labels are on).
+pub(crate) const DB_WRITE_LABELS: &str = "train_service_labels";
 
 /// Registers both operations' `db_writes_total` series at 0.
-pub(crate) fn register_db_write_metrics() {
+pub(crate) fn register_db_write_metrics(labels_enabled: bool) {
     ds_store::writes::register(&[DB_WRITE_BACKLOG, DB_WRITE_REASONS]);
+    if labels_enabled {
+        ds_store::writes::register(&[DB_WRITE_LABELS]);
+    }
 }
+
+/// `INSERT ... ON CONFLICT (trains_id) DO NOTHING` of one batch's labels,
+/// joined to the `trains` rows by `(train_uid, service_date)`: a label
+/// whose train has no row (its event was refused or outside retention) is
+/// skipped. First write wins, so a redelivery changes nothing, and the
+/// role needs INSERT and SELECT on `trains_id` only.
+const LABELS_SQL: &str = "INSERT INTO train_service_labels (trains_id, service_class, toc_id) \
+     SELECT t.id, u.service_class, u.toc_id \
+       FROM UNNEST($1::text[], $2::date[], $3::text[], $4::text[]) \
+            AS u(train_uid, service_date, service_class, toc_id) \
+       JOIN trains t ON t.train_uid = u.train_uid AND t.service_date = u.service_date \
+     ON CONFLICT (trains_id) DO NOTHING";
 
 /// Runs `write`, recording it as one `operation` write.
 async fn recorded<T>(
@@ -105,6 +130,27 @@ impl BacklogSink for DbSink {
         }
         recorded(DB_WRITE_REASONS, async {
             ds_store::backlog::reasons::upsert_reasons(&self.pool, reasons).await?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn write_labels(&self, labels: &[TrainLabel]) -> anyhow::Result<()> {
+        if labels.is_empty() {
+            return Ok(());
+        }
+        let uids: Vec<&str> = labels.iter().map(|l| l.train_uid.as_str()).collect();
+        let dates: Vec<chrono::NaiveDate> = labels.iter().map(|l| l.service_date).collect();
+        let classes: Vec<&str> = labels.iter().map(|l| l.service_class.as_str()).collect();
+        let tocs: Vec<Option<&str>> = labels.iter().map(|l| l.toc_id.as_deref()).collect();
+        recorded(DB_WRITE_LABELS, async {
+            sqlx::query(LABELS_SQL)
+                .bind(&uids)
+                .bind(&dates)
+                .bind(&classes)
+                .bind(&tocs)
+                .execute(&self.pool)
+                .await?;
             Ok(())
         })
         .await
@@ -450,6 +496,77 @@ mod db_tests {
     /// The DB sink's reads and writes work as whichever role runs the
     /// tests (in CI's per-service step, `trust_backlog`): the STANOX/CRS
     /// reload, and empty batches write nothing.
+    /// DS-513: a label is filed under the train its Activation made, once
+    /// (a redelivery changes nothing), and a label with no train row is
+    /// skipped. Skips where the table is not migrated yet (ds-core
+    /// 20261113120000). As the narrow role only the key column is readable,
+    /// so the class and code are checked only where the role may read them.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with DATABASE_URL set and --ignored"]
+    async fn the_db_sink_files_a_label_under_its_train() {
+        use crate::labels::{ServiceClass, TrainLabel};
+
+        let pool = pool().await;
+        let migrated: Option<String> =
+            sqlx::query_scalar("SELECT to_regclass('train_service_labels')::text")
+                .fetch_one(&pool)
+                .await
+                .expect("look for the table");
+        if migrated.is_none() {
+            eprintln!("skipped: train_service_labels is not migrated");
+            return;
+        }
+        let sink = DbSink { pool: pool.clone() };
+        let tag = tag("lbl");
+        sink.write_backlog(&[event(&tag, true, "0001", "act")])
+            .await
+            .expect("write the Activation");
+        let label = |uid: String, class, toc: Option<&str>| TrainLabel {
+            train_uid: uid,
+            service_date: date(),
+            service_class: class,
+            toc_id: toc.map(str::to_owned),
+        };
+        let labels = [
+            label(
+                format!("{tag}U"),
+                ServiceClass::FreightOrEngineering,
+                Some("55"),
+            ),
+            label(format!("{tag}NOROW"), ServiceClass::Freight, None),
+        ];
+        sink.write_labels(&labels).await.expect("write the labels");
+        sink.write_labels(&labels).await.expect("write them again");
+        sink.write_labels(&[])
+            .await
+            .expect("an empty batch writes nothing");
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM train_service_labels l \
+               JOIN trains t ON t.id = l.trains_id WHERE t.train_uid LIKE $1",
+        )
+        .bind(format!("%{tag}%"))
+        .fetch_one(&pool)
+        .await
+        .expect("count the labels");
+        assert_eq!(count, 1, "one label, for the train that exists");
+        match sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT l.service_class, l.toc_id FROM train_service_labels l \
+               JOIN trains t ON t.id = l.trains_id WHERE t.train_uid = $1",
+        )
+        .bind(format!("{tag}U"))
+        .fetch_one(&pool)
+        .await
+        {
+            Ok((class, toc)) => {
+                assert_eq!(class, "freight_or_engineering");
+                assert_eq!(toc.as_deref(), Some("55"));
+            }
+            Err(err) => eprintln!("not checking the values (the role cannot read them): {err}"),
+        }
+        cleanup(&pool, &tag).await;
+    }
+
     #[tokio::test]
     #[ignore = "requires a live database; run with DATABASE_URL set and --ignored"]
     async fn the_db_sink_reloads_stanox_crs_and_skips_empty_batches() {
