@@ -392,17 +392,17 @@ impl ProcessorState {
         }
     }
 
-    /// The batch's events reached `api`. Its mutations are now durable
-    /// facts, so the undo log is dropped. Called by `main.rs`'s `run_cycle`
-    /// and by nothing else.
+    /// The batch's events were written. Its mutations are now durable
+    /// facts, so the undo log is dropped -- also when the XACK after the
+    /// write failed (finding T4). Called by `main.rs`'s `run_cycle` and by
+    /// nothing else (and tests).
     pub(crate) fn confirm_batch(&mut self) {
         self.journal.clear();
     }
 
-    /// The batch failed somewhere between `next_batch` and a confirmed
-    /// POST, so it will be redelivered (Redis: `reclaim_stale`'s 30-second
-    /// replay or the startup PEL replay; Kafka: `KafkaMovementFeed`'s
-    /// seek-back). Undo everything it did, newest change first, so the
+    /// The batch failed somewhere between `next_batch` and a committed
+    /// write, so it will be redelivered (the feed re-reads its un-ACKed
+    /// batch first on the next read, or the startup PEL replay). Undo everything it did, newest change first, so the
     /// replay sees the same state the first attempt saw and can produce the
     /// same events -- including the one-time
     /// `resolved_train_uid`/`resolved_train_id` resolution signal, which was

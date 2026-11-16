@@ -485,9 +485,9 @@ enum Cycle {
 /// **This function also owns the in-memory state's transaction boundary**
 /// (finding #4 of the 2026-09-25 review): `process::run_once` journals every
 /// mutation it makes to `state`, and exactly one of
-/// `ProcessorState::confirm_batch` (the whole cycle succeeded) or
-/// `ProcessorState::roll_back_batch` (anything at all failed) is called
-/// before returning. Without the rollback, a redelivered batch -- which the
+/// `ProcessorState::confirm_batch` (the write committed, whether or not the
+/// XACK then succeeded -- finding T4) or `ProcessorState::roll_back_batch`
+/// (anything before that failed) is called before returning. Without the rollback, a redelivered batch -- which the
 /// Redis backend really does replay into this same process after 30 seconds,
 /// via `RedisStreamMovementFeed::reclaim_stale` -- would find its own
 /// half-applied state from the failed attempt, decide the train was
@@ -596,12 +596,18 @@ where
             "operation" => "commit_offsets"
         )
         .increment(1);
-        // Rolled back even though the post itself succeeded: an uncommitted
-        // batch WILL be redelivered (`reclaim_stale`), and the replay must build
-        // the same events from the same pre-batch state. Re-posting them is
-        // harmless -- that is exactly what `dedup_key` and the writers'
-        // `ON CONFLICT` clauses are for.
-        state.roll_back_batch();
+        // Kept, NOT rolled back (finding T4): the write committed, so the
+        // batch's resolutions and claimed Activations are already facts in
+        // Postgres. Whether the XACK took is unknown -- a reply timeout can
+        // follow an applied XACK, and then nothing ever replays the batch,
+        // so a rollback here used to un-park its Activations (their pins
+        // later resolved with no `train_uid`, 'pending' for good) and forget
+        // its resolutions. If the XACK did not take, the batch is re-read
+        // first thing (the feed keeps it pending) and derived against this
+        // state: its events carry the same `dedup_key`s as the ones already
+        // written, so the writers' `ON CONFLICT` clauses drop them, and the
+        // one-time resolution signal they no longer carry has already landed.
+        state.confirm_batch();
         return Cycle::Failed;
     }
 
@@ -720,6 +726,51 @@ mod tests {
         assert_eq!(
             feed.committed_count, 0,
             "a batch that never reached api must not be committed"
+        );
+    }
+
+    /// Finding T4: the write committed but the XACK failed (it may well
+    /// have been applied, a reply timeout). The batch's resolutions and
+    /// parked Activations are in Postgres, so they are kept, not rolled
+    /// back: if the XACK did apply, nothing ever replays the batch to
+    /// rebuild them.
+    #[tokio::test]
+    async fn a_failed_commit_after_a_written_batch_keeps_its_state() {
+        let activation = r#"[{"header":{"msg_type":"0001"},"body":{
+            "train_id":"991A32406","train_uid":"C99999","toc_id":"SW",
+            "train_service_code":"22345000","schedule_wtt_id":"WTT1",
+            "schedule_start_date":"2026-08-28","schedule_end_date":"2026-08-28"
+        }}]"#;
+        let mut feed = FakeMovementFeed::new(vec![vec![
+            activation.to_string(),
+            ORIGIN_DEPARTURE.to_string(),
+        ]]);
+        feed.fail_next_commit = true;
+        let reference = one_pending_pin();
+        let mut state = process::ProcessorState::default();
+
+        let outcome = run_cycle(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            &sink::DB_OPERATIONS,
+            async |events| {
+                assert_eq!(events.len(), 1);
+                Ok(Vec::new())
+            },
+        )
+        .await;
+
+        assert_eq!(outcome, Cycle::Failed, "the XACK failed");
+        assert_eq!(feed.committed_count, 0);
+        assert!(
+            state.resolved.contains_key("221832406"),
+            "the written resolution is kept"
+        );
+        assert!(
+            state.pending_activations.contains_key("991A32406"),
+            "the parked Activation is kept"
         );
     }
 
