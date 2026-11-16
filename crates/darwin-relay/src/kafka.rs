@@ -28,6 +28,11 @@ pub(crate) struct Record {
     pub topic: String,
     pub partition: i32,
     pub offset: i64,
+    /// The record's Kafka timestamp (milliseconds since the epoch), when
+    /// the broker gives one. Part of the batch key
+    /// ([`crate::relay`]): it tells a recreated topic's offsets from the
+    /// old topic's.
+    pub timestamp_ms: Option<i64>,
     pub payload: Vec<u8>,
 }
 
@@ -376,6 +381,7 @@ impl RecordSource for KafkaSource {
             topic: message.topic().to_owned(),
             partition: message.partition(),
             offset: message.offset(),
+            timestamp_ms: message.timestamp().to_millis(),
             payload: message.payload().map(<[u8]>::to_vec).unwrap_or_default(),
         }))
     }
