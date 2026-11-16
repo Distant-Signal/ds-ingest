@@ -276,6 +276,18 @@ pub(crate) struct ProcessorState {
     /// that `journey::apply_cancellation` exists to preserve.
     pub last_derived: HashMap<String, DerivedState>,
 
+    /// `train_id -> the latest rail day a message for it was processed`,
+    /// for every `train_id` in `resolved`. What [`prune_stale_resolutions`]
+    /// ages `resolved`/`last_derived` out by: TRUST reuses a `train_id`
+    /// about monthly, and without pruning, next month's train under the
+    /// same id inherited this month's subscriptions and its terminal
+    /// `completed` state (which `journey::apply_movement` never leaves).
+    ///
+    /// Not journaled: a rolled-back batch can leave a slightly fresher date
+    /// here (or one for a `train_id` it un-resolved), which only delays the
+    /// pruning of that entry.
+    pub resolved_last_active: HashMap<String, NaiveDate>,
+
     /// `train_id`s resolved via `by_train_uid`'s direct-match fast path
     /// (this task) but not yet confirmed by a live Movement. `api`'s own
     /// `upsert_train_event` only flips `resolution_status` on a message
@@ -355,6 +367,7 @@ impl Default for ProcessorState {
             resolved: HashMap::new(),
             pending_activations: HashMap::new(),
             last_derived: HashMap::new(),
+            resolved_last_active: HashMap::new(),
             activation_matched_awaiting_movement: HashSet::new(),
             trust_timestamp_correction_enabled: true,
             journal: Vec::new(),
@@ -520,6 +533,99 @@ impl ProcessorState {
             train_id: train_id.to_string(),
             previous,
         });
+    }
+
+    /// Records that a message for `train_id` was processed on `rail_day`,
+    /// if `train_id` is resolved (see `resolved_last_active`).
+    fn note_activity(&mut self, train_id: &str, rail_day: NaiveDate) {
+        if !self.resolved.contains_key(train_id) {
+            return;
+        }
+        self.resolved_last_active
+            .entry(train_id.to_string())
+            .and_modify(|day| *day = (*day).max(rail_day))
+            .or_insert(rail_day);
+    }
+}
+
+/// The `train_id` a TRUST message is about, if it names one.
+fn message_train_id(message: &TrustMessage) -> Option<&str> {
+    match message {
+        TrustMessage::Activation(m) => Some(&m.train_id),
+        TrustMessage::Cancellation(m) => Some(&m.train_id),
+        TrustMessage::Movement(m) => Some(&m.train_id),
+        TrustMessage::Reinstatement(m) => Some(&m.train_id),
+        TrustMessage::ChangeOfOrigin(m) => Some(&m.train_id),
+        TrustMessage::ChangeOfIdentity(m) => Some(&m.train_id),
+        TrustMessage::Unknown(_) => None,
+    }
+}
+
+/// How many rail days a resolved `train_id` is kept after its last message
+/// once none of its subscriptions is active any more. Two, as for parked
+/// Activations ([`MAX_PARKED_ACTIVATION_AGE_DAYS`]): an overnight working
+/// still reports well into the next rail day, and a cancelled train can
+/// still be reinstated after its subscription left the active set.
+pub(crate) const MAX_RESOLVED_IDLE_DAYS: i64 = 2;
+
+/// Drops resolved `train_id`s that no current train can be reporting under
+/// (review finding T1): every subscription attributed to the `train_id` has
+/// left the active set (`ingest_active_tracked_trains`: completed,
+/// cancelled, unresolved or outside its service-date window) AND no
+/// message for it has been seen for more than [`MAX_RESOLVED_IDLE_DAYS`]
+/// rail days. Its `last_derived` state and any unspent "freshly resolved"
+/// marker go with it.
+///
+/// TRUST reuses a `train_id` about monthly. Before this, `resolved` and
+/// `last_derived` were only ever added to, so next month's train under the
+/// same id was attributed to last month's subscription (its movements
+/// written onto last month's train, and a user tracking the same commute
+/// merged into the stale entry), and derived from last month's terminal
+/// `completed` state, which `journey::apply_movement` never leaves. The
+/// maps also grew without bound.
+///
+/// Called on the reference-reload tick, between batches (the undo journal
+/// is empty then, so nothing pruned here can be restored by a rollback).
+/// `active` is every subscription id the reload returned; `today` the
+/// current rail day. Pure apart from `state`, like
+/// [`prune_expired_activations`].
+pub(crate) fn prune_stale_resolutions(
+    state: &mut ProcessorState,
+    active: &HashSet<i64>,
+    today: NaiveDate,
+) {
+    let oldest_kept = today - chrono::Duration::days(MAX_RESOLVED_IDLE_DAYS);
+    let expired: Vec<String> = state
+        .resolved
+        .iter()
+        .filter(|(train_id, ids)| {
+            let still_tracked = ids.iter().any(|id| active.contains(id));
+            let recently_active = state
+                .resolved_last_active
+                .get(*train_id)
+                .is_some_and(|day| *day >= oldest_kept);
+            !still_tracked && !recently_active
+        })
+        .map(|(train_id, _)| train_id.clone())
+        .collect();
+    for train_id in &expired {
+        state.resolved.remove(train_id);
+        state.last_derived.remove(train_id);
+        state.activation_matched_awaiting_movement.remove(train_id);
+        state.resolved_last_active.remove(train_id);
+    }
+    // An activity date outlives a resolution a rolled-back batch undid (see
+    // `resolved_last_active`); it goes once it is as old as a stale one.
+    let resolved = &state.resolved;
+    state
+        .resolved_last_active
+        .retain(|train_id, day| resolved.contains_key(train_id) || *day >= oldest_kept);
+    if !expired.is_empty() {
+        tracing::info!(
+            pruned = expired.len(),
+            kept = state.resolved.len(),
+            "dropped resolved train_ids no active subscription or recent message still needs"
+        );
     }
 }
 
@@ -962,6 +1068,9 @@ pub(crate) async fn run_once<F: MovementFeed + movement_feed::DeadLetterSink>(
                 ))
                 .increment(1);
                 events.push(event);
+            }
+            if let Some(train_id) = message_train_id(&message) {
+                state.note_activity(train_id, common::rail_day::current_rail_day(received_at));
             }
         }
     }
@@ -2424,6 +2533,114 @@ mod tests {
             "only the resolving message carries these"
         );
         assert_eq!(second[0].resolved_train_id, None);
+    }
+
+    /// Finding T1: a resolved `train_id` is dropped once nothing active
+    /// still reports under it, so next month's train reusing the id is not
+    /// attributed to this month's subscription.
+    #[tokio::test]
+    async fn a_reused_train_id_is_not_attributed_to_last_months_subscription() {
+        let later_arrival = r#"[{"header":{"msg_type":"0003"},"body":{
+            "train_id":"221832406","event_type":"ARRIVAL",
+            "planned_timestamp":"1787946600000","actual_timestamp":"1787946600000",
+            "loc_stanox":"86031","variation_status":"ON TIME"
+        }}]"#;
+        let mut feed = FakeMovementFeed::new(vec![
+            vec![ORIGIN_DEPARTURE.to_string()],
+            vec![later_arrival.to_string()],
+        ]);
+        let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
+        let mut state = ProcessorState::default();
+
+        let first = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first[0].tracked_train_id, 1);
+        assert_eq!(
+            state.resolved_last_active.get("221832406"),
+            Some(&test_rail_day()),
+            "the resolving message records its rail day"
+        );
+
+        // A month on, subscription 1 has long left the active set.
+        let month_later = test_rail_day() + chrono::Duration::days(30);
+        prune_stale_resolutions(&mut state, &HashSet::new(), month_later);
+        assert!(state.resolved.is_empty());
+        assert!(state.last_derived.is_empty());
+        assert!(state.resolved_last_active.is_empty());
+
+        // The id's next train (no pin matches it) is not attributed to
+        // subscription 1.
+        let reused = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            reused.is_empty(),
+            "a reused train_id must not inherit last month's subscription"
+        );
+    }
+
+    #[test]
+    fn prune_stale_resolutions_keeps_active_or_recent_train_ids_only() {
+        let today = test_rail_day();
+        let days_ago = |n: i64| today - chrono::Duration::days(n);
+        let mut state = ProcessorState::default();
+        for (train_id, tracked_train_id) in [("A", 1), ("B", 2), ("C", 3), ("D", 4)] {
+            state
+                .resolved
+                .insert(train_id.to_string(), vec![tracked_train_id]);
+            state
+                .last_derived
+                .insert(train_id.to_string(), DerivedState::awaiting_activation());
+            state
+                .activation_matched_awaiting_movement
+                .insert(train_id.to_string());
+        }
+        // A: still tracked, however old. B: no longer tracked but seen
+        // within the window (a cancelled train can still be reinstated).
+        // C: neither. D: neither, and never seen at all.
+        state
+            .resolved_last_active
+            .insert("A".to_string(), days_ago(10));
+        state
+            .resolved_last_active
+            .insert("B".to_string(), days_ago(MAX_RESOLVED_IDLE_DAYS));
+        state
+            .resolved_last_active
+            .insert("C".to_string(), days_ago(MAX_RESOLVED_IDLE_DAYS + 1));
+        // An activity date left behind by a rolled-back resolution.
+        state
+            .resolved_last_active
+            .insert("orphan".to_string(), days_ago(MAX_RESOLVED_IDLE_DAYS + 1));
+
+        prune_stale_resolutions(&mut state, &HashSet::from([1]), today);
+
+        let mut kept: Vec<&String> = state.resolved.keys().collect();
+        kept.sort();
+        assert_eq!(kept, ["A", "B"]);
+        for train_id in ["C", "D"] {
+            assert!(!state.last_derived.contains_key(train_id));
+            assert!(
+                !state
+                    .activation_matched_awaiting_movement
+                    .contains(train_id)
+            );
+            assert!(!state.resolved_last_active.contains_key(train_id));
+        }
+        assert!(state.last_derived.contains_key("A") && state.last_derived.contains_key("B"));
+        assert!(!state.resolved_last_active.contains_key("orphan"));
     }
 
     /// The headline scenario this feature exists for, exercised through the

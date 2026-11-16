@@ -393,6 +393,7 @@ fn apply_loaded_reference(
     reference: &mut process::Reference,
     state: &mut process::ProcessorState,
 ) {
+    let active: std::collections::HashSet<i64> = refs.iter().map(|tracked| tracked.id).collect();
     process::apply_reference_reload(refs, reference, state);
     // Same cadence, unrelated job: age out parked Activations that no live
     // Movement can still claim, so the national Activation stream can't
@@ -403,10 +404,11 @@ fn apply_loaded_reference(
     // is, so both sides of that comparison have to be rail days on the same
     // Europe/London 02:00 convention, or an Activation observed at 01:00
     // local would be compared against tomorrow's date.
-    process::prune_expired_activations(
-        &mut state.pending_activations,
-        common::rail_day::current_rail_day(chrono::Utc::now()),
-    );
+    let today = common::rail_day::current_rail_day(chrono::Utc::now());
+    process::prune_expired_activations(&mut state.pending_activations, today);
+    // And resolved `train_id`s nothing active still reports under, before
+    // TRUST reuses the id for another train (finding T1).
+    process::prune_stale_resolutions(state, &active, today);
 }
 
 /// Startup gate (PL-11): calls `fetch` until it succeeds, sleeping `min`,
