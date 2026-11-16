@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, Utc};
-use common::darwin::{Batch, CallKey, Platform, Service, StatusCall};
+use common::darwin::{Batch, CallKey, Platform, ScheduleCall, ScheduleFields, Service, StatusCall};
 use ingest_stream::{Envelope, Handled, Handler, SchemaId, StreamEntry};
 use ingest_writer::handlers::registry;
 use ingest_writer::stream::{StreamSpec, WriterHandler};
@@ -205,6 +205,131 @@ async fn the_freshness_marker_is_clamped_and_a_future_one_healed() {
 
     cleanup(&admin).await;
     clear_future_freshness(&admin).await;
+}
+
+/// D3 (handler side): a re-sent schedule with fewer locations applies
+/// through the handler, and its locations take the new schedule. A location
+/// the new schedule dropped is never stamped with the new schedule's time:
+/// it keeps the old one until ds-core's `upsert_schedule_calls` deletes
+/// such locations, after which it is gone (either passes here).
+#[tokio::test]
+#[ignore = "requires a live database: DATABASE_URL=... cargo test -p ingest-writer --test \
+            darwin_handler -- --ignored --test-threads=1"]
+async fn a_resent_schedule_with_fewer_locations_applies() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let admin = admin_pool(&pool).await;
+    cleanup(&admin).await;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let handler = WriterHandler::new(
+        pool.clone(),
+        Arc::new(registry()),
+        StreamSpec::by_stream(STREAM).expect("the darwin stream"),
+    );
+
+    let old = "2099-07-11T08:00:00Z";
+    let new = "2099-07-11T08:30:00Z";
+    let full = entry(
+        &format!("{nanos:x}-s1"),
+        &schedule(
+            old,
+            &[
+                ("YORK", "10:00", "10:00"),
+                ("DONC", "10:20", "10:20"),
+                ("KNGX", "12:00", "12:00"),
+            ],
+        ),
+    );
+    assert!(matches!(handler.handle(&full).await, Ok(Handled::Applied)));
+    let shorter = entry(
+        &format!("{nanos:x}-s2"),
+        &schedule(
+            new,
+            &[("YORK", "10:00", "10:05"), ("KNGX", "12:00", "12:05")],
+        ),
+    );
+    assert!(matches!(
+        handler.handle(&shorter).await,
+        Ok(Handled::Applied)
+    ));
+
+    let rows: Vec<(String, Option<String>, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT tiploc, ptd, schedule_ts FROM darwin_calls WHERE rid = $1 ORDER BY tiploc",
+    )
+    .bind(SCHEDULE_RID)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    for (tiploc, ptd) in [("YORK", "10:05"), ("KNGX", "12:05")] {
+        let row = rows
+            .iter()
+            .find(|(t, _, _)| t == tiploc)
+            .unwrap_or_else(|| panic!("{tiploc} kept: {rows:?}"));
+        assert_eq!((row.1.as_deref(), row.2), (Some(ptd), ts(new)), "{rows:?}");
+    }
+    if let Some(dropped) = rows.iter().find(|(t, _, _)| t == "DONC") {
+        assert_eq!(dropped.2, ts(old), "a dropped location kept its old time");
+    }
+    let train_id: Option<String> =
+        sqlx::query_scalar("SELECT train_id FROM darwin_services WHERE rid = $1")
+            .bind(SCHEDULE_RID)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(train_id.as_deref(), Some("1Z81"));
+
+    cleanup(&admin).await;
+    clear_future_freshness(&admin).await;
+}
+
+const SCHEDULE_RID: &str = "209907118Z80002";
+
+/// A schedule message for [`SCHEDULE_RID`] at `at`, calling at `calls`
+/// (TIPLOC, working departure, public departure).
+fn schedule(at: &str, calls: &[(&str, &str, &str)]) -> Batch {
+    let ssd = NaiveDate::from_ymd_opt(2099, 7, 11).unwrap();
+    Batch {
+        services: vec![Service {
+            rid: SCHEDULE_RID.to_owned(),
+            uid: "Z80002".to_owned(),
+            ssd,
+            schedule: Some(ScheduleFields {
+                toc: Some("GR".to_owned()),
+                train_id: Some("1Z81".to_owned()),
+                rsid: None,
+                is_passenger: Some(true),
+                deleted: false,
+                cancel_reason: None,
+            }),
+            ts: ts(at),
+        }],
+        schedule_calls: calls
+            .iter()
+            .map(|(tiploc, wtd, ptd)| ScheduleCall {
+                key: CallKey {
+                    rid: SCHEDULE_RID.to_owned(),
+                    tiploc: (*tiploc).to_owned(),
+                    wta: String::new(),
+                    wtd: (*wtd).to_owned(),
+                    wtp: String::new(),
+                },
+                ssd,
+                pta: None,
+                ptd: Some((*ptd).to_owned()),
+                planned_platform: None,
+                cancelled: false,
+                ts: ts(at),
+            })
+            .collect(),
+        ..Batch::default()
+    }
 }
 
 /// Removes a `darwin-pushport` marker the tests left ahead of the clock
