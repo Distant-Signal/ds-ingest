@@ -15,6 +15,18 @@
 //!
 //! **Duplicates** (a re-read after a restart or a rebalance) are harmless:
 //! every stored row is guarded by its Darwin timestamp.
+//!
+//! **The batch key** ([`Accumulator::key`]) names the records it holds:
+//! per topic partition, the offset range and the Kafka timestamp of its
+//! first record. The writer keeps applied keys for 48 hours and skips an
+//! entry whose key it has seen, so a key must never name different
+//! records: the topic tells a renamed topic's offsets from the old one's,
+//! and the timestamp a recreated topic's (same name, offsets from 0 again).
+//! The consumer group is left out on purpose: offsets belong to the topic,
+//! so another group reading the same offsets reads the same records, and
+//! skipping them is right. Keys of the older form
+//! (`darwin-pushport:0@120-180`, before DS-534) cannot match a new key;
+//! they age out of the writer's dedup table on their own.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -53,8 +65,9 @@ pub(crate) struct Limits {
 #[derive(Default)]
 struct Accumulator {
     batch: Batch,
-    /// The highest offset read per `(topic, partition)`.
-    offsets: BTreeMap<(String, i32), (i64, i64)>,
+    /// Per `(topic, partition)`: the offset range read, and the Kafka
+    /// timestamp of its first record.
+    offsets: BTreeMap<(String, i32), Range>,
     records: usize,
     newest: Option<DateTime<Utc>>,
 }
@@ -64,11 +77,12 @@ impl Accumulator {
         self.records += 1;
         self.offsets
             .entry((record.topic.clone(), record.partition))
-            .and_modify(|(first, last)| {
-                *first = (*first).min(record.offset);
-                *last = (*last).max(record.offset);
-            })
-            .or_insert((record.offset, record.offset));
+            .and_modify(|range| range.add(record))
+            .or_insert(Range {
+                first: record.offset,
+                last: record.offset,
+                first_timestamp_ms: record.timestamp_ms,
+            });
         match pushport::decode_record(&record.payload) {
             Ok(Decoded::Document(batch)) => {
                 metrics::record("document");
@@ -97,13 +111,21 @@ impl Accumulator {
         }
     }
 
-    /// The batch's idempotency key: the schema, then each partition's
-    /// offset range (`darwin-pushport:0@120-180`).
+    /// The batch's idempotency key (see the module docs): the schema, then
+    /// each topic partition's offset range and, when Kafka gave one, its
+    /// first record's timestamp in milliseconds
+    /// (`darwin-pushport:darwin-topic:0@120-180~1763294400000`).
     fn key(&self) -> String {
         let ranges: Vec<String> = self
             .offsets
             .iter()
-            .map(|((_, partition), (first, last))| format!("{partition}@{first}-{last}"))
+            .map(|((topic, partition), range)| {
+                let part = format!("{topic}:{partition}@{}-{}", range.first, range.last);
+                match range.first_timestamp_ms {
+                    Some(ms) => format!("{part}~{ms}"),
+                    None => part,
+                }
+            })
             .collect();
         format!("{}:{}", common::darwin::SCHEMA, ranges.join(","))
     }
@@ -111,8 +133,26 @@ impl Accumulator {
     fn commit_offsets(&self) -> Vec<(String, i32, i64)> {
         self.offsets
             .iter()
-            .map(|((topic, partition), (_, last))| (topic.clone(), *partition, *last))
+            .map(|((topic, partition), range)| (topic.clone(), *partition, range.last))
             .collect()
+    }
+}
+
+/// The records read from one topic partition.
+struct Range {
+    first: i64,
+    last: i64,
+    /// The Kafka timestamp of the record at `first`.
+    first_timestamp_ms: Option<i64>,
+}
+
+impl Range {
+    fn add(&mut self, record: &Record) {
+        if record.offset < self.first {
+            self.first = record.offset;
+            self.first_timestamp_ms = record.timestamp_ms;
+        }
+        self.last = self.last.max(record.offset);
     }
 }
 
@@ -304,6 +344,7 @@ mod tests {
             topic: "t".to_owned(),
             partition: 0,
             offset,
+            timestamp_ms: Some(1_763_294_400_000 + offset),
             payload,
         }
     }
@@ -331,7 +372,7 @@ mod tests {
         assert!(matches!(cycle, Cycle::Committed { records: 3, .. }));
         assert_eq!(sink.published.len(), 1);
         let (key, batch) = &sink.published[0];
-        assert_eq!(key, "darwin-pushport:0@10-12");
+        assert_eq!(key, "darwin-pushport:t:0@10-12~1763294400010");
         // The schedule and the TS for the same RID merged to one service
         // that kept its schedule fields.
         assert_eq!(batch.services.len(), 1);
@@ -371,6 +412,59 @@ mod tests {
             .expect("cycle");
         assert_eq!(sink.published, []);
         assert_eq!(source.committed, vec![vec![("t".to_owned(), 0, 12)]]);
+    }
+
+    fn key_of(records: &[Record]) -> String {
+        let mut acc = Accumulator::default();
+        for record in records {
+            acc.add(record);
+        }
+        acc.key()
+    }
+
+    #[test]
+    fn the_key_tells_a_renamed_or_recreated_topic_from_the_old_one() {
+        let old = key_of(&[record(10, b"x".to_vec()), record(12, b"x".to_vec())]);
+        // The same records read again (a restart): the same key.
+        assert_eq!(
+            old,
+            key_of(&[record(10, b"x".to_vec()), record(12, b"x".to_vec())])
+        );
+        // Another topic at the same offsets.
+        let renamed = key_of(&[
+            Record {
+                topic: "u".to_owned(),
+                ..record(10, b"x".to_vec())
+            },
+            Record {
+                topic: "u".to_owned(),
+                ..record(12, b"x".to_vec())
+            },
+        ]);
+        assert_ne!(old, renamed);
+        // The topic recreated: offsets from the start again, new times.
+        let recreated = key_of(&[
+            Record {
+                timestamp_ms: Some(1_800_000_000_000),
+                ..record(10, b"x".to_vec())
+            },
+            record(12, b"x".to_vec()),
+        ]);
+        assert_ne!(old, recreated);
+    }
+
+    #[test]
+    fn the_key_names_each_partition_and_takes_the_lowest_offsets_time() {
+        let key = key_of(&[
+            record(12, b"x".to_vec()),
+            record(10, b"x".to_vec()),
+            Record {
+                partition: 1,
+                timestamp_ms: None,
+                ..record(7, b"x".to_vec())
+            },
+        ]);
+        assert_eq!(key, "darwin-pushport:t:0@10-12~1763294400010,t:1@7-7");
     }
 
     #[test]

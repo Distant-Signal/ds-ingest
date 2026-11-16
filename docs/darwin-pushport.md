@@ -40,7 +40,9 @@ RDM Push Port JSON topic (Kafka, SASL_SSL)
   committed offset, a gap of seconds that loses nothing.
 - **ingest-writer** applies `darwin-pushport/1` (`ingestWriter.streams.darwin`)
   and records `ingest_freshness` source `darwin-pushport` at the batch's
-  newest Darwin time.
+  newest Darwin time, clamped to the writer's clock plus 2 minutes like
+  every observed time, so a message stamped in the future cannot hold the
+  marker ahead and silence the staleness alert.
 - **The api** lays each tracked train's Push Port locations over its stops
   (`crates/api/src/data/pushport_platform.rs`): a stop matches the Darwin
   location with its TIPLOC and working time. A confirmed platform is served
