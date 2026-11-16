@@ -291,6 +291,9 @@ pub(crate) async fn run_startup_replay<S: ReplaySource + ?Sized>(
         };
         let population = population.load();
         for (id, payload) in &page.entries {
+            // The group redelivers a pending entry next, and the live path
+            // routes it by when it was received (`DayState::dispatch_entry`),
+            // so one from the lookback segment still takes the lookback path.
             if pending.contains(id) {
                 report.skipped_pending += 1;
                 continue;
@@ -299,7 +302,7 @@ pub(crate) async fn run_startup_replay<S: ReplaySource + ?Sized>(
             // The entry's own time: when the relay received it.
             let received_at = stream_id_time(id).unwrap_or_else(chrono::Utc::now);
             let dispatched = if lookback {
-                day.dispatch_lookback_payload(payload, lookups, received_at)
+                day.dispatch_lookback_payload(payload, lookups, &population, received_at)
             } else {
                 day.dispatch_payload(payload, lookups, &population, received_at)
             };
