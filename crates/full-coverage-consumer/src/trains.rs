@@ -35,6 +35,15 @@ pub(crate) fn to_minutes(instant: DateTime<Utc>) -> u32 {
     u32::try_from(instant.timestamp().div_euclid(60)).unwrap_or(0)
 }
 
+/// The skew `common::trust_timestamp`'s correction removes from a TRUST
+/// timestamp stamped at `at`: London local time written as if it were UTC,
+/// so minus London's UTC offset (-60 minutes under BST, 0 under GMT). What
+/// [`TrainState`] assumes until a Movement has shown the real skew.
+pub(crate) fn london_skew(at: DateTime<Utc>) -> chrono::Duration {
+    let wall = at.naive_utc();
+    common::rail_day::london_to_utc(wall.date(), wall.time()) - at
+}
+
 /// A live 0002.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[expect(
@@ -127,7 +136,10 @@ pub(crate) struct TrainState {
     /// feed's current local-as-UTC skew (`common::trust_timestamp`), applied
     /// to 0002/0006 `dep_timestamp`s, which are planned times often hours
     /// ahead of receipt and so cannot be plausibility-checked on their own.
-    skew: chrono::Duration,
+    /// Learned from every Movement, the startup replay's lookback segment
+    /// included ([`TrainState::learn_skew`]); `None` until one is seen, when
+    /// [`london_skew`] at the message's receipt stands in.
+    skew: Option<chrono::Duration>,
 }
 
 impl TrainState {
@@ -139,7 +151,7 @@ impl TrainState {
             train_ids: HashMap::new(),
             parked: HashMap::new(),
             tiplocs: HashMap::new(),
-            skew: chrono::Duration::zero(),
+            skew: None,
         }
     }
 
@@ -281,22 +293,7 @@ impl TrainState {
         tiploc: Option<&str>,
         received_at: DateTime<Utc>,
     ) -> Option<DateTime<Utc>> {
-        let pair = common::trust_timestamp::parse_trust_epoch_millis_pair(
-            movement.planned_timestamp.as_deref(),
-            movement.actual_timestamp.as_deref(),
-            received_at,
-            true,
-        );
-        if let (Some(actual), Some(raw)) = (
-            pair.actual,
-            movement
-                .actual_timestamp
-                .as_deref()
-                .and_then(|a| a.parse::<i64>().ok())
-                .and_then(DateTime::from_timestamp_millis),
-        ) {
-            self.skew = actual - raw;
-        }
+        let pair = self.learn_skew(movement, received_at);
         let (which, uid) = self.lookup(&movement.train_id)?;
         let delay = trust_schema::schema::movement_delay_minutes(movement)?;
         let planned = pair.planned?;
@@ -319,10 +316,40 @@ impl TrainState {
         pair.actual
     }
 
-    fn dep_minutes(&self, raw: Option<&str>, _received_at: DateTime<Utc>) -> Option<u32> {
+    /// Learns the feed's current skew from a Movement's `actual_timestamp`
+    /// (see [`TrainState::skew`]) and returns its corrected timestamps.
+    /// Called for every Movement, including the startup replay's lookback
+    /// ones, which record nothing else: without them a replay's 0002/0006s
+    /// all came out uncorrected, 60 minutes late under BST.
+    pub(crate) fn learn_skew(
+        &mut self,
+        movement: &Movement,
+        received_at: DateTime<Utc>,
+    ) -> common::trust_timestamp::TrustTimestampPair {
+        let pair = common::trust_timestamp::parse_trust_epoch_millis_pair(
+            movement.planned_timestamp.as_deref(),
+            movement.actual_timestamp.as_deref(),
+            received_at,
+            true,
+        );
+        if let (Some(actual), Some(raw)) = (
+            pair.actual,
+            movement
+                .actual_timestamp
+                .as_deref()
+                .and_then(|a| a.parse::<i64>().ok())
+                .and_then(DateTime::from_timestamp_millis),
+        ) {
+            self.skew = Some(actual - raw);
+        }
+        pair
+    }
+
+    fn dep_minutes(&self, raw: Option<&str>, received_at: DateTime<Utc>) -> Option<u32> {
         let millis: i64 = raw?.trim().parse().ok()?;
         let raw = DateTime::from_timestamp_millis(millis)?;
-        Some(to_minutes(raw.checked_add_signed(self.skew)?))
+        let skew = self.skew.unwrap_or_else(|| london_skew(received_at));
+        Some(to_minutes(raw.checked_add_signed(skew)?))
     }
 
     /// The state for the day after this one: `next` becomes `current`, and
@@ -357,6 +384,12 @@ impl TrainState {
         rolled.tiplocs = self.tiplocs;
         rolled.skew = self.skew;
         (rolled, unattributed)
+    }
+
+    /// The skew learned so far, if any.
+    #[cfg(test)]
+    pub(crate) fn skew(&self) -> Option<chrono::Duration> {
+        self.skew
     }
 
     /// Parked messages not yet attributed.
@@ -582,6 +615,36 @@ mod tests {
         let mut c = cancellation("1A01MW27", None);
         c.dep_timestamp = Some(skewed("2026-09-27T11:00:00Z"));
         s.apply_cancellation(&c, at("2026-09-27T09:01:00Z"));
+        assert_eq!(
+            s.current["C1"].cancel.as_ref().unwrap().dep_min,
+            Some(to_minutes(at("2026-09-27T11:00:00Z")))
+        );
+    }
+
+    /// Regression test (F6): with no Movement seen yet (the first entries
+    /// of a replay), a 0002's `dep_timestamp` is corrected by London's
+    /// offset at receipt rather than not at all.
+    #[test]
+    fn before_any_movement_the_skew_is_londons_offset() {
+        assert_eq!(
+            london_skew(at("2026-09-27T09:00:00Z")),
+            chrono::Duration::hours(-1)
+        );
+        assert_eq!(
+            london_skew(at("2026-01-27T09:00:00Z")),
+            chrono::Duration::zero()
+        );
+
+        let mut s = TrainState::new(date());
+        s.apply_activation(&activation("1A01MW27", "C1"), false);
+        let mut c = cancellation("1A01MW27", None);
+        c.dep_timestamp = Some(
+            (at("2026-09-27T11:00:00Z") + chrono::Duration::hours(1))
+                .timestamp_millis()
+                .to_string(),
+        );
+        s.apply_cancellation(&c, at("2026-09-27T09:01:00Z"));
+        assert_eq!(s.skew(), None);
         assert_eq!(
             s.current["C1"].cancel.as_ref().unwrap().dep_min,
             Some(to_minutes(at("2026-09-27T11:00:00Z")))
