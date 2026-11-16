@@ -80,6 +80,12 @@ pub(crate) struct CycleOutcome {
     /// How many `(line_id, date)` fetches reached the source and were
     /// understood (a body or `null`, or not modified).
     pub succeeded: usize,
+    /// Every `(line_id, date)` the source answered `null` for (nothing
+    /// published). Not a failure -- no faster retry, no abort -- but a
+    /// line with no population for the current day when consumption
+    /// begins is just as unable to match its trains as one whose fetch
+    /// failed ([`Reloader::run`]'s first load).
+    pub unpublished: Vec<(String, chrono::NaiveDate)>,
 }
 
 impl CycleOutcome {
@@ -90,6 +96,24 @@ impl CycleOutcome {
             .filter(|(_, d)| *d == date)
             .map(|(line, _)| line.clone())
             .collect()
+    }
+
+    /// Lines with no population for `date` in `population` after this
+    /// cycle: their fetch failed, or nothing is published for them (and
+    /// none was held from before).
+    pub(crate) fn missing_on(
+        &self,
+        population: &Population,
+        date: chrono::NaiveDate,
+    ) -> Vec<String> {
+        let mut missing = self.failed_on(date);
+        missing.extend(
+            self.unpublished
+                .iter()
+                .filter(|(line, d)| *d == date && !population.has(line, date))
+                .map(|(line, _)| line.clone()),
+        );
+        missing
     }
 }
 
@@ -320,6 +344,7 @@ pub(crate) async fn reload_cycle_with<S: PopulationSource>(
     start: usize,
 ) -> (Population, CycleOutcome) {
     let mut next = Population::default();
+    next.set_built_for(service_date);
     let mut outcome = CycleOutcome::default();
     let dates = [service_date, service_date + chrono::Duration::days(1)];
     let cycle = source.begin_cycle(line_ids, &dates).await;
@@ -402,7 +427,16 @@ pub(crate) async fn reload_cycle_with<S: PopulationSource>(
                         Ok(None) => {
                             // Nothing published yet for this (line, date) --
                             // Decision 2e's Pending case, upstream of the
-                            // rail-day gate. Not an error.
+                            // rail-day gate. Not an error. A population
+                            // already held for the CURRENT day is kept,
+                            // though: a day's population is not withdrawn
+                            // mid-day, so a `null` then is transient, and
+                            // dropping it emptied the line's rows until the
+                            // next cycle.
+                            if date == dates[0] {
+                                next.carry_over(previous, line_id, date);
+                            }
+                            outcome.unpublished.push((line_id.clone(), date));
                             outcome.succeeded += 1;
                         }
                         Err(err) => {
@@ -693,10 +727,14 @@ impl Reloader {
             .record(cycle_start.elapsed().as_secs_f64());
 
             if tx.borrow().is_none() {
-                let missing = outcome.failed_on(service_date);
-                let today_ok = line_ids.len().saturating_sub(missing.len());
+                let failed = outcome.failed_on(service_date);
+                let today_ok = line_ids.len().saturating_sub(failed.len());
                 let give_up_waiting = started.elapsed() >= self.initial_wait && today_ok > 0;
-                if missing.is_empty() || give_up_waiting {
+                if failed.is_empty() || give_up_waiting {
+                    // Only failures hold consumption back; a line with
+                    // nothing published for today is partial for the day
+                    // like a failed one, but waiting would not publish it.
+                    let missing = outcome.missing_on(&self.population.load(), service_date);
                     if !missing.is_empty() {
                         tracing::error!(
                             %service_date,
@@ -1264,6 +1302,69 @@ pub(crate) mod tests {
         .expect("let through after the initial wait")
         .unwrap();
         assert_eq!(first.missing_lines, vec!["broken-line".to_string()]);
+    }
+
+    /// Regression test: a `null` (nothing published) for the current day
+    /// used to drop a population already held, emptying the line's rows
+    /// until the next cycle. It is kept now; tomorrow's `null` still means
+    /// nothing held. Neither is a failure.
+    #[tokio::test]
+    async fn a_null_for_today_keeps_the_held_population() {
+        let source = Scripted::new(|_, _, _, _| body("null"));
+        let today: chrono::NaiveDate = "2026-09-04".parse().unwrap();
+        let tomorrow = today + chrono::Duration::days(1);
+        let mut previous = Population::default();
+        for date in [today, tomorrow] {
+            previous.insert_uids(
+                "waterloo-reading",
+                date,
+                ["C11052".to_string()].into(),
+                None,
+            );
+        }
+        let lines = vec!["waterloo-reading".to_string(), "unpublished".to_string()];
+        let (next, outcome) =
+            reload_cycle(&source, &lines, &HashMap::new(), &previous, today).await;
+        assert_eq!(outcome.failed, []);
+        assert_eq!(outcome.unpublished.len(), 4);
+        assert_eq!(next.built_for(), Some(today));
+        assert_eq!(next.uids_for("waterloo-reading", today), vec!["C11052"]);
+        assert!(!next.has("waterloo-reading", tomorrow));
+        assert_eq!(
+            outcome.missing_on(&next, today),
+            vec!["unpublished".to_string()],
+            "only the line with no population held for today is missing"
+        );
+    }
+
+    /// Regression test: a line with nothing published for today when
+    /// consumption begins used to be neither waited for nor reported, so
+    /// its row was not partial: trains that ran before the process started
+    /// counted as cancelled under the no-event rule while the row read
+    /// "available". It is reported missing now, without holding the first
+    /// load back (waiting would not publish it).
+    #[tokio::test]
+    async fn a_line_unpublished_for_today_is_reported_missing_at_the_first_load() {
+        let source = Scripted::new(|line: &str, _, _, _| {
+            if line == "unpublished" {
+                body("null")
+            } else {
+                body(BODY)
+            }
+        });
+        let (reloader, _) = reloader(&["waterloo-reading", "unpublished"]);
+        let mut rx = reloader.spawn(source);
+        let first = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_first_load(
+                &mut rx,
+                &health_http::Progress::new(Duration::from_secs(60)),
+            ),
+        )
+        .await
+        .expect("not held back by the initial wait")
+        .unwrap();
+        assert_eq!(first.missing_lines, vec!["unpublished".to_string()]);
     }
 }
 
