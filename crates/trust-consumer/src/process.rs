@@ -535,6 +535,63 @@ impl ProcessorState {
         });
     }
 
+    /// A Change of Identity (`0007`): TRUST reports the train under
+    /// `revised` from now on, so everything known about `current` is
+    /// carried over to it (review finding T3). Without this, every later
+    /// message under the revised id missed `resolved` and was dropped, and
+    /// a later DEPARTURE under it could claim a different pin.
+    ///
+    /// - `resolved`: `current`'s subscriptions are unioned into `revised`'s
+    ///   (journaled, as every attribution is).
+    /// - `last_derived`: copied, unless `revised` already has a state of its
+    ///   own, so the next message derives from where the train was.
+    /// - the unspent "freshly resolved" marker and a parked Activation are
+    ///   MOVED (both are one-shot), so the first Movement under `revised`
+    ///   still carries the `train_uid` and the resolution signal.
+    /// - `resolved_last_active`: the later of the two dates.
+    ///
+    /// `current`'s own entries are kept (TRUST may still send a straggler
+    /// under it) and age out like any other ([`prune_stale_resolutions`]).
+    /// Every map change goes through the journaled mutators, so a rolled-back
+    /// batch undoes this too.
+    ///
+    /// Not wired up yet: ds-core's `trust_schema::schema::ChangeOfIdentity`
+    /// models only `train_id`, not TRUST's `revised_train_id`. Once a ds-core
+    /// release adds it, the `ChangeOfIdentity` arm of `process_message` calls
+    /// this with `(change.train_id, change.revised_train_id)`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "called once ds-core's ChangeOfIdentity carries revised_train_id (finding T3)"
+        )
+    )]
+    pub(crate) fn carry_over_identity(&mut self, current: &str, revised: &str) {
+        if current == revised {
+            return;
+        }
+        if let Some(ids) = self.resolved.get(current).cloned() {
+            self.attribute(revised, &ids);
+        }
+        if !self.last_derived.contains_key(revised)
+            && let Some(derived) = self.last_derived.get(current).cloned()
+        {
+            self.set_last_derived(revised, derived);
+        }
+        if self.spend_awaiting_movement(current) {
+            self.mark_awaiting_movement(revised);
+        }
+        if !self.pending_activations.contains_key(revised)
+            && let Some(activation) = self.pending_activations.get(current).cloned()
+            && self.claim_activation(current).is_some()
+        {
+            self.park_activation(revised, activation);
+        }
+        if let Some(day) = self.resolved_last_active.get(current).copied() {
+            self.note_activity(revised, day);
+        }
+    }
+
     /// Records that a message for `train_id` was processed on `rail_day`,
     /// if `train_id` is resolved (see `resolved_last_active`).
     fn note_activity(&mut self, train_id: &str, rail_day: NaiveDate) {
@@ -2641,6 +2698,117 @@ mod tests {
         }
         assert!(state.last_derived.contains_key("A") && state.last_derived.contains_key("B"));
         assert!(!state.resolved_last_active.contains_key("orphan"));
+    }
+
+    /// Finding T3: after a Change of Identity, the revised `train_id`
+    /// inherits the old one's subscriptions and state, so its next movement
+    /// is attributed instead of dropped.
+    #[tokio::test]
+    async fn a_revised_train_id_inherits_the_resolution_and_derived_state() {
+        let under_revised_id = r#"[{"header":{"msg_type":"0003"},"body":{
+            "train_id":"221Z32406","event_type":"ARRIVAL",
+            "planned_timestamp":"1787946600000","actual_timestamp":"1787946600000",
+            "loc_stanox":"86031","variation_status":"ON TIME"
+        }}]"#;
+        let mut feed = FakeMovementFeed::new(vec![
+            vec![ORIGIN_DEPARTURE.to_string()],
+            vec![under_revised_id.to_string()],
+        ]);
+        let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
+        let mut state = ProcessorState::default();
+        run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+        state.confirm_batch();
+
+        state.carry_over_identity("221832406", "221Z32406");
+        assert_eq!(state.resolved.get("221Z32406"), Some(&vec![1]));
+        assert_eq!(
+            state.last_derived.get("221Z32406"),
+            state.last_derived.get("221832406")
+        );
+        assert_eq!(
+            state.resolved_last_active.get("221Z32406"),
+            Some(&test_rail_day())
+        );
+
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(events.len(), 1, "the revised id's movement is not dropped");
+        assert_eq!(events[0].tracked_train_id, 1);
+        assert_eq!(events[0].last_reported_location, Some("WOK".to_string()));
+    }
+
+    /// Finding T3: a parked Activation (and its one-shot claim) moves to the
+    /// revised id, so the Movement that resolves the pin under it still
+    /// carries the `train_uid`; and the move is undone with its batch.
+    #[tokio::test]
+    async fn a_parked_activation_moves_to_the_revised_train_id() {
+        let activation = r#"[{"header":{"msg_type":"0001"},"body":{
+            "train_id":"221A32406","train_uid":"C21373","toc_id":"SW",
+            "train_service_code":"22345000","schedule_wtt_id":"WTT1",
+            "schedule_start_date":"2026-08-28","schedule_end_date":"2026-08-28"
+        }}]"#;
+        let mut feed = FakeMovementFeed::new(vec![
+            vec![activation.to_string()],
+            vec![ORIGIN_DEPARTURE.to_string()],
+        ]);
+        let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
+        let mut state = ProcessorState::default();
+        run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+        state.confirm_batch();
+
+        // Rolled back: the Activation is parked under the old id again.
+        state.carry_over_identity("221A32406", "221832406");
+        state.roll_back_batch();
+        assert!(state.pending_activations.contains_key("221A32406"));
+        assert!(!state.pending_activations.contains_key("221832406"));
+
+        state.carry_over_identity("221A32406", "221832406");
+        assert!(!state.pending_activations.contains_key("221A32406"));
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].resolved_train_uid, Some("C21373".to_string()));
+        assert_eq!(events[0].resolved_train_id, Some("221832406".to_string()));
+    }
+
+    #[test]
+    fn carrying_an_identity_over_to_itself_changes_nothing() {
+        let mut state = ProcessorState::default();
+        state.resolved.insert("X".to_string(), vec![1]);
+        state.carry_over_identity("X", "X");
+        assert_eq!(state.resolved.get("X"), Some(&vec![1]));
+        state.roll_back_batch();
+        assert_eq!(state.resolved.get("X"), Some(&vec![1]), "nothing journaled");
     }
 
     /// The headline scenario this feature exists for, exercised through the
