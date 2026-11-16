@@ -26,7 +26,8 @@ pub(crate) const LATE_REASONS: &str = "darwin_relay_late_reasons_total";
 /// `darwin_relay_batches_published_total`.
 pub(crate) const BATCHES: &str = "darwin_relay_batches_published_total";
 /// `darwin_relay_last_message_timestamp_seconds`: the newest Darwin `ts`
-/// relayed (or of a heartbeat). Its age is how stale DS's Push Port data is.
+/// relayed. A heartbeat carries none, so the gauge ages while only
+/// heartbeats arrive. Its age is how stale DS's Push Port data is.
 pub(crate) const LAST_MESSAGE: &str = "darwin_relay_last_message_timestamp_seconds";
 /// `darwin_relay_consumer_lag{partition}`: messages behind the partition's
 /// high watermark, from librdkafka's statistics every 30 s.
