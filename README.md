@@ -23,9 +23,9 @@ request bumps a pin by hand.
 
 The shared crates (`common`, `ds-runtime`, `health-http`, `trust-schema`, `schedule-query`, `ingest-stream`, `ds-store`, `ds-lines`) come from
 [ds-core](https://github.com/Distant-Signal/ds-core) as git dependencies,
-all on one tag (`Cargo.toml`, `[workspace.dependencies]`). Once Renovate
-runs here it opens one `renovate/ds-core` PR per ds-core release; until
-then, bump every crate's tag together by hand.
+all on one tag (`Cargo.toml`, `[workspace.dependencies]`). Renovate opens
+one PR per ds-core release; to bump by hand, move every crate's tag together
+and run `python3 scripts/check-core-pin.py`.
 
 To build against a local ds-core checkout beside this one, without
 committing anything, pass a patch for each crate, e.g.:

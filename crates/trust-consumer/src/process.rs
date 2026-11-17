@@ -90,9 +90,11 @@
 //! re-hands a message to a running process, whatever the offset state:
 //! committed offsets govern where a *new* consumer session resumes) and
 //! then generalized from it, but the production backend is Redis Streams,
-//! and `movement_feed::redis_stream::RedisStreamMovementFeed::reclaim_stale`
-//! DOES replay an unacked batch to the same running process after 30
-//! seconds. On that replay, the resolving Movement used to find
+//! and `movement_feed::redis_stream::RedisStreamMovementFeed` DOES replay an
+//! unacked batch to the same running process: the next read restarts the
+//! consumer's own pending-entries replay from id `0`, ahead of anything
+//! newer (`reclaim_stale` is only the sweep for entries stuck under a
+//! dead consumer name). On that replay, the resolving Movement used to find
 //! `state.resolved` already populated by the first (unacked, unposted)
 //! attempt, so `freshly_resolved` came back `false`, the event went out
 //! without `resolved_train_uid`/`resolved_train_id`, and `api` left the
@@ -101,7 +103,8 @@
 //! idempotent under redelivery, which is the property that whole path needs.
 //!
 //! **A failed batch is retried, not skipped.** The unacked Redis stream
-//! entry is reclaimed and replayed (the removed Kafka backend got the same
+//! entry is re-read from this consumer's own pending list before anything
+//! newer, including when only the batch's XACK failed (the removed Kafka backend got the same
 //! guarantee from a `seek` back to the unconfirmed offset). Either way
 //! the replay is safe because of the `dedup_key` path and the rollback
 //! described above.
@@ -1050,8 +1053,8 @@ pub(crate) async fn run_once<F: MovementFeed + movement_feed::DeadLetterSink>(
         // `?`, which aborted the whole `run_once` call: under the Redis
         // backend a batch is up to 100 entries and `commit` acks all or
         // nothing, so a single poison payload left every good entry beside
-        // it unacked, to be reclaimed 30 seconds later, fail identically,
-        // and be reclaimed again -- trapping real events indefinitely
+        // it unacked, to be re-read on the next cycle, fail identically,
+        // and be re-read again -- trapping real events indefinitely
         // behind one bad one. There is no retry that can ever fix a payload
         // that doesn't parse, so the honest handling is to log it loudly
         // (with the raw bytes) and keep going, exactly as
@@ -3976,7 +3979,7 @@ mod tests {
         }}]"#;
         // The whole batch -- Activation and the Movement that carries its
         // resolution signal -- delivered twice, which is what an unacked
-        // Redis batch's `reclaim_stale` replay looks like from here.
+        // Redis batch's own-pending replay looks like from here.
         let batch = vec![SHARED_ACTIVATION.to_string(), later_arrival.to_string()];
         let mut feed = FakeMovementFeed::new(vec![batch.clone(), batch]);
         let reference = shared_ref("C88888", vec![1]);
