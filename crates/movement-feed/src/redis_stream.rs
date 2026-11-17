@@ -1237,7 +1237,14 @@ impl RedisStreamMovementFeed {
         // another consumer, trimmed), and one such id would pin the restore
         // target below it for good. So the cursor holds exactly what was
         // listed.
-        if id_arg == "0" && raw_len < count {
+        //
+        // Only when the group stands at or past the highest id handed out.
+        // Behind it (a Redis that reloaded an older copy, its PEL gone with
+        // the rest of that read, and the group about to hand those entries
+        // out again) an id missing from the listing is not finished, only
+        // lost: releasing it would let a second failed read restore the group
+        // past entries that were never processed.
+        if id_arg == "0" && raw_len < count && self.group_is_at_or_past_cursor().await {
             self.cursor = cursor_holding(&self.cursor, raw.iter().map(|e| e.id.as_str()));
         } else {
             for entry in &raw {
@@ -1301,6 +1308,38 @@ impl RedisStreamMovementFeed {
             .collect();
         self.pending = entries;
         Ok(delivered)
+    }
+
+    /// Whether the group's `last-delivered-id` is at or past the highest id
+    /// this consumer was handed (`true` when it was handed none). Every id
+    /// in this consumer's PEL is at or below the group's position, so when
+    /// this holds an outstanding id that a complete read of the PEL does not
+    /// list really is no longer this consumer's to finish. `false` when the
+    /// group is behind (its position and PEL came back older, and the
+    /// entries are delivered again) or cannot be read: the caller keeps what
+    /// it holds, which costs at worst a lower restore target.
+    async fn group_is_at_or_past_cursor(&mut self) -> bool {
+        let Some(highest) = self.cursor.highest_delivered() else {
+            return true;
+        };
+        match ds_runtime::redis_group::group_last_delivered_id(
+            &mut self.conn,
+            &self.stream,
+            &self.group,
+        )
+        .await
+        {
+            Ok(Some(at)) => !stream_id_less_than(&at, &highest),
+            Ok(None) => false,
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    group = %self.group,
+                    "could not read the group's position; keeping the entries its PEL does not list as unfinished"
+                );
+                false
+            }
+        }
     }
 
     /// The arrival time of the entry `id` (see [`crate::FeedEntry::received_at`]),
@@ -3752,6 +3791,22 @@ mod redis_tests {
             group_position(&stream).await,
             just_below(&e3),
             "restored below e3, not to e4 (the highest id handed out)"
+        );
+        assert_eq!(
+            feed.cursor.restore_target(),
+            Some(just_below(&e3)),
+            "the group is behind, so the empty re-read of the PEL (lost with the read) \
+             does not release e3 and e4"
+        );
+        // Redis fails again before e3 and e4 are handed out once more: the
+        // restore after that failure must not move the group past them.
+        assert!(
+            restore_group_position(&mut feed.conn, &stream, "test-group", &mut feed.cursor).await
+        );
+        assert_eq!(
+            group_position(&stream).await,
+            just_below(&e3),
+            "a second restore before the redelivery leaves the group below e3"
         );
         // e3 and e4 are delivered again; e1 and e2 are not.
         assert_eq!(payloads(feed.next_batch().await.unwrap()), ["e3", "e4"]);
