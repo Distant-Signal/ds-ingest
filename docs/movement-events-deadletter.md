@@ -24,8 +24,16 @@ Only records with specific evidence that they are poison are dead-lettered:
 and 60s request timeout), or answers 5xx, 401/403, 404, 408 or 429, the entry
 stays pending in its group and is retried until it succeeds. A delivery count
 is no longer a reason to dead-letter: an entry that has been redelivered more
-than 240 times (about an hour of failure) is only reported, as a warn log and
+than 240 times (an hour or more of failure, depending on the consumer's
+retry backoff) is only reported, as a warn log and
 `distant_signal_movement_feed_long_pending_total{group}`.
+
+A consumer retries its failed batch before it reads anything newer (the next
+read re-reads its own pending entries from the start, after the cycle's
+backoff), so entries are applied in order. The flip side: while a batch keeps
+failing, the group reads nothing after it, and its lag grows until the
+failure is fixed or the entry is `XACK`ed by hand (see "Long-pending entries"
+below).
 
 When `api` rejects a batch of several entries, the consumer cannot tell which
 entry was bad. It then re-reads its pending entries one at a time
@@ -62,7 +70,9 @@ entries it has already been handed more than 240 times
 They are never dead-lettered: only a data rejection is. So the cause is
 either a long `api` outage (then the lag and pending alerts usually fire as
 well) or a failure the consumer cannot classify as a rejection, such as an
-OAuth token error or a 5xx that one entry always triggers.
+OAuth token error or a 5xx that one entry always triggers. Either way the
+group is stuck behind that batch: its lag alert fires too, and nothing newer
+is applied until it clears.
 
 1. Read that consumer's warn log for "pending entries have been redelivered
    for over an hour". It names the group and the oldest entry id.

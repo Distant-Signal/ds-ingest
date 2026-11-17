@@ -170,6 +170,9 @@ pub struct FakeMovementFeed {
     pub fail_next_dead_letter: bool,
     /// The `detail` of every [`MovementFeed::reject_batch`] call, in order.
     pub rejected_batches: Vec<String>,
+    /// When set, the next `commit` fails without confirming anything (and
+    /// clears this).
+    pub fail_next_commit: bool,
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -194,6 +197,7 @@ impl FakeMovementFeed {
             dead_lettered: Vec::new(),
             fail_next_dead_letter: false,
             rejected_batches: Vec::new(),
+            fail_next_commit: false,
         }
     }
 }
@@ -212,6 +216,9 @@ impl MovementFeed for FakeMovementFeed {
     async fn commit(&mut self) -> anyhow::Result<()> {
         if !self.received_since_commit {
             return Ok(());
+        }
+        if std::mem::take(&mut self.fail_next_commit) {
+            anyhow::bail!("fake commit failure");
         }
         self.received_since_commit = false;
         self.committed_count += 1;

@@ -152,7 +152,9 @@ pub struct RedisStreamMovementFeed {
     /// `Some("0")` for the startup replay, and is reset to `Some("0")` by
     /// `reclaim_stale` after a non-empty `XAUTOCLAIM` claim (so a reclaimed
     /// entry is picked up through the same code path -- see that
-    /// function's own doc) and by `reject_batch` when it starts isolation.
+    /// function's own doc), by `reject_batch` when it starts isolation, and
+    /// before any read that follows a batch neither committed nor rejected
+    /// (see [`replay_cursor_before_read`]).
     ///
     /// **M15 (Repeater Signal review).** An ordinary replay advances this
     /// cursor past each full batch and keeps reading until a short batch,
@@ -165,7 +167,8 @@ pub struct RedisStreamMovementFeed {
     pel_replay_cursor: Option<String>,
     /// `(id, payload)` of every entry returned by the most recent
     /// `next_batch` call, held until `commit` XACKs them, `reject_batch`
-    /// acts on them, or they're replaced by the next call -- the
+    /// acts on them, or they're replaced by the next call (which, while
+    /// they are still here, re-reads them first) -- the
     /// receive/confirm split the removed Kafka backend's `last_received`
     /// established, generalized to a `Vec` since one Redis Streams read
     /// can return more than one entry per call. The payload is kept so a
@@ -847,6 +850,29 @@ fn next_pel_replay_cursor(
     }
 }
 
+/// Where the next read starts, given whether the previous batch is still
+/// un-ACKed (`unfinished_batch`: `next_batch` returned it and neither
+/// `commit` nor `reject_batch` retired it). An unfinished batch restarts
+/// this consumer's PEL replay from id `0`, so the failed entries come back
+/// on the very next read, ahead of anything newer, rather than only after
+/// `reclaim_stale` finds them idle for `autoclaim_min_idle`. A `>` read
+/// there would hand out later entries first: an Activation stuck in the
+/// failed batch could be overtaken by its train's origin DEPARTURE, which
+/// then resolves the pin without the parked `train_uid`, and older
+/// movements would be applied after newer ones. Isolation already re-reads
+/// id `0`, so it is left alone; otherwise the cursor is unchanged.
+fn replay_cursor_before_read(
+    unfinished_batch: bool,
+    isolating: bool,
+    cursor: Option<String>,
+) -> Option<String> {
+    if unfinished_batch && !isolating {
+        Some("0".to_string())
+    } else {
+        cursor
+    }
+}
+
 /// After a failed read: moves `group` forward to `last_delivered_id` if
 /// Redis reports it behind (`ds_runtime::redis_group::restore_group_position`),
 /// logging a warning and counting [`GROUP_RESTORED_METRIC`]; a group at or
@@ -948,15 +974,18 @@ impl MovementFeed for RedisStreamMovementFeed {
         result
     }
 
+    /// `XACK`s the last batch. On a failure the batch is kept in
+    /// `pending`: the `XACK` may or may not have been applied (a reply
+    /// timeout), so the next `next_batch` re-reads this consumer's own
+    /// pending entries first (see [`replay_cursor_before_read`]). Entries the
+    /// `XACK` did retire are simply no longer there to re-read.
     async fn commit(&mut self) -> anyhow::Result<()> {
         if self.pending.is_empty() {
             return Ok(());
         }
-        let ids: Vec<String> = std::mem::take(&mut self.pending)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
+        let ids: Vec<&str> = self.pending.iter().map(|(id, _)| id.as_str()).collect();
         let _: i64 = self.conn.xack(&self.stream, &self.group, &ids).await?;
+        self.pending.clear();
         Ok(())
     }
 
@@ -1021,6 +1050,13 @@ impl RedisStreamMovementFeed {
             self.last_autoclaim_sweep = std::time::Instant::now();
         }
 
+        // The previous batch was neither committed nor rejected (its write
+        // or its XACK failed): re-read it before anything newer.
+        self.pel_replay_cursor = replay_cursor_before_read(
+            !self.pending.is_empty(),
+            self.isolating,
+            self.pel_replay_cursor.take(),
+        );
         let replaying_pel = self.pel_replay_cursor.is_some();
         let id_arg = if self.isolating {
             "0"
@@ -1870,6 +1906,29 @@ mod long_pending_entries_tests {
         assert_eq!(next_pel_replay_cursor(Some("7-0".to_string()), 2, 3), None);
         assert_eq!(next_pel_replay_cursor(None, 0, 3), None);
     }
+
+    #[test]
+    fn an_unfinished_batch_restarts_the_pel_replay_from_the_start() {
+        assert_eq!(
+            replay_cursor_before_read(true, false, None),
+            Some("0".to_string())
+        );
+        assert_eq!(
+            replay_cursor_before_read(true, false, Some("7-0".to_string())),
+            Some("0".to_string()),
+            "a replay page that failed is read again, not skipped past"
+        );
+    }
+
+    #[test]
+    fn a_finished_batch_or_isolation_keeps_the_cursor() {
+        assert_eq!(replay_cursor_before_read(false, false, None), None);
+        assert_eq!(
+            replay_cursor_before_read(false, false, Some("7-0".to_string())),
+            Some("7-0".to_string())
+        );
+        assert_eq!(replay_cursor_before_read(true, true, None), None);
+    }
 }
 
 #[cfg(test)]
@@ -2438,8 +2497,8 @@ mod redis_tests {
 
     #[tokio::test]
     #[ignore = "needs REDIS_URL"]
-    async fn next_batch_never_redelivers_its_own_in_flight_batch_before_a_reconnect() {
-        let stream = unique_stream("no-double-read");
+    async fn next_batch_redelivers_an_uncommitted_batch_before_newer_entries() {
+        let stream = unique_stream("redeliver-first");
 
         let mut feed = RedisStreamMovementFeed::connect_for_test(
             &redis_url(),
@@ -2455,16 +2514,61 @@ mod redis_tests {
         let first = payloads(feed.next_batch().await.unwrap());
         assert_eq!(first, vec!["payload-1".to_string()]);
 
-        // A third call, still without committing the second's delivery --
-        // must NOT redeliver payload-1 via `>` (it's legitimately
-        // "delivered, not yet acked", which only a reconnect's PEL replay
-        // should surface). Nothing new is in the stream, so this blocks on
-        // `>` for up to 5s and then returns empty.
-        let third = payloads(feed.next_batch().await.unwrap());
-        assert!(
-            third.is_empty(),
-            "an already-connected feed must not re-deliver its own undelivered batch"
+        // The batch failed downstream: no commit. A newer entry arrives
+        // (e.g. the origin DEPARTURE after an Activation in the failed
+        // batch). The next call must hand back the failed batch first, not
+        // the newer entry -- this used to be a `>` read that returned
+        // payload-2, leaving payload-1 for `reclaim_stale` (here an hour
+        // away) to deliver after it.
+        xadd(&stream, "payload-2").await;
+        let retry = payloads(feed.next_batch().await.unwrap());
+        assert_eq!(
+            retry,
+            vec!["payload-1".to_string()],
+            "an uncommitted batch is re-read before anything newer"
         );
+        feed.commit().await.unwrap();
+
+        // Committed: the PEL replay ends and the newer entry follows.
+        let mut rest = Vec::new();
+        for _ in 0..3 {
+            rest.extend(payloads(feed.next_batch().await.unwrap()));
+            feed.commit().await.unwrap();
+        }
+        assert_eq!(rest, vec!["payload-2".to_string()]);
+
+        let pending: redis::streams::StreamPendingCountReply = feed
+            .conn
+            .xpending_count(&stream, "test-group", "-", "+", 10)
+            .await
+            .unwrap();
+        assert!(pending.ids.is_empty(), "everything acked once");
+
+        cleanup(&stream).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn a_committed_batch_is_not_redelivered() {
+        let stream = unique_stream("no-double-read");
+
+        let mut feed = RedisStreamMovementFeed::connect_for_test(
+            &redis_url(),
+            &stream,
+            "test-group",
+            "test-consumer",
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+        xadd(&stream, "payload-1").await;
+        payloads(feed.next_batch().await.unwrap()); // drain empty startup PEL
+        let first = payloads(feed.next_batch().await.unwrap());
+        assert_eq!(first, vec!["payload-1".to_string()]);
+        feed.commit().await.unwrap();
+
+        let next = payloads(feed.next_batch().await.unwrap());
+        assert!(next.is_empty(), "a committed entry is never read again");
 
         cleanup(&stream).await;
     }
@@ -2530,7 +2634,7 @@ mod redis_tests {
         let stream = unique_stream("backlog-drain");
         const BACKLOG: usize = PEL_REPLAY_BATCH_COUNT + 200;
 
-        let mut dead = RedisStreamMovementFeed::connect_for_test(
+        let dead = RedisStreamMovementFeed::connect_for_test(
             &redis_url(),
             &stream,
             "test-group",
@@ -2556,16 +2660,22 @@ mod redis_tests {
         }
         let _: () = pipe.query_async(&mut raw_conn).await.unwrap();
 
-        // Deliver the whole backlog to "dead-consumer" (live `>` reads, 100
-        // at a time) and never ack it -- a consumer rename / dead pod.
-        payloads(dead.next_batch().await.unwrap()); // drain empty startup PEL
-        let mut delivered_to_dead = 0;
-        while delivered_to_dead < BACKLOG {
-            let batch = payloads(dead.next_batch().await.unwrap());
-            assert!(!batch.is_empty(), "backlog should still be readable");
-            delivered_to_dead += batch.len();
-        }
+        // Deliver the whole backlog to "dead-consumer" and never ack it -- a
+        // consumer rename / dead pod. One raw `>` read: the feed's own
+        // `next_batch` re-reads an un-ACKed batch before reading further.
         drop(dead);
+        let reply: redis::streams::StreamReadReply = raw_conn
+            .xread_options(
+                &[&stream],
+                &[">"],
+                &redis::streams::StreamReadOptions::default()
+                    .group("test-group", "dead-consumer")
+                    .count(BACKLOG),
+            )
+            .await
+            .unwrap();
+        let delivered_to_dead: usize = reply.keys.iter().map(|key| key.ids.len()).sum();
+        assert_eq!(delivered_to_dead, BACKLOG);
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
