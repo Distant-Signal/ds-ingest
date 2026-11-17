@@ -252,7 +252,7 @@ pub fn history_cutoff(
     now: chrono::DateTime<chrono::Utc>,
     retention_days: u32,
 ) -> chrono::NaiveDate {
-    let today = now.with_timezone(&chrono_tz::Europe::Dublin).date_naive();
+    let today = common::zone::Zone::DUBLIN.date(now);
     today - chrono::Days::new(u64::from(retention_days))
 }
 
