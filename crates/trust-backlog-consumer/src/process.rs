@@ -184,7 +184,7 @@ pub(crate) fn prune_stale_activations(state: &mut ProcessorState, today: NaiveDa
 /// `service_date = $2` filter for exactly this class of train, every single
 /// night.
 pub(crate) fn service_date_for_instant(at: chrono::DateTime<chrono::Utc>) -> NaiveDate {
-    at.with_timezone(&chrono_tz::Europe::London).date_naive()
+    common::zone::london_date(at)
 }
 
 /// Is `at`'s Europe/London LOCAL time-of-day inside the 00:00-01:59:59
@@ -206,9 +206,8 @@ pub(crate) fn service_date_for_instant(at: chrono::DateTime<chrono::Utc>) -> Nai
     reason = "a constant or range-checked time is always valid"
 )]
 fn is_within_post_midnight_window(at: chrono::DateTime<chrono::Utc>) -> bool {
-    let local = at.with_timezone(&chrono_tz::Europe::London);
     let cutoff = chrono::NaiveTime::from_hms_opt(2, 0, 0).expect("2:00:00 is a valid time");
-    local.time() < cutoff
+    common::zone::london_time(at) < cutoff
 }
 
 /// `received_at` is the wall-clock time this message is being processed

@@ -1506,7 +1506,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "chrono-tz",
  "clap",
  "common",
  "ds-lines",
@@ -3374,7 +3373,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "chrono-tz",
  "clap",
  "common",
  "dotenvy",
