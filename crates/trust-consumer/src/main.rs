@@ -488,8 +488,10 @@ enum Cycle {
 /// `ProcessorState::confirm_batch` (the write committed, whether or not the
 /// XACK then succeeded -- finding T4) or `ProcessorState::roll_back_batch`
 /// (anything before that failed) is called before returning. Without the rollback, a redelivered batch -- which the
-/// Redis backend really does replay into this same process after 30 seconds,
-/// via `RedisStreamMovementFeed::reclaim_stale` -- would find its own
+/// Redis backend really does replay into this same process, on the very next
+/// read (`RedisStreamMovementFeed::read_next_batch` restarts the consumer's
+/// own pending-entries replay from `0` when the previous batch was neither
+/// committed nor rejected) -- would find its own
 /// half-applied state from the failed attempt, decide the train was
 /// "already resolved", and drop the one-time
 /// `resolved_train_uid`/`resolved_train_id` signal that is the only thing
@@ -959,7 +961,7 @@ mod tests {
     /// (`a_batch_that_fails_to_parse_is_a_failed_cycle_and_commits_nothing`).
     /// That contract was actively harmful: under the Redis backend a batch is
     /// up to 100 entries, acked all-or-nothing, so one poison payload left
-    /// every good entry beside it unacked, to be reclaimed 30 seconds later
+    /// every good entry beside it unacked, to be re-read on the next cycle
     /// and fail identically, forever. No retry can fix a payload that does
     /// not parse.
     #[tokio::test]
@@ -1302,8 +1304,8 @@ mod tests {
     }
 
     /// **Finding #4's end-to-end regression test.** A batch whose POST fails
-    /// is redelivered (Redis `reclaim_stale` replays an unacked batch into
-    /// this same running process after 30 seconds). The redelivered attempt MUST still carry the one-time
+    /// is redelivered (the Redis backend replays an unacked batch into this
+    /// same running process on its next read). The redelivered attempt MUST still carry the one-time
     /// `resolved_train_uid`/`resolved_train_id` signal, because that is the
     /// only thing that ever flips the subscription to `'resolved'` in the
     /// database.

@@ -2640,7 +2640,8 @@ mod redis_tests {
         // batch). The next call must hand back the failed batch first, not
         // the newer entry -- this used to be a `>` read that returned
         // payload-2, leaving payload-1 for `reclaim_stale` (here an hour
-        // away) to deliver after it.
+        // away) to deliver after it. (`reclaim_stale` now only sweeps entries
+        // held by a dead consumer name.)
         xadd(&stream, "payload-2").await;
         let retry = payloads(feed.next_batch().await.unwrap());
         assert_eq!(
