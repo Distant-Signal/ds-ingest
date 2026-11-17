@@ -284,11 +284,16 @@ pub const SCHEMA_NOT_ALLOWED_ON_STREAM: &str = "schema_not_allowed_on_stream";
 /// with `<schema name>:` ([`ingest_stream::Envelope::snapshot_key`]).
 pub const KEY_NOT_FOR_SCHEMA: &str = "key_not_for_schema";
 
-/// The longest envelope `key` the writer admits, in bytes. Real keys are a
-/// schema name, a producer's window and a counter or hash (well under 200
-/// bytes); the key is stored in `ingest_dedup` and logged, so an unbounded
-/// one is a storage and log amplifier for any producer allowed to `XADD`.
-pub const MAX_KEY_LEN: usize = 512;
+/// The longest envelope `key` the writer admits, in bytes. A key is a schema
+/// name, a producer's window and a counter or hash; darwin-relay's names
+/// each topic partition it read (`<topic>:<partition>@<first>-<last>~<ms>`,
+/// about 60 bytes plus the topic name, joined by commas, and a `/<i>` per
+/// size split), so a batch spanning several partitions of a long-named
+/// topic is a few hundred bytes. The limit leaves room for that and still
+/// bounds the storage and log amplification an unbounded key would be (the
+/// key is stored in `ingest_dedup` and logged) for any producer allowed to
+/// `XADD`.
+pub const MAX_KEY_LEN: usize = 2048;
 
 /// The longest envelope `producer` (`<component>/<pod name>`) the writer
 /// admits, in bytes: a Kubernetes pod name is at most 253.
