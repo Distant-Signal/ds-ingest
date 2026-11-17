@@ -39,6 +39,13 @@ pub(crate) struct Config {
     /// librdkafka `security.protocol` (secret key `security-protocol`).
     #[arg(long, env, default_value = "SASL_SSL")]
     pub kafka_security_protocol: String,
+    /// Allows a `security.protocol` other than `SASL_SSL` (for a local
+    /// broker). Without it the relay refuses to start on `PLAINTEXT`,
+    /// `SASL_PLAINTEXT` or `SSL`: the Secret is the only place the protocol
+    /// comes from, and a wrong value there would send the SASL password
+    /// and the feed unencrypted. Never set it in production.
+    #[arg(long, env, default_value_t = false)]
+    pub kafka_allow_insecure_protocol: bool,
     /// `auto.offset.reset` for a partition the group has no committed
     /// offset for. `latest` by default, unlike movement-relay: the Push
     /// Port is current state, not a log of events DS must not miss, and a

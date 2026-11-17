@@ -141,6 +141,12 @@ Secret `distant-signal-darwin-pushport` exists in namespace
 `security-protocol`, `sasl-config` and `kafka-topic`; the chart reads each
 one by name and renders none of them.
 
+`security-protocol` must be `SASL_SSL`: darwin-relay refuses to start on any
+other value (`PLAINTEXT`, `SASL_PLAINTEXT`, `SSL`), so a wrong Secret cannot
+send the SASL password or the feed unencrypted. For a local broker only, set
+`KAFKA_ALLOW_INSECURE_PROTOCOL=true` on the relay to acknowledge it (it logs
+a warning); never in production.
+
 ### Ranma steps
 
 1. **The relay's Redis password.** Add a key `darwin-relay-password` to
