@@ -25,15 +25,14 @@ ignore = [
     # sqlx-macros-core; we run Postgres and no RSA operation is reachable).
     # Re-read at the date: bump rsa when its dependents allow, else renew.
     { id = "RUSTSEC-2023-0071", reason = "rsa 0.9 only via sqlx-mysql, which this repo never uses; patched only in rsa 0.10" }, # expires 2027-05-17
-    # chrono and chrono-tz: informational "unmaintained" advisories
-    # (RUSTSEC-2026-0543, RUSTSEC-2026-0555), not vulnerabilities. All
+    # chrono: informational "unmaintained" advisory
+    # (RUSTSEC-2026-0543), not a vulnerability. All
     # versions are affected and no patched release exists. chrono is a
     # direct dependency across the Distant-Signal Rust repositories, plus
     # the sqlx, schemars and ts-rs integrations; the advisory suggests
     # jiff or time, but a move is a cross-repo effort. Revisit before the
     # expiry: migrate if a plan exists, else re-read the advisory and renew.
     { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained (informational, no patched version); a move to jiff or time is a cross-repo effort" }, # expires 2027-02-17
-    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained (informational, no patched version); a move to jiff or time is a cross-repo effort" }, # expires 2027-02-17
 ]
 
 [licenses]
