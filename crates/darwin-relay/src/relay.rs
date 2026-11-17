@@ -414,6 +414,30 @@ mod tests {
         assert_eq!(source.committed, vec![vec![("t".to_owned(), 0, 12)]]);
     }
 
+    /// A record that inflates past the decode cap is skipped like any
+    /// record that can never decode: its offset is committed, so it is not
+    /// redelivered, and nothing is published for it.
+    #[tokio::test]
+    async fn a_record_over_the_decode_cap_is_skipped_and_its_offset_committed() {
+        use std::io::Write;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        let zeros = vec![0_u8; 1024 * 1024];
+        for _ in 0..9 {
+            gz.write_all(&zeros).expect("gzip");
+        }
+        let bomb = gz.finish().expect("gzip");
+        let mut source = FakeSource {
+            records: VecDeque::from([record(20, bomb), record(21, fixture("heartbeat.json"))]),
+            committed: Vec::new(),
+        };
+        let mut sink = FakeSink::default();
+        run_cycle(&mut source, &mut sink, LIMITS)
+            .await
+            .expect("cycle");
+        assert_eq!(sink.published, []);
+        assert_eq!(source.committed, vec![vec![("t".to_owned(), 0, 21)]]);
+    }
+
     fn key_of(records: &[Record]) -> String {
         let mut acc = Accumulator::default();
         for record in records {

@@ -35,8 +35,15 @@ use common::darwin::{
 use serde_json::Value;
 
 /// The largest document this relay will gunzip to. A Push Port update is a
-/// few KB, a large snapshot fragment a few MB.
-const MAX_DECODED_BYTES: u64 = 32 * 1024 * 1024;
+/// few KB and a large snapshot fragment a few MB, so 8 MiB leaves a wide
+/// margin. The cap bounds the memory one record can take: a record is
+/// gunzipped (at most this), its `bytes` field is gunzipped again (at most
+/// this), and the document is parsed into a [`Value`] several times its text
+/// size, so a bound far above real messages let one crafted record exhaust
+/// the pod (and, uncommitted, be redelivered into the same crash). A record
+/// over the cap is skipped as malformed and its offset committed
+/// ([`crate::relay`]), like any record that can never decode.
+const MAX_DECODED_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The schedule location elements, by their XSD names: origin, operational
 /// origin, intermediate, operational intermediate, passing point,
@@ -69,28 +76,31 @@ pub(crate) enum DecodeError {
 
 /// Reads one Kafka record value. See the module docs.
 pub(crate) fn decode_record(value: &[u8]) -> Result<Decoded, DecodeError> {
-    let value = maybe_gunzip(value)?;
-    let trimmed = trim_ascii(&value);
-    if trimmed.first() == Some(&b'<') {
-        return Ok(Decoded::Xml);
-    }
-    let root: Value =
-        serde_json::from_slice(trimmed).map_err(|err| DecodeError::NotJson(err.to_string()))?;
-    let Some(bytes) = root.get("bytes") else {
+    // Each stage's buffer is dropped before the next is built, so a record
+    // never holds its gunzipped bytes, the envelope and the inner document
+    // at once.
+    let mut root: Value = {
+        let value = maybe_gunzip(value)?;
+        let trimmed = trim_ascii(&value);
+        if trimmed.first() == Some(&b'<') {
+            return Ok(Decoded::Xml);
+        }
+        serde_json::from_slice(trimmed).map_err(|err| DecodeError::NotJson(err.to_string()))?
+    };
+    let Some(bytes) = root.get_mut("bytes") else {
         // A bare document (as a test or a replay tool sends it).
         return parse_document(&root);
     };
-    let Some(payload) = bytes.as_str() else {
+    let Value::String(payload) = bytes.take() else {
         return Err(DecodeError::UnknownPayload);
     };
+    drop(root);
     decode_payload(payload.trim())
 }
 
 fn decode_payload(payload: &str) -> Result<Decoded, DecodeError> {
     if payload.starts_with('{') {
-        let doc: Value =
-            serde_json::from_str(payload).map_err(|err| DecodeError::NotJson(err.to_string()))?;
-        return parse_document(&doc);
+        return parse_text(payload);
     }
     if payload.starts_with('<') {
         return Ok(Decoded::Xml);
@@ -98,15 +108,27 @@ fn decode_payload(payload: &str) -> Result<Decoded, DecodeError> {
     let raw = base64::engine::general_purpose::STANDARD
         .decode(payload)
         .map_err(|_| DecodeError::UnknownPayload)?;
-    let raw = maybe_gunzip(&raw)?;
-    let text = std::str::from_utf8(trim_ascii(&raw)).map_err(|_| DecodeError::UnknownPayload)?;
+    let text = {
+        let raw = maybe_gunzip(&raw)?;
+        std::str::from_utf8(trim_ascii(&raw))
+            .map_err(|_| DecodeError::UnknownPayload)?
+            .to_owned()
+    };
+    // The encoded and the gunzipped bytes are not needed past here.
+    drop(raw);
     if text.starts_with('<') {
         return Ok(Decoded::Xml);
     }
     if text.starts_with('{') {
-        return decode_payload(text);
+        return parse_text(&text);
     }
     Err(DecodeError::UnknownPayload)
+}
+
+fn parse_text(text: &str) -> Result<Decoded, DecodeError> {
+    let doc: Value =
+        serde_json::from_str(text).map_err(|err| DecodeError::NotJson(err.to_string()))?;
+    parse_document(&doc)
 }
 
 fn trim_ascii(bytes: &[u8]) -> &[u8] {
@@ -568,6 +590,35 @@ mod tests {
             decode_record(wrapped.as_bytes()),
             Ok(Decoded::Document(plain))
         );
+    }
+
+    /// A gzip bomb: a few KB that inflate past the cap. It is refused at the
+    /// cap (never inflated to its full size) as a permanent decode error.
+    fn gzip_of_zeros(len: usize) -> Vec<u8> {
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        let zeros = vec![0_u8; 1024 * 1024];
+        for _ in 0..len / zeros.len() {
+            gz.write_all(&zeros).expect("gzip");
+        }
+        gz.finish().expect("gzip")
+    }
+
+    #[test]
+    fn a_record_that_inflates_past_the_cap_is_rejected() {
+        let over = gzip_of_zeros(usize::try_from(MAX_DECODED_BYTES).expect("fits") + 1024 * 1024);
+        assert!(over.len() < 64 * 1024, "the bomb is small: {}", over.len());
+        assert!(matches!(decode_record(&over), Err(DecodeError::Gzip(_))));
+    }
+
+    #[test]
+    fn an_inner_gzipped_document_past_the_cap_is_rejected() {
+        let over = gzip_of_zeros(usize::try_from(MAX_DECODED_BYTES).expect("fits") + 1024 * 1024);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(over);
+        let wrapped = serde_json::json!({ "bytes": encoded }).to_string();
+        assert!(matches!(
+            decode_record(wrapped.as_bytes()),
+            Err(DecodeError::Gzip(_))
+        ));
     }
 
     #[test]
