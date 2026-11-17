@@ -37,12 +37,14 @@ RDM Push Port JSON topic (Kafka, SASL_SSL)
   out with `Recreate`: the topic has one partition, so a surge pod can
   wait forever for the assignment the old pod holds (build 833's stalled
   rollout). The old pod stops first and the new one resumes from the
-  committed offset, a gap of seconds that loses nothing.
+  committed offset, a gap of seconds that loses nothing. Each entry carries
+  a dedup key naming the records it holds ([Batch keys](#batch-keys)).
 - **ingest-writer** applies `darwin-pushport/1` (`ingestWriter.streams.darwin`)
   and records `ingest_freshness` source `darwin-pushport` at the batch's
   newest Darwin time, clamped to the writer's clock plus 2 minutes like
   every observed time, so a message stamped in the future cannot hold the
-  marker ahead and silence the staleness alert.
+  marker ahead and silence the staleness alert
+  ([The freshness marker](#the-freshness-marker)).
 - **The api** lays each tracked train's Push Port locations over its stops
   (`crates/api/src/data/pushport_platform.rs`): a stop matches the Darwin
   location with its TIPLOC and working time. A confirmed platform is served
@@ -55,6 +57,63 @@ RDM Push Port JSON topic (Kafka, SASL_SSL)
   sequence otherwise. An inferred link where either train joins or divides
   that day (`schedule_associations`, from the CIF `AA` records) is capped
   at medium, so it never pushes.
+
+### Batch keys
+
+Every entry darwin-relay produces carries an idempotency key, and the
+ingest-writer skips an entry whose key it has already applied on
+`ds:ingest:darwin` (`ingest_dedup`, kept for 48 hours and pruned hourly).
+The key names the Kafka records in the batch
+(`crates/darwin-relay/src/relay.rs`, `Accumulator::key`):
+
+```text
+darwin-pushport:<topic>:<partition>@<first>-<last>~<ts>
+```
+
+one `<topic>:<partition>@...` part per topic partition the batch read,
+comma-separated in topic and partition order, where `<first>` and `<last>`
+are the lowest and highest offsets read and `<ts>` is the Kafka timestamp,
+in milliseconds, of the record at `<first>`. When Kafka gives that record
+no timestamp the `~<ts>` part is left out. For example
+`darwin-pushport:t:0@10-12~1763294400010,t:1@7-7`. A batch over the 512 KiB
+entry cap is split in halves keyed `<key>/1` and `<key>/2`, recursively
+(`<key>/1/2` and so on).
+
+A key must never name different records, or the writer would skip a batch
+it has not applied. The topic tells a renamed topic's offsets from the
+old one's, and the timestamp tells a recreated topic (same name, offsets
+from 0 again) from the one before. The consumer group is deliberately not
+in the key: offsets belong to the topic, so a different group reading the
+same offsets reads the same records, and skipping them is right.
+
+Keys of the older form (`darwin-pushport:0@120-180`, partition and offsets
+only, before DS-534) can never equal a new one. Nothing migrates them; the
+writer's hourly prune drops each one once it is 48 hours old. In the first window
+after the deploy, the new relay resumes from the old one's committed
+offset, so records the old relay had already sent to Redis but not yet
+committed (up to `KAFKA_COMMIT_DELAY_SECS` of them, plus the batch in
+flight) are sent again under a new-form key that does not match the old
+one, and the writer applies them a second time. That is harmless: every
+stored row is guarded by its Darwin timestamp, so the repeat writes
+nothing, and the freshness marker only moves forward. The same holds for
+any re-read whose batch boundaries differ from the first read.
+
+### The freshness marker
+
+The marker is the batch's newest Darwin `ts` (the entry's `produced_at` if
+the batch has none), clamped to the writer's clock plus 2 minutes, with
+the clamp counted (`crates/ingest-writer/src/handlers/darwin.rs`,
+`freshness_at`). `ds_store::freshness::record_ingest` stores it with
+`GREATEST`, so the clamp alone cannot pull back a marker that is already
+in the future, for example one written before the clamp was deployed:
+`GREATEST` would keep it until the clock caught up, and the staleness
+alert would stay silent meanwhile. So in the same transaction, before
+`record_ingest`, the writer heals it: if the stored `darwin-pushport`
+marker is more than 2 minutes ahead of Postgres's `now()`, it is set to
+the batch's clamped value first, and `GREATEST` then runs as usual. This is
+the observed-time guard's healing arm, as for other observed times. It
+runs on every non-empty batch, so a future marker is healed by the first
+batch the writer applies; an empty batch records nothing.
 
 ## Data model
 
