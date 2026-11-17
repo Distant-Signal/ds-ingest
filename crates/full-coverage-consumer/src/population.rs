@@ -504,9 +504,23 @@ pub(crate) struct Population {
     /// predates `ETag` support sends none, so nothing is stored and every
     /// reload is a plain unconditional GET, exactly as before.
     etags: HashMap<(String, chrono::NaiveDate), String>,
+    /// The rail day the reload cycle that built this snapshot was for
+    /// (it holds that day and the next): see [`Population::built_for`].
+    built_for: Option<chrono::NaiveDate>,
 }
 
 impl Population {
+    /// The rail day this snapshot was built for, `None` for one not built
+    /// by a reload cycle. A snapshot built for a later day than the one
+    /// being written no longer holds that day (main.rs's `DayPopulation`).
+    pub(crate) fn built_for(&self) -> Option<chrono::NaiveDate> {
+        self.built_for
+    }
+
+    pub(crate) fn set_built_for(&mut self, service_date: chrono::NaiveDate) {
+        self.built_for = Some(service_date);
+    }
+
     /// Inserts `entries` for `(line_id, service_date)`, keeping only each
     /// entry's `uid` -- **not** its `calling_points`.
     ///

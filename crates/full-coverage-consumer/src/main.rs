@@ -242,6 +242,9 @@ async fn run() -> anyhow::Result<()> {
     // changes on shutdown: the day's state is rebuilt by the startup replay
     // as on any restart, and the stats are written again from it.
     let mut shutdown = Shutdown::on_sigterm();
+    let mut day_population = DayPopulation {
+        held: population.load_full(),
+    };
 
     loop {
         if shutdown.is_requested() {
@@ -261,20 +264,23 @@ async fn run() -> anyhow::Result<()> {
         //
         // So the rollover happens at the real rail-day boundary, and the
         // day that just closed gets its final, genuinely-closeable stats
-        // write BEFORE its state is replaced. The day entered here is never
-        // partial: this process sees it from its first event.
+        // write BEFORE its state is replaced. The day entered here starts out
+        // not partial (this process sees it from its first event) unless a
+        // stream gap hit its lookback hour (`DayState::roll`).
         let now = chrono::Utc::now();
         if let RailDayTransition::CloseAndRoll { closing, next } =
             rail_day_transition(day.service_date, now)
         {
             // Yesterday's closing write, with `rail_day_closed(closing,
             // now)` now genuinely true -- this is the row that reads
-            // "available" (unless the day was partial).
+            // "available" (unless the day was partial). Against the last
+            // snapshot that still holds the closing day: the reloader may
+            // already have swapped in the next day's (see `DayPopulation`).
             debug_assert_eq!(day.service_date, closing);
             write_stats(
                 &config,
                 &line_ids.load_full(),
-                &population.load_full(),
+                &day_population.refresh(population.load_full(), closing),
                 &geometry,
                 &day,
                 &defaults,
@@ -283,8 +289,9 @@ async fn run() -> anyhow::Result<()> {
             .await;
             last_stats_write = tokio::time::Instant::now();
 
-            tracing::info!(closed = %closing, new = %next, carried_activations = day.next_activations.len(), "rail day closed; wrote its final stats, then reset correlation state (keeping the next day's activations)");
-            day = day.roll(next);
+            tracing::info!(closed = %closing, new = %next, carried_activations = day.next_activations.len(), carried_cancellations = day.next_cancellations.len(), "rail day closed; wrote its final stats, then reset correlation state (keeping the next day's activations and cancellations)");
+            let next_population = day_population.refresh(population.load_full(), next);
+            day = day.roll(next, &next_population);
             publish_day_partial_metrics(&day);
         }
 
@@ -329,8 +336,12 @@ async fn run() -> anyhow::Result<()> {
                     .increment(1);
                     // Everything before now is suspect for the rest of the
                     // day: no window before it may influence severity, and
-                    // nothing before it is presumed cancelled.
+                    // nothing before it is presumed cancelled -- in the
+                    // legacy row too, which the windowed `observed_from`
+                    // alone left reading "available" with every trimmed
+                    // train counted as cancelled.
                     day.observed_from = chrono::Utc::now();
+                    mark_stream_gap(&mut day);
                 }
                 Ok(None) => {}
                 Err(err) => {
@@ -345,7 +356,7 @@ async fn run() -> anyhow::Result<()> {
         // `Arc`), not `load`: the snapshot is held across `next_batch`'s
         // blocking read, and `ArcSwap` guards are meant to be short-lived.
         let cycle_start = std::time::Instant::now();
-        let population_now = population.load_full();
+        let population_now = day_population.refresh(population.load_full(), day.service_date);
         let cycle = consume_once(&mut feed, &mut day, &lookups, &population_now);
         let failed = match finish_within(&mut shutdown, DRAIN_TIMEOUT, cycle).await {
             Finished::Ran(failed) => failed,
@@ -377,7 +388,7 @@ async fn run() -> anyhow::Result<()> {
             write_stats(
                 &config,
                 &line_ids.load_full(),
-                &population.load_full(),
+                &day_population.refresh(population.load_full(), day.service_date),
                 &geometry,
                 &day,
                 &defaults,
@@ -504,6 +515,46 @@ async fn start_consuming<F: replay::ReplaySource>(
     Ok(day)
 }
 
+/// The population snapshot the loop reads for the rail day it is
+/// correlating into. The reloader picks its dates from the clock, so just
+/// after 02:00 London it can swap in a snapshot of {new day, day after}
+/// before the loop has rolled over: the closing day's last rows (its
+/// closing write included) were then written against no population at
+/// all -- `total` 0, reading "available" (legacy) or "pending"
+/// (windowed) -- and never rewritten. Such a snapshot is held back until
+/// the loop has rolled; every other one is taken as it comes.
+struct DayPopulation {
+    held: Arc<population::Population>,
+}
+
+impl DayPopulation {
+    /// The snapshot to read for `service_date`: `fresh`, unless it was
+    /// built for a later day, in which case the last one taken.
+    fn refresh(
+        &mut self,
+        fresh: Arc<population::Population>,
+        service_date: chrono::NaiveDate,
+    ) -> Arc<population::Population> {
+        if fresh
+            .built_for()
+            .is_none_or(|built_for| built_for <= service_date)
+        {
+            self.held = fresh;
+        }
+        Arc::clone(&self.held)
+    }
+}
+
+/// A detected stream gap makes the rest of the current day partial (unless
+/// it already is, for its own reason): the gap's trains have no events,
+/// and must not be counted as cancelled.
+fn mark_stream_gap(day: &mut DayState) {
+    if day.partial_reason.is_none() {
+        day.partial_reason = Some(day::PartialReason::StreamGap);
+        publish_day_partial_metrics(day);
+    }
+}
+
 fn publish_day_partial_metrics(day: &DayState) {
     metrics::gauge!(ds_runtime::metrics::metric_name(
         "full_coverage_consumer_day_partial"
@@ -545,7 +596,7 @@ async fn consume_once<F: MovementFeed + DeadLetterSink>(
         let raw = &entry.payload;
         // When the entry arrived, not when this (possibly lagging) read ran.
         let received_at = entry.received_at_or(now);
-        if let Err(err) = day.dispatch_payload(raw, lookups, population, received_at) {
+        if let Err(err) = day.dispatch_entry(raw, lookups, population, received_at) {
             tracing::error!(error = ?err, raw = %raw, "failed to parse TRUST batch; dead-lettering this payload");
             metrics::counter!(
                 ds_runtime::metrics::metric_name("full_coverage_consumer_errors_total"),
@@ -2042,5 +2093,75 @@ mod tests {
         assert_eq!(kinds, vec!["recent", "day_to_date"]);
         assert_eq!(windows[0]["feed_stale"], true, "nothing consumed yet");
         assert_eq!(windows[0]["relevance"], "full");
+    }
+
+    /// Regression test (F3): just after 02:00 London the reloader can swap
+    /// in a snapshot built for the new day before the loop has rolled over.
+    /// The closing day's last rows used to be written against it -- no
+    /// population for the day at all, `total` 0 -- and never written again.
+    /// The last snapshot built for the closing day is held until the roll.
+    #[test]
+    fn a_snapshot_for_a_later_day_is_held_back_until_the_rollover() {
+        let closing: chrono::NaiveDate = "2026-07-15".parse().unwrap();
+        let next = closing + chrono::Duration::days(1);
+        let mut for_closing = population_for(&[closing, next]);
+        for_closing.set_built_for(closing);
+        let mut for_next = population_for(&[next]);
+        for_next.set_built_for(next);
+        let (for_closing, for_next) = (Arc::new(for_closing), Arc::new(for_next));
+
+        let mut held = DayPopulation {
+            held: Arc::new(population::Population::default()),
+        };
+        assert!(Arc::ptr_eq(
+            &held.refresh(Arc::clone(&for_closing), closing),
+            &for_closing
+        ));
+        let pop = held.refresh(Arc::clone(&for_next), closing);
+        assert!(Arc::ptr_eq(&pop, &for_closing), "held back");
+        assert_eq!(pop.uids_for("waterloo-reading", closing), vec!["C11052"]);
+        assert!(Arc::ptr_eq(
+            &held.refresh(Arc::clone(&for_next), next),
+            &for_next
+        ));
+        // A snapshot built for an earlier day (or by no cycle) is taken.
+        let mut held = DayPopulation {
+            held: Arc::clone(&for_next),
+        };
+        assert!(Arc::ptr_eq(
+            &held.refresh(Arc::clone(&for_closing), next),
+            &for_closing
+        ));
+    }
+
+    /// Regression test (F5): a detected stream gap used to move only the
+    /// windowed `observed_from`, so the legacy row stayed "available" with
+    /// every trimmed train counted as cancelled. The day is partial now,
+    /// and an earlier reason is kept.
+    #[test]
+    fn a_stream_gap_makes_the_day_partial() {
+        let service_date: chrono::NaiveDate = "2026-07-15".parse().unwrap();
+        let mut day = DayState::new(service_date);
+        mark_stream_gap(&mut day);
+        assert_eq!(day.partial_reason, Some(day::PartialReason::StreamGap));
+        let row = stats::build_line_row(
+            "waterloo-reading",
+            service_date,
+            &["C11052"],
+            &day.correlation.derived,
+            true,
+            day.is_line_partial("waterloo-reading"),
+            &common::Defaults::default(),
+        );
+        assert_ne!(row.availability, "available");
+        assert_eq!(row.stats.cancelled, 0, "the unseen train is left out");
+
+        let mut day = DayState::new(service_date);
+        day.partial_reason = Some(day::PartialReason::DayStartTrimmed);
+        mark_stream_gap(&mut day);
+        assert_eq!(
+            day.partial_reason,
+            Some(day::PartialReason::DayStartTrimmed)
+        );
     }
 }

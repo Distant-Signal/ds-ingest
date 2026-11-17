@@ -75,15 +75,18 @@ every event of that line's rail day, so:
 - the row never reads `availability = 'available'`, even after the day closes.
 
 A day is partial when the process started during that day and could not replay
-the day's start, or when a line's population was still missing as consumption
-began.
+the day's start, when a stream gap was detected during the day, or (for one
+line) when its population was still missing as consumption began.
 
 | Reason | When |
 | --- | --- |
 | `day_start_trimmed` | The day's first entries are no longer in `movement-events`. The stream's first retained entry is later than 02:00 local, and entries have been trimmed. A day whose first event simply came late looks the same, so this rule is conservative. An `XDEL` inside the day also counts. |
-| Missing population | That line only: its population still failed after `POPULATION_INITIAL_WAIT_SECS`. |
+| `stream_gap` | The gap check found `movement-events` entries trimmed before the consumer read them (`full_coverage_consumer_stream_gap_detected_total`). That day is partial. |
+| Missing population | That line only: its population still failed after `POPULATION_INITIAL_WAIT_SECS`, or nothing was published for it for the current day when consumption began. |
 
-A day entered through the in-process rail-day rollover is never partial.
+A day entered through the in-process rail-day rollover starts out not partial,
+unless a stream gap was detected in its lookback hour (the closing day's last
+hour), which may have lost some of its Activations.
 
 Rows written before 2026-09-27 were all marked `partial` by migration
 `20260927050000`. They came from a consumer that rebuilt nothing on restart.
