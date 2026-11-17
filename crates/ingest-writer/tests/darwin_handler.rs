@@ -353,12 +353,13 @@ async fn clear_future_freshness(admin: &PgPool) {
 }
 
 /// I1: a row stamped far in the future before the clamp existed does not pin
-/// the row: the next genuine batch heals it and applies. And a batch stamped
-/// far ahead is stored clamped, so it pins nothing either.
+/// the row: ds-core's guards escape it, so the next genuine batch applies.
+/// And a batch stamped far ahead is clamped by the handler, so it pins
+/// nothing either.
 #[tokio::test]
 #[ignore = "requires a live database: DATABASE_URL=... cargo test -p ingest-writer --test \
             darwin_handler -- --ignored --test-threads=1"]
-async fn a_future_stored_time_is_healed_and_a_future_message_is_clamped() {
+async fn a_future_stored_time_is_replaced_and_a_future_message_is_clamped() {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)

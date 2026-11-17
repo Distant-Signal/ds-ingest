@@ -29,7 +29,8 @@ use chrono::{DateTime, Utc};
 use ds_runtime::progress::Progress;
 use ds_runtime::redis_conn::RedisConn;
 use ingest_stream::{
-    ConsumerConfig, Handled, Handler, HandlerError, StreamConsumer, StreamEntry, budget, streams,
+    ConsumerConfig, Handled, Handler, HandlerError, SchemaId, StreamConsumer, StreamEntry, budget,
+    streams,
 };
 use sqlx::PgPool;
 use tokio::sync::watch;
@@ -387,6 +388,13 @@ impl Handler for WriterHandler {
     async fn handle(&self, entry: &StreamEntry) -> Result<Handled, HandlerError> {
         self.apply(entry).await
     }
+
+    /// A schema and version with a handler in the registry `handle` dispatches
+    /// on: a bounded set, so its metric labels are safe from the first entry.
+    /// A producer-chosen name or version stays unlabelled until accepted.
+    fn knows_schema(&self, schema: &SchemaId) -> bool {
+        self.registry.lookup(schema).is_ok()
+    }
 }
 
 /// Dead-letter entries are kept 7 days (spec §7.1), as well as capped at
@@ -731,7 +739,7 @@ mod tests {
     #[tokio::test]
     async fn an_entry_off_its_stream_or_its_key_is_poison() {
         use chrono::Utc;
-        use ingest_stream::{Envelope, SchemaId};
+        use ingest_stream::Envelope;
 
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://nobody@localhost/none")
@@ -792,5 +800,22 @@ mod tests {
                 KEY_NOT_FOR_SCHEMA,
             );
         }
+    }
+
+    /// Only a schema and version the registry has a handler for earns its
+    /// metric labels before an entry of it is accepted.
+    #[tokio::test]
+    async fn only_a_registered_schema_is_known() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://nobody@localhost/none")
+            .unwrap();
+        let live = StreamSpec::by_stream(streams::IOI_LIVE).unwrap();
+        let handler = WriterHandler::new(pool, Arc::new(crate::handlers::registry()), live);
+        let schema = |name: &str, version: u32| SchemaId::new(name, version).unwrap();
+        assert!(handler.knows_schema(&schema("ioi-station-samples", 1)));
+        assert!(handler.knows_schema(&schema("darwin-pushport", 1)));
+        // An unregistered name, and a registered name at an unregistered version.
+        assert!(!handler.knows_schema(&schema("made-up-by-a-producer", 1)));
+        assert!(!handler.knows_schema(&schema("ioi-station-samples", 999)));
     }
 }
