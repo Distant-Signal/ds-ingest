@@ -39,6 +39,22 @@ const DEAD_LETTER_SUFFIX: &str = "-deadletter";
 /// alerts hours beforehand so it can be re-injected first.
 const DEAD_LETTER_MAX_LEN: usize = 10_000;
 
+/// The most one consumer group may hold in the dead-letter stream: half the
+/// cap, so one poison source (a group whose rejections never stop) cannot
+/// fill the stream and stall the other groups' dead-letter writes (which
+/// would leave their poison records pending, and their lag growing). A
+/// write past a group's share is refused exactly like a full stream: `Err`,
+/// counted in `..._deadletter_full_total{group}`, the entry stays pending,
+/// nothing is trimmed or dropped (the "gaps over duplicates" rule is
+/// unchanged). The group's own records are only counted once the stream
+/// holds more than this many in total, so normal operation pays nothing.
+const DEAD_LETTER_GROUP_MAX_LEN: usize = DEAD_LETTER_MAX_LEN / 2;
+
+/// Gauge (labelled `stream`) of [`DEAD_LETTER_MAX_LEN`], set when a consumer
+/// connects, so an alert can compare the length against the cap it is
+/// refused at (`distant_signal_movement_relay_deadletter_length` over this).
+const DEAD_LETTER_CAP_METRIC: &str = "movement_feed_deadletter_cap";
+
 /// Counter (labelled `group`) of consumer groups recreated after `NOGROUP`
 /// ([`RedisStreamMovementFeed::recreate_group`]): Redis came back without
 /// its data (a lost or unreadable AOF, a replaced volume) or someone deleted
@@ -355,6 +371,12 @@ impl RedisStreamMovementFeed {
             "group" => group.clone()
         )
         .increment(0);
+        #[expect(clippy::cast_precision_loss, reason = "the cap is far below 2^52")]
+        metrics::gauge!(
+            ds_runtime::metrics::metric_name(DEAD_LETTER_CAP_METRIC),
+            "stream" => format!("{stream}{DEAD_LETTER_SUFFIX}")
+        )
+        .set(DEAD_LETTER_MAX_LEN as f64);
         metrics::counter!(
             ds_runtime::metrics::metric_name(GROUP_RECREATED_METRIC),
             "group" => group.clone()
@@ -551,6 +573,26 @@ fn long_pending_entries(
         .collect()
 }
 
+impl RedisStreamMovementFeed {
+    /// How many records of the dead-letter stream `stream` this group wrote.
+    /// A full scan, so only [`dead_letter`](DeadLetterSink::dead_letter)
+    /// calls it, once the stream is past one group's share.
+    async fn group_dead_letters(&mut self, stream: &str) -> anyhow::Result<usize> {
+        let reply: redis::streams::StreamRangeReply = self.conn.xrange_all(stream).await?;
+        Ok(reply
+            .ids
+            .iter()
+            .filter(|entry| {
+                entry
+                    .map
+                    .get("group")
+                    .and_then(|v| redis::from_redis_value_ref::<String>(v).ok())
+                    .is_some_and(|g| g == self.group)
+            })
+            .count())
+    }
+}
+
 #[async_trait]
 impl DeadLetterSink for RedisStreamMovementFeed {
     /// `XADD <stream>-deadletter` per record (one pipeline, no trimming --
@@ -589,6 +631,32 @@ impl DeadLetterSink for RedisStreamMovementFeed {
             )
             .increment(records.len() as u64);
             anyhow::bail!("dead-letter stream {stream} is full ({len}/{DEAD_LETTER_MAX_LEN})");
+        }
+        if len + records.len() > DEAD_LETTER_GROUP_MAX_LEN {
+            let own = self.group_dead_letters(&stream).await?;
+            if own + records.len() > DEAD_LETTER_GROUP_MAX_LEN {
+                tracing::error!(
+                    stream = %stream,
+                    group = %self.group,
+                    own,
+                    len,
+                    group_cap = DEAD_LETTER_GROUP_MAX_LEN,
+                    refused = records.len(),
+                    "this group's share of the dead-letter stream is full; refusing so the \
+                     other groups keep room, so these records stay pending until it is \
+                     drained (see docs/movement-events-deadletter.md)"
+                );
+                metrics::counter!(
+                    ds_runtime::metrics::metric_name("movement_feed_deadletter_full_total"),
+                    "group" => self.group.clone()
+                )
+                .increment(records.len() as u64);
+                anyhow::bail!(
+                    "group {} holds {own} of the dead-letter stream {stream}'s records \
+                     (share {DEAD_LETTER_GROUP_MAX_LEN})",
+                    self.group
+                );
+            }
         }
         let mut pipe = redis::pipe();
         for record in records {
@@ -2276,6 +2344,59 @@ mod redis_tests {
         );
         let len: usize = feed.conn.xlen(&dl).await.unwrap();
         assert_eq!(len, DEAD_LETTER_MAX_LEN, "nothing was trimmed");
+        cleanup(&stream).await;
+    }
+
+    /// One group cannot fill the dead-letter stream: past its share its
+    /// writes are refused (and stay pending), while another group can still
+    /// write, and nothing is trimmed.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn one_group_cannot_fill_the_dead_letter_stream_for_the_others() {
+        let stream = unique_stream("dead-letter-fair");
+        let mut noisy = RedisStreamMovementFeed::connect_for_test(
+            &redis_url(),
+            &stream,
+            "noisy-group",
+            "noisy-consumer",
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+        let mut quiet = RedisStreamMovementFeed::connect_for_test(
+            &redis_url(),
+            &stream,
+            "quiet-group",
+            "quiet-consumer",
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+        let dl = format!("{stream}{DEAD_LETTER_SUFFIX}");
+        let mut pipe = redis::pipe();
+        for i in 0..DEAD_LETTER_GROUP_MAX_LEN {
+            pipe.cmd("XADD")
+                .arg(&dl)
+                .arg("*")
+                .arg("group")
+                .arg("noisy-group")
+                .arg("payload")
+                .arg(i)
+                .ignore();
+        }
+        let _: () = pipe.query_async(&mut noisy.conn).await.unwrap();
+        let record = || DeadLetter {
+            reason: "rejected_by_api",
+            source_id: None,
+            delivery_count: None,
+            payload: "p".to_string(),
+            detail: "422".to_string(),
+        };
+
+        assert!(noisy.dead_letter(&[record()]).await.is_err());
+        quiet.dead_letter(&[record()]).await.unwrap();
+        let len: usize = noisy.conn.xlen(&dl).await.unwrap();
+        assert_eq!(len, DEAD_LETTER_GROUP_MAX_LEN + 1, "nothing trimmed");
         cleanup(&stream).await;
     }
 
