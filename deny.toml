@@ -1,7 +1,7 @@
 # cargo-deny: licences, advisories, bans and sources. CI's `cargo-deny` job
-# (ci.yml) runs `cargo deny --locked check bans licenses sources` as a
-# blocking check, `cargo deny --locked fetch` as a blocking step, and
-# `check advisories` as a non-blocking check that only warns.
+# (ci.yml) runs `cargo deny --locked check` for bans, licenses, sources and
+# advisories as blocking checks (a new RustSec advisory or yanked crate fails
+# CI), and `cargo deny --locked fetch` as a blocking step.
 # Baseline: a strict deny.toml.
 
 [graph]
@@ -11,22 +11,20 @@ all-features = true
 # Overlap, kept on purpose: dependency-scan.yml's OSV scan already reports
 # RustSec advisories for Cargo.lock (and npm, and images), and blocks on
 # critical + fixable ones. This section reports the same database, plus
-# yanked crates, which OSV doesn't check, as a CI warning (not a gate):
-# cargo-deny's advisories v2 has no severity threshold to block on. It clones the advisory DB from github.com, which GitHub-hosted CI
-# can reach.
+# yanked crates, which OSV doesn't check, and gates CI on them (advisories
+# v2 has no severity threshold). It clones the advisory DB from github.com,
+# which GitHub-hosted CI can reach.
 version = 2
 yanked = "deny"
-# Each ignore needs a reason and is revisited when the advisory changes.
+# Each ignore needs a reason and a `# expires YYYY-MM-DD` date (ci's
+# check-deny-ignores.py step fails an undated or expired one).
 ignore = [
-    # rsa: Marvin timing attack on private-key operations; no fixed release.
-    # api's openidconnect only verifies RS256 ID-token signatures with the
-    # IdP's public keys, and notifier's web-push signs VAPID with ES256, so
-    # no RSA private key is ever used.
-    { id = "RUSTSEC-2023-0071", reason = "no RSA private-key operations: OIDC verifies with public keys, VAPID is ES256" },
-    # ttf-parser is unmaintained (no fix), pulled in by pdf-extract via
-    # lopdf. PDF tickets are parsed in api's resource-limited child process
-    # (data::ticket_subprocess), so a parser bug can't take the server down.
-    { id = "RUSTSEC-2026-0192", reason = "only via pdf-extract, which runs in the sandboxed ticket-parse child" },
+    # rsa: Marvin timing attack on private-key operations (RUSTSEC-2023-0071);
+    # patched only in rsa >= 0.10.0. Pulled in by
+    # sqlx-mysql only (sqlx's MySQL driver, a lockfile-only dependency of
+    # sqlx-macros-core; we run Postgres and no RSA operation is reachable).
+    # Re-read at the date: bump rsa when its dependents allow, else renew.
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9 only via sqlx-mysql, which this repo never uses; patched only in rsa 0.10" }, # expires 2027-05-17
 ]
 
 [licenses]
