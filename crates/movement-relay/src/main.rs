@@ -393,6 +393,23 @@ enum BatchOutcome {
     PublishFailed,
 }
 
+/// How much of a raw Kafka record a log line carries.
+const LOG_EXCERPT_BYTES: usize = 300;
+
+/// The first [`LOG_EXCERPT_BYTES`] bytes of `raw` (cut at a character
+/// boundary) and its full length when cut: a whole record, which can be
+/// megabytes and is feed data, does not belong in an error log line.
+fn log_excerpt(raw: &str) -> String {
+    if raw.len() <= LOG_EXCERPT_BYTES {
+        return raw.to_owned();
+    }
+    let mut end = LOG_EXCERPT_BYTES;
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{} [truncated, {} bytes in all]", &raw[..end], raw.len())
+}
+
 async fn publish_batch<K>(sink: &mut K, batch: &[String]) -> BatchOutcome
 where
     K: EventSink,
@@ -405,7 +422,7 @@ where
                 if classified.malformed > 0 {
                     tracing::warn!(
                         malformed = classified.malformed,
-                        raw = %raw,
+                        raw = %log_excerpt(raw),
                         "skipping TRUST envelopes with no header.msg_type; publishing the rest of the record"
                     );
                     metrics::counter!(
@@ -424,7 +441,7 @@ where
                 // sleep per bad record and throttled a burst of them to
                 // 0.5 records/s for all three consumer groups. It is logged
                 // with its raw payload and counted here.
-                tracing::error!(error = ?err, raw = %raw, "failed to classify Kafka record; skipping it");
+                tracing::error!(error = ?err, raw = %log_excerpt(raw), "failed to classify Kafka record; skipping it");
                 metrics::counter!(
                     ds_runtime::metrics::metric_name("movement_relay_errors_total"),
                     "operation" => "classify_record"
@@ -899,6 +916,21 @@ mod tests {
     use super::*;
     use crate::event_sink::FakeEventSink;
     use crate::kafka_source::FakeRawSource;
+
+    #[test]
+    fn a_logged_record_is_cut_to_an_excerpt_at_a_char_boundary() {
+        assert_eq!(log_excerpt("short"), "short");
+        let exact = "a".repeat(LOG_EXCERPT_BYTES);
+        assert_eq!(log_excerpt(&exact), exact);
+        let long = "b".repeat(1_000_000);
+        let cut = log_excerpt(&long);
+        assert!(cut.len() < LOG_EXCERPT_BYTES + 60, "{}", cut.len());
+        assert!(cut.starts_with(&"b".repeat(LOG_EXCERPT_BYTES)));
+        assert!(cut.ends_with("[truncated, 1000000 bytes in all]"));
+        // A multi-byte character straddling the limit is dropped, not split.
+        let wide = format!("{}{}", "a".repeat(LOG_EXCERPT_BYTES - 1), "é".repeat(10));
+        assert!(log_excerpt(&wide).starts_with(&"a".repeat(LOG_EXCERPT_BYTES - 1)));
+    }
 
     // `0008` ("Change of Location"), not `0005`, is the still-genuinely-
     // unconfirmed type here as of the H4 fix (2026-09-26 review): `0005`

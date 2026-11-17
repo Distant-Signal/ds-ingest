@@ -125,6 +125,44 @@ affected entry stays pending in its group, so it is delayed but not lost.
 To free space, re-inject or delete records (see below). The age limit above
 also frees space, a day at a time.
 
+**Per-group share.** The cap is shared by the three groups, so one group
+whose rejections never stop could fill it and stall the others' dead-letter
+writes. A group may therefore hold at most half the cap (5,000 records). Past
+that, that group's writes are refused the same way (error log "this group's
+share of the dead-letter stream is full", the same `deadletter_full_total`
+increase, the entry stays pending), and the other groups keep room. This
+never drops a record, and it does not trim. The group's own records are only
+counted (a scan of the stream) once the stream holds more than 5,000 in
+total, so normal operation pays nothing.
+
+**Signal.** `distant_signal_movement_feed_deadletter_cap{stream}` is the cap
+(10,000), set when a consumer connects, next to
+`distant_signal_movement_relay_deadletter_length{stream}`; length over cap is
+the fill ratio the near-full and full alerts watch, and
+`increase(distant_signal_movement_feed_deadletter_full_total[..]) > 0` means
+a group is already refused and stalled behind a poison entry.
+
+### When it is full (or a group is stalled behind it)
+
+`DistantSignalDeadLetterNearFull`, `DistantSignalDeadLetterFull` or a
+rising `deadletter_full_total{group}` means a group cannot dead-letter, so
+its poison entry stays pending and that group reads nothing newer. Treat it as
+an incident for that group's lag.
+
+1. Which group, and why: `XRANGE movement-events-deadletter - + COUNT 50`
+   (see "Inspecting"), and look at `group`, `reason` and `detail`. A single
+   `detail` repeated thousands of times is one poison source or one `api`
+   fault answered 4xx for everything. Fix that cause first (an `api` bug that
+   rejects valid data is the usual one), or the stream refills.
+2. Count per group with `$REDIS EVAL "local c={} for _,e in ipairs(redis.call('XRANGE',KEYS[1],'-','+')) do for i=1,#e[2],2 do if e[2][i]=='group' then c[e[2][i+1]]=(c[e[2][i+1]] or 0)+1 end end end local r={} for k,v in pairs(c) do r[#r+1]=k r[#r+1]=v end return r" 1 movement-events-deadletter`.
+3. Recover what can be re-injected ("Re-injecting whole entries"); the rest,
+   once you have saved or deliberately discarded it, `XDEL` ("Deleting").
+   `XDEL` by id range is not built in; list ids with `XRANGE ... COUNT n` and
+   delete those.
+4. The stalled group retries on its next cycle and writes as soon as there is
+   room; no restart is needed. Watch `deadletter_full_total` stop rising and
+   the group's lag fall.
+
 ## Inspecting
 
 `<fullname>` is the chart's full name: `<release>-distant-signal`, or just

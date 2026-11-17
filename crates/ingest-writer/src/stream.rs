@@ -284,6 +284,24 @@ pub const SCHEMA_NOT_ALLOWED_ON_STREAM: &str = "schema_not_allowed_on_stream";
 /// with `<schema name>:` ([`ingest_stream::Envelope::snapshot_key`]).
 pub const KEY_NOT_FOR_SCHEMA: &str = "key_not_for_schema";
 
+/// The longest envelope `key` the writer admits, in bytes. A key is a schema
+/// name, a producer's window and a counter or hash; darwin-relay's names
+/// each topic partition it read (`<topic>:<partition>@<first>-<last>~<ms>`,
+/// about 60 bytes plus the topic name, joined by commas, and a `/<i>` per
+/// size split), so a batch spanning several partitions of a long-named
+/// topic is a few hundred bytes. The limit leaves room for that and still
+/// bounds the storage and log amplification an unbounded key would be (the
+/// key is stored in `ingest_dedup` and logged) for any producer allowed to
+/// `XADD`.
+pub const MAX_KEY_LEN: usize = 2048;
+
+/// The longest envelope `producer` (`<component>/<pod name>`) the writer
+/// admits, in bytes: a Kubernetes pod name is at most 253.
+pub const MAX_PRODUCER_LEN: usize = 512;
+
+/// The `reason` prefix of an entry whose `key` or `producer` is too long.
+pub const ENVELOPE_FIELD_TOO_LONG: &str = "envelope_field_too_long";
+
 /// The writer's [`Handler`] for one stream in `apply`.
 pub struct WriterHandler {
     pool: PgPool,
@@ -309,11 +327,23 @@ impl WriterHandler {
     /// - its key must start with `<schema name>:`, as every producer's does
     ///   ([`ingest_stream::Envelope::snapshot_key`]), so one schema's entry
     ///   can never claim (and so suppress) another schema's dedup key
-    ///   ([`KEY_NOT_FOR_SCHEMA`]).
+    ///   ([`KEY_NOT_FOR_SCHEMA`]);
+    /// - its `key` and `producer` must be at most [`MAX_KEY_LEN`] and
+    ///   [`MAX_PRODUCER_LEN`] bytes ([`ENVELOPE_FIELD_TOO_LONG`]).
     ///
-    /// Either is [`HandlerError::Poison`]: dead-lettered with the reason.
+    /// Any is [`HandlerError::Poison`]: dead-lettered with the reason.
     fn admit(&self, entry: &StreamEntry) -> Result<&dyn SchemaHandler, HandlerError> {
         let name = entry.envelope.schema.name();
+        for (field, len, max) in [
+            ("key", entry.envelope.key.len(), MAX_KEY_LEN),
+            ("producer", entry.envelope.producer.len(), MAX_PRODUCER_LEN),
+        ] {
+            if len > max {
+                return Err(HandlerError::Poison(format!(
+                    "{ENVELOPE_FIELD_TOO_LONG}: {field} is {len} bytes (at most {max})"
+                )));
+            }
+        }
         if !self.spec.carries(name) {
             return Err(HandlerError::Poison(format!(
                 "{SCHEMA_NOT_ALLOWED_ON_STREAM}: {} does not carry schema {name:?} (only {})",
@@ -736,6 +766,20 @@ mod tests {
         poison(
             handler.handle(&entry("tocs", "tocs:b:1/1")).await,
             SCHEMA_NOT_ALLOWED_ON_STREAM,
+        );
+        // An oversized key or producer, before anything touches the database.
+        let long_key = format!("ioi-station-samples:{}", "k".repeat(MAX_KEY_LEN));
+        poison(
+            handler
+                .handle(&entry("ioi-station-samples", &long_key))
+                .await,
+            ENVELOPE_FIELD_TOO_LONG,
+        );
+        let mut long_producer = entry("ioi-station-samples", "ioi-station-samples:b:1/1");
+        long_producer.envelope.producer = "p".repeat(MAX_PRODUCER_LEN + 1);
+        poison(
+            handler.handle(&long_producer).await,
+            ENVELOPE_FIELD_TOO_LONG,
         );
         // This stream's schema with another schema's key, or none.
         for key in [

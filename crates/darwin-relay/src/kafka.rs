@@ -191,6 +191,23 @@ const STATISTICS_INTERVAL_MS: &str = "30000";
 
 /// The client settings, split out so they are testable without a broker.
 pub(crate) fn client_config(config: &Config) -> anyhow::Result<ClientConfig> {
+    if !config
+        .kafka_security_protocol
+        .trim()
+        .eq_ignore_ascii_case("SASL_SSL")
+    {
+        anyhow::ensure!(
+            config.kafka_allow_insecure_protocol,
+            "KAFKA_SECURITY_PROTOCOL is {:?}, not SASL_SSL: refusing to send the SASL \
+             credentials and the feed without TLS (set KAFKA_ALLOW_INSECURE_PROTOCOL=true \
+             to allow it, for a local broker only)",
+            config.kafka_security_protocol
+        );
+        tracing::warn!(
+            protocol = %config.kafka_security_protocol,
+            "KAFKA_ALLOW_INSECURE_PROTOCOL is set: connecting without SASL_SSL"
+        );
+    }
     let mut client = ClientConfig::new();
     client
         .set("bootstrap.servers", &config.kafka_brokers)
@@ -472,7 +489,48 @@ mod tests {
     #[test]
     fn sasl_without_credentials_is_refused() {
         assert!(client_config(&config(&[])).is_err());
-        let plain = client_config(&config(&["--kafka-security-protocol", "SSL"])).expect("ok");
+        let plain = client_config(&config(&[
+            "--kafka-security-protocol",
+            "SSL",
+            "--kafka-allow-insecure-protocol",
+        ]))
+        .expect("ok");
         assert_eq!(plain.get("sasl.username"), None);
+    }
+
+    #[test]
+    fn a_protocol_other_than_sasl_ssl_needs_the_explicit_acknowledgement() {
+        for protocol in ["PLAINTEXT", "SASL_PLAINTEXT", "SSL", "bogus", ""] {
+            let args = [
+                "--kafka-security-protocol",
+                protocol,
+                "--kafka-sasl-username",
+                "user",
+                "--kafka-sasl-password",
+                "fake-password",
+            ];
+            assert!(
+                client_config(&config(&args)).is_err(),
+                "{protocol:?} was accepted"
+            );
+            let mut allowed = args.to_vec();
+            allowed.push("--kafka-allow-insecure-protocol");
+            assert!(
+                client_config(&config(&allowed)).is_ok(),
+                "{protocol:?} was refused with the acknowledgement"
+            );
+        }
+        // The default and a differently cased SASL_SSL need nothing.
+        for protocol in ["SASL_SSL", "sasl_ssl"] {
+            let args = [
+                "--kafka-security-protocol",
+                protocol,
+                "--kafka-sasl-username",
+                "user",
+                "--kafka-sasl-password",
+                "fake-password",
+            ];
+            assert!(client_config(&config(&args)).is_ok(), "{protocol:?}");
+        }
     }
 }
