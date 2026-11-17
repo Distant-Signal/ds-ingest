@@ -555,17 +555,9 @@ impl ProcessorState {
     /// Every map change goes through the journaled mutators, so a rolled-back
     /// batch undoes this too.
     ///
-    /// Not wired up yet: ds-core's `trust_schema::schema::ChangeOfIdentity`
-    /// models only `train_id`, not TRUST's `revised_train_id`. Once a ds-core
-    /// release adds it, the `ChangeOfIdentity` arm of `process_message` calls
-    /// this with `(change.train_id, change.revised_train_id)`.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "called once ds-core's ChangeOfIdentity carries revised_train_id (finding T3)"
-        )
-    )]
+    /// Called from the `ChangeOfIdentity` arm of `process_message` with
+    /// `ChangeOfIdentity::identity_change()`, which is `None` (nothing to
+    /// carry) when the message names no usable `revised_train_id`.
     pub(crate) fn carry_over_identity(&mut self, current: &str, revised: &str) {
         if current == revised {
             return;
@@ -1900,7 +1892,15 @@ fn process_message(
             passthrough_event(message, &change.train_id, "0006", state, received_at)
         }
         TrustMessage::ChangeOfIdentity(change) => {
-            passthrough_event(message, &change.train_id, "0007", state, received_at)
+            // The event is derived against the state as it was under the old
+            // id; the carry-over then makes the revised id inherit it. A
+            // message with no usable `revised_train_id` (absent, empty, or
+            // equal to `train_id`) carries nothing over.
+            let events = passthrough_event(message, &change.train_id, "0007", state, received_at);
+            if let Some((current, revised)) = change.identity_change() {
+                state.carry_over_identity(current, revised);
+            }
+            events
         }
 
         // Not logged by `schema::parse_envelope` itself (parsing an
@@ -3113,6 +3113,99 @@ mod tests {
         assert_eq!(events[0].tracked_train_id, 1);
         assert_eq!(events[0].status, "en_route");
         assert_eq!(events[0].last_reported_location, Some("WAT".to_string()));
+    }
+
+    /// SYNTHETIC: the `0007` body is shaped after the field names in
+    /// Network Rail's public Train Movements documentation (as ds-core's
+    /// `ChangeOfIdentity` documents); it is not a captured production
+    /// message, and no live `0007` carrying `revised_train_id` has been
+    /// seen.
+    #[tokio::test]
+    async fn a_change_of_identity_message_carries_the_resolution_to_the_revised_id() {
+        let change_of_identity = r#"[{"header":{"msg_type":"0007"},"body":{
+            "train_id":"221832406","revised_train_id":"221Z32406",
+            "train_service_code":"22345000"
+        }}]"#;
+        let under_revised_id = r#"[{"header":{"msg_type":"0003"},"body":{
+            "train_id":"221Z32406","event_type":"ARRIVAL",
+            "planned_timestamp":"1787946600000","actual_timestamp":"1787946600000",
+            "loc_stanox":"86031","variation_status":"ON TIME"
+        }}]"#;
+        let mut feed = FakeMovementFeed::new(vec![
+            vec![ORIGIN_DEPARTURE.to_string()],
+            vec![change_of_identity.to_string()],
+            vec![under_revised_id.to_string()],
+        ]);
+        let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
+        let mut state = ProcessorState::default();
+        for _ in 0..2 {
+            run_once(
+                &mut feed,
+                &reference,
+                &mut state,
+                &TEST_STANOX_CRS,
+                test_received_at(),
+            )
+            .await
+            .unwrap();
+            state.confirm_batch();
+        }
+        assert_eq!(state.resolved.get("221Z32406"), Some(&vec![1]));
+
+        let events = run_once(
+            &mut feed,
+            &reference,
+            &mut state,
+            &TEST_STANOX_CRS,
+            test_received_at(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(events.len(), 1, "the revised id's movement is not dropped");
+        assert_eq!(events[0].tracked_train_id, 1);
+    }
+
+    /// SYNTHETIC, as above: bodies with no usable `revised_train_id` still
+    /// parse and are recorded, and carry nothing over.
+    #[tokio::test]
+    async fn a_change_of_identity_without_a_revised_id_carries_nothing_over() {
+        for body in [
+            r#"{"train_id":"221832406"}"#,
+            r#"{"train_id":"221832406","revised_train_id":""}"#,
+            r#"{"train_id":"221832406","revised_train_id":null}"#,
+            r#"{"train_id":"221832406","revised_train_id":"221832406"}"#,
+        ] {
+            let change_of_identity =
+                format!(r#"[{{"header":{{"msg_type":"0007"}},"body":{body}}}]"#);
+            let mut feed = FakeMovementFeed::new(vec![
+                vec![ORIGIN_DEPARTURE.to_string()],
+                vec![change_of_identity],
+            ]);
+            let reference = reference_with_one_pending(1, "WAT", "2026-08-28T18:32:00Z");
+            let mut state = ProcessorState::default();
+            run_once(
+                &mut feed,
+                &reference,
+                &mut state,
+                &TEST_STANOX_CRS,
+                test_received_at(),
+            )
+            .await
+            .unwrap();
+            state.confirm_batch();
+            let events = run_once(
+                &mut feed,
+                &reference,
+                &mut state,
+                &TEST_STANOX_CRS,
+                test_received_at(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(events.len(), 1, "{body}: still recorded");
+            assert_eq!(events[0].msg_type, "0007", "{body}");
+            assert_eq!(state.resolved.len(), 1, "{body}: nothing carried over");
+        }
     }
 
     #[tokio::test]
