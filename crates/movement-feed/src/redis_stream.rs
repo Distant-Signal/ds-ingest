@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use ds_runtime::redis_conn::RedisConn;
+use ds_runtime::redis_group::GroupCursor;
 use redis::AsyncCommands;
 
 use crate::{DeadLetter, DeadLetterSink, MovementFeed};
@@ -65,11 +66,13 @@ const DEAD_LETTER_CAP_METRIC: &str = "movement_feed_deadletter_cap";
 /// `increase()`.
 const GROUP_RECREATED_METRIC: &str = "movement_feed_group_recreated_total";
 
-/// Counter (labelled `group`) of consumer groups found BEHIND the last entry
-/// this consumer was handed after a failed read, and moved forward to it
+/// Counter (labelled `group`) of consumer groups found BEHIND this
+/// consumer's position after a failed read, and moved forward to it
 /// (`XGROUP SETID`; [`restore_group_position`]): Redis came back with an
 /// older copy of its data, so the group still exists but would hand out
-/// again entries already processed. Registered at 0.
+/// again entries already processed. The position is the cursor's restore
+/// target, just below the oldest entry handed out and not yet acked.
+/// Registered at 0.
 const GROUP_RESTORED_METRIC: &str = "movement_feed_group_position_restored_total";
 
 /// Counter (labelled `group`) of delivered entries whose stream id has no
@@ -198,14 +201,17 @@ pub struct RedisStreamMovementFeed {
     isolating: bool,
     last_autoclaim_sweep: std::time::Instant,
     autoclaim_min_idle: Duration,
-    /// This process's copy of the group's `last-delivered-id`: seeded from
-    /// `XINFO GROUPS` at connect (and after [`Self::recreate_group`]) and
-    /// advanced by every `>` read to the last id it returned, exactly as
-    /// Redis advances the group's own. `None` only when `XINFO GROUPS`
-    /// could not be read. It is what a group lost to `NOGROUP` is
-    /// recreated at -- see [`recreate_start_id`] -- and what a group that
-    /// went backwards is moved forward to (see `verify_position`).
-    last_delivered_id: Option<String>,
+    /// How far this consumer has got: which entries it was handed and has
+    /// not yet acked. Seeded from the group's `last-delivered-id`
+    /// (`XINFO GROUPS`) at connect and after [`Self::recreate_group`] (empty
+    /// when that could not be read). Every id a read or `XAUTOCLAIM` hands
+    /// out is `delivered`, every `XACK` `acked`. Its `restore_target` (just
+    /// below the oldest unacked entry, else the highest id seen) is what a
+    /// group lost to `NOGROUP` is recreated at -- see [`recreate_start_id`]
+    /// -- and what a group that went backwards is moved forward to (see
+    /// `verify_position`), so neither skips an entry read but not finished
+    /// (2026-11 review R3).
+    cursor: GroupCursor,
     /// Set by a failed read other than `NOGROUP`: before the next read,
     /// [`restore_group_position`] checks the group did not go backwards
     /// (2026-10-09 redelivery review). A Redis restart that reloads an older
@@ -352,7 +358,11 @@ impl RedisStreamMovementFeed {
                  entry, so every retained entry is read (duplicates are absorbed by the dedup key)"
             );
         }
-        let last_delivered_id = seed_last_delivered_id(&mut conn, stream, &group).await;
+        let cursor = seeded_cursor(
+            seed_last_delivered_id(&mut conn, stream, &group)
+                .await
+                .as_deref(),
+        );
 
         // Register the dead-letter counters at 0 for this group, so the
         // DistantSignalDeadLetterGrowing/Full alerts can use a plain
@@ -411,7 +421,7 @@ impl RedisStreamMovementFeed {
                 .checked_sub(autoclaim_min_idle)
                 .unwrap(),
             autoclaim_min_idle,
-            last_delivered_id,
+            cursor,
             verify_position: false,
         })
     }
@@ -516,6 +526,7 @@ impl RedisStreamMovementFeed {
                 }])
                 .await?;
                 let _: i64 = self.conn.xack(&self.stream, &self.group, &[&id]).await?;
+                self.cursor.acked(&id);
                 self.pending.clear();
                 Ok(())
             }
@@ -773,6 +784,30 @@ async fn seed_last_delivered_id(conn: &mut RedisConn, stream: &str, group: &str)
     }
 }
 
+/// A cursor starting at `last_delivered_id` (the group's, as read by
+/// [`seed_last_delivered_id`]), or an empty one when it is unknown.
+fn seeded_cursor(last_delivered_id: Option<&str>) -> GroupCursor {
+    last_delivered_id.map_or_else(GroupCursor::new, GroupCursor::seeded)
+}
+
+/// `cursor` holding exactly `own_pel` as outstanding, keeping its highest
+/// id: for when a read of this consumer's own pending-entries list from the
+/// start came back complete (fewer entries than asked for), so `own_pel` is
+/// all of what is still this consumer's to finish. Anything it was handed and
+/// had not acked that is not listed was acked elsewhere, claimed by another
+/// consumer, or trimmed. `GroupCursor::released` per such id would do the
+/// same; the cursor does not list its outstanding ids to find them.
+fn cursor_holding<'a>(
+    cursor: &GroupCursor,
+    own_pel: impl IntoIterator<Item = &'a str>,
+) -> GroupCursor {
+    let mut held = seeded_cursor(cursor.highest_delivered().as_deref());
+    for id in own_pel {
+        held.delivered(id);
+    }
+    held
+}
+
 /// The stream's `last-generated-id` (`XINFO STREAM`), or `None` when the
 /// stream does not exist.
 async fn stream_last_generated_id(
@@ -801,8 +836,15 @@ async fn stream_last_generated_id(
 /// Where a consumer group lost to `NOGROUP` is recreated (the id passed to
 /// `XGROUP CREATE`; the group then delivers every entry AFTER it).
 ///
-/// - `last_delivered`: this consumer's copy of the lost group's
-///   `last-delivered-id` (`None` if unknown).
+/// - `restore_target`: where this consumer's cursor stands
+///   (`GroupCursor::restore_target`): just below the oldest entry it was
+///   handed and has not acked, else the lost group's `last-delivered-id`
+///   (`None` if unknown). Never above the highest id handed out (the cursor
+///   takes the minimum), so recreating there only ever re-delivers, never
+///   skips: an entry read but not finished is delivered again, which is a
+///   duplicate every consumer absorbs by its dedup key (2026-11 review R3;
+///   this used to resume after the highest id handed out, and skipped the
+///   unacked entries below it).
 /// - `stream_last_generated`: the stream's `last-generated-id` now, `None`
 ///   when the stream does not exist.
 ///
@@ -811,34 +853,36 @@ async fn stream_last_generated_id(
 /// - **Redis came back empty** (lost AOF, or no persistence). The stream
 ///   is gone, or was recreated by the producer's next `XADD`, so everything
 ///   in it is new to this group. Its ids come from the server's clock, so
-///   they are normally all later than `last_delivered`, and resuming after
-///   `last_delivered` delivers them all (a missing stream: `0`). If the
-///   stream's `last-generated-id` is instead BEHIND `last_delivered`, it
+///   they are normally all later than `restore_target`, and resuming after
+///   `restore_target` delivers them all (a missing stream: `0`). If the
+///   stream's `last-generated-id` is instead BEHIND `restore_target`, it
 ///   cannot be the stream that was read (a stream's ids never go
 ///   backwards): a new stream on a server whose clock is behind, so start
 ///   at `0`.
 /// - **The group was deleted by hand**, stream intact.
-///   `last-generated-id >= last_delivered`, so the group resumes after the
-///   last entry it had been handed: nothing it already read is replayed
+///   `last-generated-id >= restore_target`, so the group resumes after the
+///   last entry it had finished: nothing it already finished is replayed
 ///   (as `0` would), nothing added since is skipped (as `$` would).
 ///
-/// With no `last_delivered` known (it could not be read at connect) this
+/// With no `restore_target` known (it could not be read at connect) this
 /// falls back to `0`, the stream's first retained entry, as at startup:
 /// a replay of what the stream retains is duplicates, which every consumer
 /// absorbs by its dedup key, where `$` (the tail) would silently skip
 /// whatever was added since the group was lost.
 ///
-/// Not recoverable either way: the lost group's pending-entries list.
-/// Entries delivered but not yet `ACKed` are not redelivered (after an empty
-/// restart they are gone anyway). Nor is one narrow case: a recreated
+/// Not recoverable either way: the lost group's pending-entries list
+/// itself. Entries delivered but not yet `ACKed` are delivered again only
+/// while the stream still has them: from the restore target on, as new
+/// entries of the recreated group (after an empty restart they are gone
+/// anyway). Nor is one narrow case: a recreated
 /// stream on a server whose clock is behind, whose `last-generated-id`
-/// has already passed `last_delivered` -- its entries up to
-/// `last_delivered` are skipped.
-fn recreate_start_id(last_delivered: Option<&str>, stream_last_generated: Option<&str>) -> String {
+/// has already passed `restore_target` -- its entries up to
+/// `restore_target` are skipped.
+fn recreate_start_id(restore_target: Option<&str>, stream_last_generated: Option<&str>) -> String {
     let Some(last_generated) = stream_last_generated else {
         return "0".to_string();
     };
-    match last_delivered {
+    match restore_target {
         None => STARTUP_START_ID.to_string(),
         Some(last) if stream_id_less_than(last_generated, last) => "0".to_string(),
         Some(last) => last.to_string(),
@@ -941,13 +985,27 @@ fn replay_cursor_before_read(
     }
 }
 
-/// After a failed read: moves `group` forward to `last_delivered_id` if
-/// Redis reports it behind (`ds_runtime::redis_group::restore_group_position`),
-/// logging a warning and counting [`GROUP_RESTORED_METRIC`]; a group at or
-/// past it is adopted as the new `last_delivered_id`. Returns whether the
-/// check is done: `false` (logged) when Redis could not be asked, so the
-/// next read tries again. A missing group is done here: the read will fail
-/// `NOGROUP` and recreate it.
+/// After a failed read: moves `group` forward to `cursor`'s restore target
+/// if Redis reports it behind
+/// (`ds_runtime::redis_group::restore_group_cursor`), logging a warning and
+/// counting [`GROUP_RESTORED_METRIC`]. Returns whether the check is done:
+/// `false` (logged) when Redis could not be asked, so the next read tries
+/// again. A missing group is done here: the read will fail `NOGROUP` and
+/// recreate it.
+///
+/// The target is just below the oldest entry handed out and not yet acked
+/// (else the highest id seen), never the highest id handed out: with
+/// E1..E16 read and only E1..E4 acked, a reloaded Redis whose PEL no longer
+/// holds E5..E16 would otherwise never hand them out again. Restoring to E4
+/// delivers them again instead (duplicates, never a gap). The target is at
+/// most the highest id handed out, which is what this restored to before, so
+/// this only ever moves the group to the same id or a lower one.
+///
+/// A group found AHEAD of the cursor is left as it is and not adopted: the
+/// cursor only learns of entries by being handed them, and adopting the
+/// group's position would raise the target past entries this consumer never
+/// saw. A cursor with no target yet is seeded from the group's position, as
+/// at connect.
 ///
 /// What is not undone: entries the consumer `ACKed` after the reloaded copy
 /// was written are pending again and are redelivered once idle; every
@@ -956,27 +1014,19 @@ async fn restore_group_position<C: redis::aio::ConnectionLike + Send>(
     conn: &mut C,
     stream: &str,
     group: &str,
-    last_delivered_id: &mut Option<String>,
+    cursor: &mut GroupCursor,
 ) -> bool {
-    let Some(remembered) = last_delivered_id.clone() else {
-        // Nothing to compare with; seed it, as at connect.
-        if let Ok(Some(at)) =
-            ds_runtime::redis_group::group_last_delivered_id(conn, stream, group).await
-        {
-            *last_delivered_id = Some(at);
-        }
-        return true;
-    };
-    match ds_runtime::redis_group::restore_group_position(conn, stream, group, &remembered).await {
+    match ds_runtime::redis_group::restore_group_cursor(conn, stream, group, cursor).await {
         Ok(ds_runtime::redis_group::GroupPosition::Restored { was }) => {
             tracing::warn!(
                 stream,
                 group,
                 was,
-                restored_to = %remembered,
+                restored_to = ?cursor.restore_target(),
                 "consumer group went backwards (Redis reloaded an older copy of its data); \
-                 moved it forward to the last entry this consumer was handed, so entries \
-                 already processed are not delivered again"
+                 moved it forward to just below the oldest entry this consumer has not \
+                 finished, so entries already processed are not delivered again and \
+                 unfinished ones are"
             );
             metrics::counter!(
                 ds_runtime::metrics::metric_name(GROUP_RESTORED_METRIC),
@@ -986,7 +1036,10 @@ async fn restore_group_position<C: redis::aio::ConnectionLike + Send>(
             true
         }
         Ok(ds_runtime::redis_group::GroupPosition::Current { at }) => {
-            *last_delivered_id = Some(at);
+            if cursor.restore_target().is_none() {
+                // Nothing to compare with; seed it, as at connect.
+                *cursor = GroupCursor::seeded(&at);
+            }
             true
         }
         Ok(ds_runtime::redis_group::GroupPosition::Missing) => true,
@@ -1027,7 +1080,7 @@ impl MovementFeed for RedisStreamMovementFeed {
                 &mut self.conn,
                 &self.stream,
                 &self.group,
-                &mut self.last_delivered_id,
+                &mut self.cursor,
             )
             .await;
         }
@@ -1053,6 +1106,9 @@ impl MovementFeed for RedisStreamMovementFeed {
         }
         let ids: Vec<&str> = self.pending.iter().map(|(id, _)| id.as_str()).collect();
         let _: i64 = self.conn.xack(&self.stream, &self.group, &ids).await?;
+        for id in ids {
+            self.cursor.acked(id);
+        }
         self.pending.clear();
         Ok(())
     }
@@ -1080,18 +1136,22 @@ impl RedisStreamMovementFeed {
                 return;
             }
         };
-        let start_id = recreate_start_id(
-            self.last_delivered_id.as_deref(),
-            stream_last_generated.as_deref(),
-        );
+        // Just below the oldest entry handed out and not acked, so those are
+        // read again from the stream (when it still has them); the highest
+        // id handed out would skip them.
+        let restore_target = self.cursor.restore_target();
+        let start_id =
+            recreate_start_id(restore_target.as_deref(), stream_last_generated.as_deref());
         tracing::warn!(
             stream = %self.stream,
             group = %self.group,
-            last_delivered_id = ?self.last_delivered_id,
+            restore_target = ?restore_target,
+            highest_delivered_id = ?self.cursor.highest_delivered(),
             stream_last_generated_id = ?stream_last_generated,
             start_id,
             "consumer group is missing (Redis lost its data, or it was deleted); recreating it \
-             after the last entry it delivered (entries delivered but not ACKed are not redelivered)"
+             just below the oldest entry this consumer had not finished (entries after it that \
+             the stream still holds are delivered again)"
         );
         if let Err(err) = ensure_group(&mut self.conn, &self.stream, &self.group, &start_id).await {
             tracing::error!(error = ?err, group = %self.group, "failed to recreate the consumer group");
@@ -1102,9 +1162,14 @@ impl RedisStreamMovementFeed {
             "group" => self.group.clone()
         )
         .increment(1);
-        if let Some(id) = seed_last_delivered_id(&mut self.conn, &self.stream, &self.group).await {
-            self.last_delivered_id = Some(id);
-        }
+        // The old group's pending entries are gone with it: start again from
+        // the new group's position, nothing outstanding. Only now, so a
+        // failed recreate keeps the position for the next attempt.
+        self.cursor = seeded_cursor(
+            seed_last_delivered_id(&mut self.conn, &self.stream, &self.group)
+                .await
+                .as_deref(),
+        );
     }
 
     async fn read_next_batch(&mut self) -> anyhow::Result<Vec<crate::FeedEntry>> {
@@ -1162,12 +1227,22 @@ impl RedisStreamMovementFeed {
         let pel_drained = raw.is_empty();
         let last_raw_id = raw.last().map(|entry| entry.id.clone());
         let raw_len = raw.len();
-        // A `>` read advanced the group's last-delivered-id to its last
-        // entry; keep the copy a `NOGROUP` recreate resumes from in step.
-        if id_arg == ">"
-            && let Some(id) = &last_raw_id
-        {
-            self.last_delivered_id = Some(id.clone());
+        // Every id handed out (`>`, this consumer's own PEL from `0` or a
+        // cursor, an isolation read), malformed ones included: none is
+        // acked yet, so the restore target stays below the oldest of them.
+        //
+        // A read of this consumer's own PEL from the start that is not full
+        // lists all of it: what it was handed and had not acked, and is not
+        // listed, is no longer its to finish (acked elsewhere, claimed by
+        // another consumer, trimmed), and one such id would pin the restore
+        // target below it for good. So the cursor holds exactly what was
+        // listed.
+        if id_arg == "0" && raw_len < count {
+            self.cursor = cursor_holding(&self.cursor, raw.iter().map(|e| e.id.as_str()));
+        } else {
+            for entry in &raw {
+                self.cursor.delivered(&entry.id);
+            }
         }
         let (entries, malformed) = split_deliverable_and_malformed(raw);
 
@@ -1189,6 +1264,9 @@ impl RedisStreamMovementFeed {
                 .conn
                 .xack(&self.stream, &self.group, &malformed_ids)
                 .await?;
+            for id in malformed_ids {
+                self.cursor.acked(id);
+            }
         }
 
         // Advance the PEL replay (M15, see `pel_replay_cursor`'s doc). A
@@ -1288,6 +1366,21 @@ impl RedisStreamMovementFeed {
                 )
                 .await?;
 
+            // Claimed entries are this consumer's now: not to be skipped by a
+            // restore until acked. (The id-`0` re-read after this sweep hands
+            // them out too; this covers the time before it.) This only ever
+            // claims TO this consumer, so no entry of its own is taken away
+            // here; ones that left its PEL for another consumer are released
+            // by `read_next_batch`'s next complete read of its PEL.
+            for entry in &reply.claimed {
+                self.cursor.delivered(&entry.id);
+            }
+            // Trimmed entries `XAUTOCLAIM` dropped from the PEL: finished,
+            // never redelivered. `released`, not `acked`, so a trimmed id
+            // this consumer never saw cannot raise the target.
+            for id in &reply.deleted_ids {
+                self.cursor.released(id);
+            }
             if !reply.claimed.is_empty() {
                 claimed_any = true;
             }
@@ -1800,11 +1893,109 @@ mod recreate_start_id_tests {
     use super::*;
 
     #[test]
-    fn an_intact_stream_resumes_after_the_last_delivered_entry() {
-        // Group deleted by hand: nothing already read is replayed.
+    fn an_intact_stream_resumes_after_the_restore_target() {
+        // Group deleted by hand: nothing already finished is replayed.
         assert_eq!(recreate_start_id(Some("100-3"), Some("250-0")), "100-3");
-        // Caught up: the stream's tail is the last delivered entry.
+        // Caught up: the stream's tail is the restore target.
         assert_eq!(recreate_start_id(Some("250-0"), Some("250-0")), "250-0");
+    }
+
+    /// The target the feed passes is the cursor's: just below the oldest
+    /// entry handed out and not acked, not the highest id handed out.
+    #[test]
+    fn a_group_is_recreated_just_below_the_oldest_unacked_entry() {
+        let mut cursor = GroupCursor::seeded("100-0");
+        for id in ["101-0", "102-0", "103-0"] {
+            cursor.delivered(id);
+        }
+        cursor.acked("101-0");
+        // 102-0 and 103-0 were read and not finished: resume just below 102-0.
+        let target = cursor.restore_target();
+        let below_102 = format!("101-{}", u64::MAX);
+        assert_eq!(target.as_deref(), Some(below_102.as_str()));
+        assert_eq!(
+            recreate_start_id(target.as_deref(), Some("250-0")),
+            below_102,
+            "102-0 is delivered again; the highest id handed out (103-0) would skip it"
+        );
+        // Everything finished: the highest id handed out, as before.
+        cursor.acked("102-0");
+        cursor.acked("103-0");
+        assert_eq!(
+            recreate_start_id(cursor.restore_target().as_deref(), Some("250-0")),
+            "103-0"
+        );
+        // An unacked entry at a millisecond boundary steps back across it.
+        let mut cursor = GroupCursor::new();
+        cursor.delivered("200-0");
+        assert_eq!(
+            recreate_start_id(cursor.restore_target().as_deref(), Some("250-0")),
+            format!("199-{}", u64::MAX)
+        );
+        // Below a stream whose ids start later: the whole stream.
+        assert_eq!(
+            recreate_start_id(Some("101-0"), Some("50-0")),
+            "0",
+            "a stream behind the target is a different one"
+        );
+    }
+
+    /// This change restores LOWER than before, never higher. Before, the
+    /// remembered id was the highest id a `>` read handed out (or the seed);
+    /// the cursor's target is `min(just below the oldest unacked, highest
+    /// delivered/seeded)`. For one consumer per group (one replica,
+    /// `Recreate`: the design's Decision 2) every id the group hands out,
+    /// PEL replay and `XAUTOCLAIM` included, was first returned by this
+    /// consumer's own `>` read, so the cursor's highest id is exactly the old
+    /// remembered one and the target is never above it.
+    #[test]
+    fn the_restore_target_is_never_above_the_highest_id_handed_out() {
+        let ids = ["10-0", "10-1", "11-0", "20-5", "21-0"];
+        // Every order of acks over every prefix of what was read.
+        for read in 0..=ids.len() {
+            for mask in 0u32..(1 << read) {
+                let mut cursor = GroupCursor::seeded("5-0");
+                for id in &ids[..read] {
+                    cursor.delivered(id);
+                }
+                let highest = cursor.highest_delivered().unwrap();
+                for (i, id) in ids[..read].iter().enumerate() {
+                    if mask & (1 << i) != 0 {
+                        cursor.acked(id);
+                    }
+                }
+                let target = cursor.restore_target().unwrap();
+                assert!(
+                    !stream_id_less_than(&highest, &target),
+                    "read {read}, acked {mask:b}: target {target} above highest {highest}"
+                );
+                assert_eq!(cursor.highest_delivered().unwrap(), highest);
+            }
+        }
+    }
+
+    /// A complete read of the consumer's own PEL lets go of every
+    /// outstanding id it does not list (claimed away, trimmed), keeping the
+    /// highest id, so one such entry cannot pin the target for good.
+    #[test]
+    fn a_complete_pel_read_releases_the_ids_it_does_not_list() {
+        let mut cursor = GroupCursor::seeded("100-0");
+        cursor.delivered("101-0");
+        cursor.delivered("102-0");
+        assert_eq!(
+            cursor.restore_target(),
+            Some(format!("100-{}", u64::MAX)),
+            "pinned just below the oldest outstanding id"
+        );
+        // The PEL still lists 102-0 only: 101-0 left it.
+        let held = cursor_holding(&cursor, ["102-0"]);
+        assert_eq!(held.restore_target(), Some(format!("101-{}", u64::MAX)));
+        assert_eq!(held.highest_delivered().as_deref(), Some("102-0"));
+        // It lists nothing: nothing is outstanding.
+        let held = cursor_holding(&cursor, []);
+        assert_eq!(held.restore_target().as_deref(), Some("102-0"));
+        assert_eq!(held.highest_delivered().as_deref(), Some("102-0"));
+        assert_eq!(cursor_holding(&GroupCursor::new(), []), GroupCursor::new());
     }
 
     #[test]
@@ -1870,29 +2061,62 @@ mod restore_group_position_tests {
         )]))
     }
 
+    /// A cursor that was handed `ids` and acked `acked` of them, on top of a
+    /// seed of 100-0.
+    fn cursor_after(ids: &[&str], acked: &[&str]) -> GroupCursor {
+        let mut cursor = GroupCursor::seeded("100-0");
+        for id in ids {
+            cursor.delivered(id);
+        }
+        for id in acked {
+            cursor.acked(id);
+        }
+        cursor
+    }
+
     /// Redis reloaded an older copy: the group stands at 100-0 though this
-    /// consumer was handed 250-1. It is moved forward; the remembered id
-    /// stays.
+    /// consumer was handed and finished 250-1. It is moved forward to it.
     #[tokio::test]
     async fn a_group_that_went_backwards_is_moved_forward() {
         let mut conn = FakeConn::new([groups("100-0"), Ok(Value::Okay)]);
-        let mut last = Some("250-1".to_string());
-        assert!(restore_group_position(&mut conn, "s", "trust-consumer", &mut last).await);
-        assert_eq!(last.as_deref(), Some("250-1"));
+        let mut cursor = cursor_after(&["250-1"], &["250-1"]);
+        assert!(restore_group_position(&mut conn, "s", "trust-consumer", &mut cursor).await);
+        assert_eq!(cursor.restore_target().as_deref(), Some("250-1"));
         assert_eq!(
             conn.sent[1],
             ["XGROUP", "SETID", "s", "trust-consumer", "250-1"]
         );
     }
 
-    /// A group ahead of this consumer's copy (a read whose reply was lost)
-    /// is adopted, not moved.
+    /// 200-0..250-1 were read, only 200-0 acked: the group is moved to just
+    /// below 210-0, not to the highest id handed out (250-1), so what was not
+    /// finished is delivered again rather than skipped.
     #[tokio::test]
-    async fn a_group_ahead_is_adopted() {
+    async fn a_group_is_moved_to_just_below_the_oldest_unacked_entry() {
+        let mut conn = FakeConn::new([groups("100-0"), Ok(Value::Okay)]);
+        let mut cursor = cursor_after(&["200-0", "210-0", "250-1"], &["200-0"]);
+        assert!(restore_group_position(&mut conn, "s", "trust-consumer", &mut cursor).await);
+        assert_eq!(
+            conn.sent[1],
+            [
+                "XGROUP".to_string(),
+                "SETID".to_string(),
+                "s".to_string(),
+                "trust-consumer".to_string(),
+                format!("209-{}", u64::MAX)
+            ]
+        );
+    }
+
+    /// A group already at or past the target is left alone, and the cursor
+    /// is not raised to it (it only learns of entries it was handed), so a
+    /// later restore can only go lower.
+    #[tokio::test]
+    async fn a_group_ahead_is_left_alone_and_not_adopted() {
         let mut conn = FakeConn::new([groups("300-0")]);
-        let mut last = Some("250-1".to_string());
-        assert!(restore_group_position(&mut conn, "s", "trust-consumer", &mut last).await);
-        assert_eq!(last.as_deref(), Some("300-0"));
+        let mut cursor = cursor_after(&["250-1"], &["250-1"]);
+        assert!(restore_group_position(&mut conn, "s", "trust-consumer", &mut cursor).await);
+        assert_eq!(cursor.restore_target().as_deref(), Some("250-1"));
         assert_eq!(conn.sent.len(), 1);
     }
 
@@ -1903,28 +2127,29 @@ mod restore_group_position_tests {
             redis::ErrorKind::Io,
             "connection refused",
         )))]);
-        let mut last = Some("250-1".to_string());
-        assert!(!restore_group_position(&mut conn, "s", "trust-consumer", &mut last).await);
-        assert_eq!(last.as_deref(), Some("250-1"));
+        let mut cursor = cursor_after(&["250-1"], &["250-1"]);
+        assert!(!restore_group_position(&mut conn, "s", "trust-consumer", &mut cursor).await);
+        assert_eq!(cursor.restore_target().as_deref(), Some("250-1"));
     }
 
     /// A missing group is left to the `NOGROUP` recreate.
     #[tokio::test]
     async fn a_missing_group_is_left_to_the_nogroup_recreate() {
         let mut conn = FakeConn::new([Ok(Value::Array(vec![]))]);
-        let mut last = Some("250-1".to_string());
-        assert!(restore_group_position(&mut conn, "s", "trust-consumer", &mut last).await);
+        let mut cursor = cursor_after(&["250-1"], &["250-1"]);
+        assert!(restore_group_position(&mut conn, "s", "trust-consumer", &mut cursor).await);
         assert_eq!(conn.sent.len(), 1, "no SETID");
     }
 
-    /// With no remembered id there is nothing to restore; the group's own
-    /// is adopted.
+    /// With nothing delivered or seeded there is nothing to restore; the
+    /// group's own position is adopted.
     #[tokio::test]
-    async fn no_remembered_id_seeds_it_from_the_group() {
+    async fn an_empty_cursor_is_seeded_from_the_group() {
         let mut conn = FakeConn::new([groups("42-0")]);
-        let mut last = None;
-        assert!(restore_group_position(&mut conn, "s", "trust-consumer", &mut last).await);
-        assert_eq!(last.as_deref(), Some("42-0"));
+        let mut cursor = GroupCursor::new();
+        assert!(restore_group_position(&mut conn, "s", "trust-consumer", &mut cursor).await);
+        assert_eq!(cursor.restore_target().as_deref(), Some("42-0"));
+        assert_eq!(conn.sent.len(), 1, "no SETID");
     }
 }
 
@@ -3351,7 +3576,7 @@ mod redis_tests {
             .await
             .unwrap();
         let mut feed = connect(&stream).await;
-        assert!(feed.last_delivered_id.is_some());
+        assert!(feed.cursor.restore_target().is_some());
 
         let _: i64 = redis::cmd("XGROUP")
             .arg("DESTROY")
@@ -3414,7 +3639,7 @@ mod redis_tests {
     async fn a_lost_group_with_an_unknown_position_is_recreated_at_the_start() {
         let stream = unique_stream("nogroup-unknown-position");
         let mut feed = connect(&stream).await;
-        feed.last_delivered_id = None;
+        feed.cursor = GroupCursor::new();
 
         let client = redis::Client::open(redis_url()).unwrap();
         let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
@@ -3430,6 +3655,322 @@ mod redis_tests {
         let err = feed.next_batch().await.expect_err("the group is gone");
         assert!(is_nogroup(&err), "{err:?}");
         assert_eq!(drain(&mut feed).await, vec!["while-lost"]);
+        cleanup(&stream).await;
+    }
+
+    // ---- Restore target (GroupCursor): the group is only ever put back
+    // just below the oldest entry read and not acked, never past it. ----
+
+    /// `XADD`s `payload` (or, with `field`, a differently named field) and
+    /// returns the generated id.
+    async fn xadd_id(stream: &str, field: &str, payload: &str) -> String {
+        let client = redis::Client::open(redis_url()).unwrap();
+        let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
+        redis::cmd("XADD")
+            .arg(stream)
+            .arg("*")
+            .arg(field)
+            .arg(payload)
+            .query_async(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    /// The greatest stream id below `id`.
+    fn just_below(id: &str) -> String {
+        let (ms, seq) = id.split_once('-').unwrap();
+        let (ms, seq): (u64, u64) = (ms.parse().unwrap(), seq.parse().unwrap());
+        if seq > 0 {
+            format!("{ms}-{}", seq - 1)
+        } else {
+            format!("{}-{}", ms - 1, u64::MAX)
+        }
+    }
+
+    async fn group_position(stream: &str) -> String {
+        let client = redis::Client::open(redis_url()).unwrap();
+        let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
+        ds_runtime::redis_group::group_last_delivered_id(&mut conn, stream, "test-group")
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Reads one batch past the empty startup PEL replay, uncommitted.
+    async fn read_uncommitted(feed: &mut RedisStreamMovementFeed) -> Vec<String> {
+        assert_eq!(
+            payloads(feed.next_batch().await.unwrap()),
+            [] as [String; 0]
+        );
+        payloads(feed.next_batch().await.unwrap())
+    }
+
+    /// Four entries read; the first two committed, the last two a failed
+    /// batch (never committed). Redis then reloads an older copy that has
+    /// neither the group's position nor the last two in its PEL. The
+    /// restore after the failed read puts the group just below the first
+    /// unacked entry, not at the last entry read (which would skip both).
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn a_restore_after_a_failed_batch_lands_below_the_unacked_entries() {
+        let stream = unique_stream("cursor-restore-below");
+        let mut feed = connect(&stream).await;
+        xadd(&stream, "e1").await;
+        xadd(&stream, "e2").await;
+        assert_eq!(read_uncommitted(&mut feed).await, ["e1", "e2"]);
+        feed.commit().await.unwrap();
+        let e3 = xadd_id(&stream, "payload", "e3").await;
+        let e4 = xadd_id(&stream, "payload", "e4").await;
+        assert_eq!(payloads(feed.next_batch().await.unwrap()), ["e3", "e4"]);
+        // The write failed: no commit. A Redis reload loses the read of
+        // e3 and e4 (position and PEL entries) but keeps e1 and e2 acked.
+        let _: i64 = feed
+            .conn
+            .xack(&stream, "test-group", &[&e3, &e4])
+            .await
+            .unwrap();
+        assert_eq!(
+            feed.cursor.restore_target(),
+            Some(just_below(&e3)),
+            "e1 and e2 are acked; e3 is the oldest unacked"
+        );
+        // The group is back at 0.
+        let () = redis::cmd("XGROUP")
+            .arg("SETID")
+            .arg(&stream)
+            .arg("test-group")
+            .arg("0")
+            .query_async(&mut feed.conn)
+            .await
+            .unwrap();
+        feed.verify_position = true;
+        assert_eq!(
+            payloads(feed.next_batch().await.unwrap()),
+            [] as [String; 0]
+        );
+        assert_eq!(
+            group_position(&stream).await,
+            just_below(&e3),
+            "restored below e3, not to e4 (the highest id handed out)"
+        );
+        // e3 and e4 are delivered again; e1 and e2 are not.
+        assert_eq!(payloads(feed.next_batch().await.unwrap()), ["e3", "e4"]);
+        feed.commit().await.unwrap();
+        assert_eq!(feed.cursor.restore_target(), Some(e4));
+        cleanup(&stream).await;
+    }
+
+    /// Redelivery with the PEL intact costs duplicates and loses nothing:
+    /// the group is rewound to 0 while e3 and e4 are still pending, so each
+    /// comes back from the PEL and again from the group, e1 and e2 (acked)
+    /// do not, and a later entry still arrives.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn a_redelivery_after_a_restore_duplicates_but_loses_nothing() {
+        let stream = unique_stream("cursor-duplicates");
+        let mut feed = connect(&stream).await;
+        xadd(&stream, "e1").await;
+        xadd(&stream, "e2").await;
+        assert_eq!(read_uncommitted(&mut feed).await, ["e1", "e2"]);
+        feed.commit().await.unwrap();
+        xadd(&stream, "e3").await;
+        xadd(&stream, "e4").await;
+        assert_eq!(payloads(feed.next_batch().await.unwrap()), ["e3", "e4"]);
+        // Not committed. The group is rewound to 0.
+        let () = redis::cmd("XGROUP")
+            .arg("SETID")
+            .arg(&stream)
+            .arg("test-group")
+            .arg("0")
+            .query_async(&mut feed.conn)
+            .await
+            .unwrap();
+        feed.verify_position = true;
+        xadd(&stream, "e5").await;
+        let seen = drain(&mut feed).await;
+        for wanted in ["e3", "e4", "e5"] {
+            assert!(seen.iter().any(|p| p == wanted), "{wanted} lost: {seen:?}");
+        }
+        for acked in ["e1", "e2"] {
+            assert!(!seen.iter().any(|p| p == acked), "{acked} again: {seen:?}");
+        }
+        assert_eq!(pending_ids(&mut feed, &stream).await, [] as [String; 0]);
+        cleanup(&stream).await;
+    }
+
+    /// A batch refused as a whole is re-read one entry at a time. After the
+    /// first entry is committed and the second only read, the target sits
+    /// just below the second (the oldest unacked), not at the first or the
+    /// third.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn a_partial_commit_leaves_the_target_at_the_oldest_unacked_entry() {
+        let stream = unique_stream("cursor-partial");
+        let mut feed = connect(&stream).await;
+        let e1 = xadd_id(&stream, "payload", "e1").await;
+        let e2 = xadd_id(&stream, "payload", "e2").await;
+        let e3 = xadd_id(&stream, "payload", "e3").await;
+        assert_eq!(read_uncommitted(&mut feed).await, ["e1", "e2", "e3"]);
+        assert_eq!(feed.cursor.restore_target(), Some(just_below(&e1)));
+        feed.reject_batch("422").await.unwrap();
+
+        assert_eq!(payloads(feed.next_batch().await.unwrap()), ["e1"]);
+        feed.commit().await.unwrap();
+        assert_eq!(feed.cursor.restore_target(), Some(just_below(&e2)));
+        assert_eq!(payloads(feed.next_batch().await.unwrap()), ["e2"]);
+        assert_eq!(
+            feed.cursor.restore_target(),
+            Some(just_below(&e2)),
+            "e2 read, not acked: e3 (read earlier) does not move it"
+        );
+        feed.commit().await.unwrap();
+        assert_eq!(feed.cursor.restore_target(), Some(just_below(&e3)));
+        assert_eq!(payloads(feed.next_batch().await.unwrap()), ["e3"]);
+        feed.commit().await.unwrap();
+        assert_eq!(feed.cursor.restore_target(), Some(e3));
+        cleanup(&stream).await;
+    }
+
+    /// A single entry refused on its own is dead-lettered and acked: it no
+    /// longer holds the target.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn a_dead_lettered_entry_leaves_no_pin() {
+        let stream = unique_stream("cursor-dead-letter");
+        let mut feed = connect(&stream).await;
+        let e1 = xadd_id(&stream, "payload", "poison").await;
+        assert_eq!(read_uncommitted(&mut feed).await, ["poison"]);
+        assert_eq!(feed.cursor.restore_target(), Some(just_below(&e1)));
+        feed.reject_batch("422").await.unwrap();
+        assert_eq!(feed.cursor.restore_target(), Some(e1));
+        cleanup(&stream).await;
+    }
+
+    /// An entry another consumer claimed (`XAUTOCLAIM`) and finished is no
+    /// longer this one's to finish. Left outstanding it would hold the
+    /// target below it for good; the next complete read of this consumer's
+    /// own PEL lets go of it.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn a_reclaim_by_another_consumer_does_not_pin_the_target() {
+        let stream = unique_stream("cursor-reclaimed");
+        let mut feed = connect(&stream).await;
+        let e1 = xadd_id(&stream, "payload", "e1").await;
+        let e2 = xadd_id(&stream, "payload", "e2").await;
+        assert_eq!(read_uncommitted(&mut feed).await, ["e1", "e2"]);
+        assert_eq!(feed.cursor.restore_target(), Some(just_below(&e1)));
+
+        // A second consumer claims both (idle for over 1 ms) and acks them.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut other = RedisStreamMovementFeed::connect_for_test(
+            &redis_url(),
+            &stream,
+            "test-group",
+            "other-consumer",
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(payloads(other.next_batch().await.unwrap()), ["e1", "e2"]);
+        assert_eq!(
+            other.cursor.restore_target(),
+            Some(just_below(&e1)),
+            "the claimed entries are the claimer's to finish"
+        );
+        other.commit().await.unwrap();
+        assert_eq!(other.cursor.restore_target(), Some(e2.clone()));
+
+        // The first consumer's PEL is now empty: the failed batch it still
+        // holds is re-read as nothing, and e1 and e2 are released.
+        assert_eq!(
+            payloads(feed.next_batch().await.unwrap()),
+            [] as [String; 0]
+        );
+        assert_eq!(feed.cursor.restore_target(), Some(e2));
+        cleanup(&stream).await;
+    }
+
+    /// `XAUTOCLAIM`'s claimed entries become outstanding for the claimer at
+    /// once, before any read hands them out.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn a_reclaimed_entry_holds_the_target_until_it_is_acked() {
+        let stream = unique_stream("cursor-claimer");
+        let mut first = connect(&stream).await;
+        let e1 = xadd_id(&stream, "payload", "e1").await;
+        assert_eq!(read_uncommitted(&mut first).await, ["e1"]);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut claimer = RedisStreamMovementFeed::connect_for_test(
+            &redis_url(),
+            &stream,
+            "test-group",
+            "other-consumer",
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimer.cursor.restore_target(), Some(e1.clone()));
+        claimer.reclaim_stale().await.unwrap();
+        assert_eq!(claimer.cursor.restore_target(), Some(just_below(&e1)));
+        cleanup(&stream).await;
+    }
+
+    /// A malformed entry is dead-lettered and acked by the read itself, so
+    /// it never holds the target.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn a_malformed_entry_acked_leaves_no_pin() {
+        let stream = unique_stream("cursor-malformed");
+        let mut feed = connect(&stream).await;
+        let bad = xadd_id(&stream, "not_payload", "whatever").await;
+        assert_eq!(read_uncommitted(&mut feed).await, [] as [String; 0]);
+        assert_eq!(
+            feed.cursor.restore_target(),
+            Some(bad),
+            "acked, so the target is the entry itself, not just below it"
+        );
+        assert_eq!(pending_ids(&mut feed, &stream).await, [] as [String; 0]);
+        cleanup(&stream).await;
+    }
+
+    /// A group lost to `NOGROUP` is recreated just below the oldest entry
+    /// read and not acked, so the stream's copies of those entries are
+    /// delivered again. It used to be recreated at the last entry read and
+    /// skip them.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn a_nogroup_recreate_resumes_from_the_oldest_unacked_entry() {
+        let stream = unique_stream("cursor-nogroup");
+        let mut feed = connect(&stream).await;
+        xadd(&stream, "done").await;
+        assert_eq!(drain(&mut feed).await, ["done"]);
+        xadd(&stream, "unfinished-1").await;
+        xadd(&stream, "unfinished-2").await;
+        assert_eq!(
+            payloads(feed.next_batch().await.unwrap()),
+            ["unfinished-1", "unfinished-2"]
+        );
+        // Not committed; the group (and its PEL) is lost.
+        let client = redis::Client::open(redis_url()).unwrap();
+        let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
+        let destroyed: i64 = redis::cmd("XGROUP")
+            .arg("DESTROY")
+            .arg(&stream)
+            .arg("test-group")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(destroyed, 1);
+        xadd(&stream, "after").await;
+
+        let err = feed.next_batch().await.expect_err("the group is gone");
+        assert!(is_nogroup(&err), "{err:?}");
+        assert_eq!(
+            drain(&mut feed).await,
+            ["unfinished-1", "unfinished-2", "after"],
+            "the unfinished entries come back, and \"done\" does not"
+        );
         cleanup(&stream).await;
     }
 }
@@ -3679,9 +4220,9 @@ mod outage_tests {
         assert_eq!(read, ["a", "b"]);
         feed.commit().await.unwrap();
         let read_up_to = feed
-            .last_delivered_id
-            .clone()
-            .expect("advanced by the read");
+            .cursor
+            .restore_target()
+            .expect("advanced by the read, and acked");
 
         proxy.take_down().await;
         let () = redis::cmd("XGROUP")
