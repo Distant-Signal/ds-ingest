@@ -5,7 +5,7 @@
 //! writer's own role (the per-service step), which proves the grants and
 //! the `darwin-pushport` freshness row policy.
 //!
-//! Fixture RIDs carry `8Z8` and dates in 2099, so the cleanup touches no
+//! Fixture RIDs carry `8Z8` and service dates in 2099, so the cleanup touches no
 //! real row.
 
 #![expect(
@@ -25,13 +25,19 @@ use sqlx::PgPool;
 const STREAM: &str = "ds:ingest:darwin";
 const RID: &str = "209907118Z80001";
 
-fn ts(raw: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(raw)
-        .unwrap()
-        .with_timezone(&Utc)
+/// A Darwin time `minutes` after a base an hour before this process
+/// started: message times must be in the past, or the writer clamps them to
+/// its `now() + 2 min`.
+fn ts(minutes: i64) -> DateTime<Utc> {
+    static BASE: std::sync::OnceLock<DateTime<Utc>> = std::sync::OnceLock::new();
+    let base = *BASE.get_or_init(|| {
+        let now = Utc::now() - chrono::TimeDelta::hours(1);
+        DateTime::from_timestamp(now.timestamp(), 0).unwrap()
+    });
+    base + chrono::TimeDelta::minutes(minutes)
 }
 
-fn batch(at: &str, platform: &str) -> Batch {
+fn batch(at: DateTime<Utc>, platform: &str) -> Batch {
     let ssd = NaiveDate::from_ymd_opt(2099, 7, 11).unwrap();
     Batch {
         services: vec![Service {
@@ -39,7 +45,7 @@ fn batch(at: &str, platform: &str) -> Batch {
             uid: "Z80001".to_owned(),
             ssd,
             schedule: None,
-            ts: ts(at),
+            ts: at,
         }],
         status_calls: vec![StatusCall {
             key: CallKey {
@@ -63,7 +69,7 @@ fn batch(at: &str, platform: &str) -> Batch {
             departure: None,
             pass: None,
             suppressed: false,
-            ts: ts(at),
+            ts: at,
         }],
         ..Batch::default()
     }
@@ -127,13 +133,13 @@ async fn a_batch_is_applied_once_and_an_older_one_writes_nothing() {
         StreamSpec::by_stream(STREAM).expect("the darwin stream"),
     );
 
-    let first = entry(&format!("{nanos:x}-a"), &batch("2099-07-11T09:00:00Z", "4"));
+    let first = entry(&format!("{nanos:x}-a"), &batch(ts(10), "4"));
     assert!(matches!(handler.handle(&first).await, Ok(Handled::Applied)));
     assert!(matches!(
         handler.handle(&first).await,
         Ok(Handled::Duplicate)
     ));
-    let older = entry(&format!("{nanos:x}-b"), &batch("2099-07-11T08:00:00Z", "9"));
+    let older = entry(&format!("{nanos:x}-b"), &batch(ts(0), "9"));
     assert!(matches!(handler.handle(&older).await, Ok(Handled::Applied)));
 
     let (platform, basis): (String, String) = sqlx::query_as(
@@ -149,9 +155,9 @@ async fn a_batch_is_applied_once_and_an_older_one_writes_nothing() {
     clear_future_freshness(&admin).await;
 }
 
-/// The fixture times are in 2099: the freshness marker is clamped to the
-/// writer's `now() + 2 min` (D13), not left in 2099 where `GREATEST` would
-/// keep it and silence the staleness alert; a marker a skewed message left
+/// A batch stamped a day ahead: the freshness marker is clamped to the
+/// writer's `now() + 2 min` (D13), not left a day ahead where `GREATEST`
+/// would keep it and silence the staleness alert; a marker a skewed message left
 /// in the future before the clamp is healed by the next batch.
 #[tokio::test]
 #[ignore = "requires a live database: DATABASE_URL=... cargo test -p ingest-writer --test \
@@ -185,7 +191,10 @@ async fn the_freshness_marker_is_clamped_and_a_future_one_healed() {
     );
 
     let before = Utc::now();
-    let first = entry(&format!("{nanos:x}-f"), &batch("2099-07-11T09:00:00Z", "4"));
+    let first = entry(
+        &format!("{nanos:x}-f"),
+        &batch(Utc::now() + chrono::TimeDelta::days(1), "4"),
+    );
     assert!(matches!(handler.handle(&first).await, Ok(Handled::Applied)));
     let after = Utc::now();
 
@@ -234,8 +243,8 @@ async fn a_resent_schedule_with_fewer_locations_applies() {
         StreamSpec::by_stream(STREAM).expect("the darwin stream"),
     );
 
-    let old = "2099-07-11T08:00:00Z";
-    let new = "2099-07-11T08:30:00Z";
+    let old = ts(0);
+    let new = ts(30);
     let full = entry(
         &format!("{nanos:x}-s1"),
         &schedule(
@@ -272,10 +281,10 @@ async fn a_resent_schedule_with_fewer_locations_applies() {
             .iter()
             .find(|(t, _, _)| t == tiploc)
             .unwrap_or_else(|| panic!("{tiploc} kept: {rows:?}"));
-        assert_eq!((row.1.as_deref(), row.2), (Some(ptd), ts(new)), "{rows:?}");
+        assert_eq!((row.1.as_deref(), row.2), (Some(ptd), new), "{rows:?}");
     }
     if let Some(dropped) = rows.iter().find(|(t, _, _)| t == "DONC") {
-        assert_eq!(dropped.2, ts(old), "a dropped location kept its old time");
+        assert_eq!(dropped.2, old, "a dropped location kept its old time");
     }
     let train_id: Option<String> =
         sqlx::query_scalar("SELECT train_id FROM darwin_services WHERE rid = $1")
@@ -293,7 +302,7 @@ const SCHEDULE_RID: &str = "209907118Z80002";
 
 /// A schedule message for [`SCHEDULE_RID`] at `at`, calling at `calls`
 /// (TIPLOC, working departure, public departure).
-fn schedule(at: &str, calls: &[(&str, &str, &str)]) -> Batch {
+fn schedule(at: DateTime<Utc>, calls: &[(&str, &str, &str)]) -> Batch {
     let ssd = NaiveDate::from_ymd_opt(2099, 7, 11).unwrap();
     Batch {
         services: vec![Service {
@@ -308,7 +317,7 @@ fn schedule(at: &str, calls: &[(&str, &str, &str)]) -> Batch {
                 deleted: false,
                 cancel_reason: None,
             }),
-            ts: ts(at),
+            ts: at,
         }],
         schedule_calls: calls
             .iter()
@@ -325,7 +334,7 @@ fn schedule(at: &str, calls: &[(&str, &str, &str)]) -> Batch {
                 ptd: Some((*ptd).to_owned()),
                 planned_platform: None,
                 cancelled: false,
-                ts: ts(at),
+                ts: at,
             })
             .collect(),
         ..Batch::default()
@@ -341,4 +350,91 @@ async fn clear_future_freshness(admin: &PgPool) {
     .execute(admin)
     .await
     .unwrap();
+}
+
+/// I1: a row stamped far in the future before the clamp existed does not pin
+/// the row: the next genuine batch heals it and applies. And a batch stamped
+/// far ahead is stored clamped, so it pins nothing either.
+#[tokio::test]
+#[ignore = "requires a live database: DATABASE_URL=... cargo test -p ingest-writer --test \
+            darwin_handler -- --ignored --test-threads=1"]
+async fn a_future_stored_time_is_healed_and_a_future_message_is_clamped() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let admin = admin_pool(&pool).await;
+    cleanup(&admin).await;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let handler = WriterHandler::new(
+        pool.clone(),
+        Arc::new(registry()),
+        StreamSpec::by_stream(STREAM).expect("the darwin stream"),
+    );
+
+    // The pinned rows a pre-clamp message left: both far in the future.
+    sqlx::query(
+        "INSERT INTO darwin_services (rid, uid, ssd, message_ts) \
+         VALUES ($1, 'Z80001', '2099-07-11', '2099-12-31T00:00:00Z')",
+    )
+    .bind(RID)
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO darwin_calls (rid, tiploc, wta, wtd, wtp, ssd, ts_ts) \
+         VALUES ($1, 'YORK', '', '10:00', '', '2099-07-11', '2099-12-31T00:00:00Z')",
+    )
+    .bind(RID)
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    let genuine = entry(&format!("{nanos:x}-h"), &batch(ts(10), "7"));
+    assert!(matches!(
+        handler.handle(&genuine).await,
+        Ok(Handled::Applied)
+    ));
+    let (platform,): (String,) =
+        sqlx::query_as("SELECT platform FROM darwin_calls WHERE rid = $1 AND tiploc = 'YORK'")
+            .bind(RID)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(platform, "7", "the genuine update was refused by the pin");
+    let message_ts: DateTime<Utc> =
+        sqlx::query_scalar("SELECT message_ts FROM darwin_services WHERE rid = $1")
+            .bind(RID)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(message_ts, ts(10));
+
+    // A message stamped a year ahead is stored at the clamp, not a year out.
+    let skewed = entry(
+        &format!("{nanos:x}-k"),
+        &batch(Utc::now() + chrono::TimeDelta::days(365), "8"),
+    );
+    assert!(matches!(
+        handler.handle(&skewed).await,
+        Ok(Handled::Applied)
+    ));
+    let stored: DateTime<Utc> =
+        sqlx::query_scalar("SELECT message_ts FROM darwin_services WHERE rid = $1")
+            .bind(RID)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        stored <= Utc::now() + chrono::TimeDelta::minutes(2),
+        "stored {stored} should be clamped"
+    );
+
+    cleanup(&admin).await;
+    clear_future_freshness(&admin).await;
 }
