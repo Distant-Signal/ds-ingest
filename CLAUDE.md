@@ -82,7 +82,9 @@ movements from Kafka into the `movement-events` stream, which three
 consumer groups read: `trust-consumer` (tracked trains),
 `full-coverage-consumer` (full-coverage delay stats, which also sends
 snapshots to the writer) and `trust-backlog-consumer` (late-tracked
-trains); `movement-feed` holds what they share. `darwin-relay` relays
+trains; Movements only at catalogued-line stations unless
+`TRUST_BACKLOG_ALL_STATIONS` is on, default off, see
+`docs/trust-backlog-consumer.md`); `movement-feed` holds what they share. `darwin-relay` relays
 Darwin Push Port from Kafka (`docs/darwin-pushport.md`). Every consumer
 counts stream gaps and dead letters; ds-deploy's
 `scripts/check-ingest-rollout.py` checks a deploy lost nothing. Runbooks:

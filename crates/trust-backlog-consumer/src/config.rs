@@ -142,6 +142,19 @@ pub(crate) struct Config {
     /// and never holds a batch. No effect on any other write.
     #[arg(long, env, default_value_t = false)]
     pub train_service_labels_enabled: bool,
+
+    /// Stores TRUST Movements (`0003`) at any station whose STANOX resolves
+    /// through `stanox_to_crs`, instead of only stations in the line
+    /// catalogue's CRS index. Off by default: the catalogue scope was a
+    /// storage-ceiling choice (Decision 2 of the 2026-09-05 trust event
+    /// backlog design); measured, the wider scope adds about 7% rows
+    /// (roughly 40k a day, 0.25-0.4 GB at the current retention). An
+    /// unmapped STANOX is still dropped, PASS, `ChangeOfOrigin` and
+    /// `ChangeOfIdentity` still are, and Activation and Cancellation are kept
+    /// either way. Unset it and restart to roll back; the extra rows age
+    /// out with retention. See docs/trust-backlog-consumer.md.
+    #[arg(long, env, default_value_t = false)]
+    pub trust_backlog_all_stations: bool,
 }
 
 impl Config {
@@ -239,5 +252,24 @@ mod tests {
                 .unwrap()
                 .train_service_labels_enabled
         );
+    }
+
+    /// Movements outside the catalogue are stored only when asked for.
+    #[test]
+    fn all_stations_is_off_by_default_and_reads_its_env_name() {
+        use clap::CommandFactory;
+        assert!(!parse(&[]).unwrap().trust_backlog_all_stations);
+        assert!(
+            parse(&["--trust-backlog-all-stations"])
+                .unwrap()
+                .trust_backlog_all_stations
+        );
+        let command = Config::command();
+        let env = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "trust_backlog_all_stations")
+            .and_then(|arg| arg.get_env())
+            .map(|env| env.to_string_lossy().into_owned());
+        assert_eq!(env.as_deref(), Some("TRUST_BACKLOG_ALL_STATIONS"));
     }
 }

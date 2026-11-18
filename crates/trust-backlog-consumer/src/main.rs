@@ -1,6 +1,8 @@
 //! `trust-backlog-consumer`: a third, independent Redis Streams consumer
 //! group on the `movement-events` stream, retaining a short,
-//! catalogued-line-scoped, key-journey-point-only backlog of TRUST
+//! catalogued-line-scoped (unless `TRUST_BACKLOG_ALL_STATIONS` is on, which
+//! widens Movements to every station with a mapped STANOX; see
+//! docs/trust-backlog-consumer.md), key-journey-point-only backlog of TRUST
 //! events for late-tracking pins. See
 //! docs/superpowers/specs/2026-09-05-trust-event-backlog-design.md and
 //! docs/superpowers/plans/2026-09-05-trust-event-backlog-plan.md.
@@ -19,7 +21,6 @@ mod reasons;
 mod sink;
 mod stanox_crs;
 
-use std::collections::HashSet;
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -109,7 +110,12 @@ async fn run() -> anyhow::Result<()> {
 
     // Built once: purely static-catalogue-derived, needs no reload at
     // runtime (config.lines doesn't change without a restart).
-    let crs_index = crs_index::build_crs_index(&config.lines);
+    let scope = crs_index::StationScope::new(config.trust_backlog_all_stations, &config.lines);
+    tracing::info!(
+        all_stations = config.trust_backlog_all_stations,
+        scope = scope.describe(),
+        "TRUST backlog Movement scope"
+    );
 
     // Wrapped in `ActiveFeed::RedisStream`, not used bare -- this is what
     // actually threads `connection_state` through to flip the /healthz
@@ -146,7 +152,7 @@ async fn run() -> anyhow::Result<()> {
 
     tracing::info!("writing the TRUST backlog to Postgres directly");
     sink::register_db_write_metrics(config.train_service_labels_enabled);
-    consume(&config, &crs_index, &mut feed, &progress, &DbSink { pool }).await
+    consume(&config, &scope, &mut feed, &progress, &DbSink { pool }).await
 }
 
 /// Waits for Postgres (INF-5), connects the pool (with the `db_pool_*`
@@ -180,7 +186,7 @@ async fn connect_database(
 )]
 async fn consume<S: BacklogSink>(
     config: &Config,
-    crs_index: &HashSet<String>,
+    scope: &crs_index::StationScope,
     feed: &mut ActiveFeed,
     progress: &health_http::Progress,
     sink: &S,
@@ -268,7 +274,7 @@ async fn consume<S: BacklogSink>(
         let cycle_start = std::time::Instant::now();
         let cycle = consume_cycle(
             config,
-            crs_index,
+            scope,
             feed,
             sink,
             &mut process_state,
@@ -315,7 +321,7 @@ async fn consume<S: BacklogSink>(
 )]
 async fn consume_cycle<S: BacklogSink>(
     config: &Config,
-    crs_index: &HashSet<String>,
+    scope: &crs_index::StationScope,
     feed: &mut ActiveFeed,
     sink: &S,
     process_state: &mut process::ProcessorState,
@@ -359,7 +365,7 @@ async fn consume_cycle<S: BacklogSink>(
                 &batch,
                 process_state,
                 &snapshot,
-                crs_index,
+                scope,
                 now,
                 config.trust_event_backlog_retention_days,
                 config.train_service_labels_enabled,
@@ -679,7 +685,7 @@ fn collect_batch(
     batch: &[movement_feed::FeedEntry],
     process_state: &mut process::ProcessorState,
     snapshot: &stanox_crs::StanoxCrsTable,
-    crs_index: &HashSet<String>,
+    scope: &crs_index::StationScope,
     now: chrono::DateTime<chrono::Utc>,
     retention_days: i64,
     label_trains: bool,
@@ -718,7 +724,7 @@ fn collect_batch(
                         &message,
                         process_state,
                         snapshot,
-                        crs_index,
+                        scope,
                         arrival_rail_day,
                         received_at,
                     ) {
@@ -821,6 +827,7 @@ mod rail_day_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn a_batch_with_a_pass_and_a_departure_keeps_only_the_departure() {
@@ -846,7 +853,7 @@ mod tests {
             source_sequence: 1,
             change_time_minutes: None,
         }]);
-        let crs_index: HashSet<String> = ["WAT".to_string()].into_iter().collect();
+        let scope = crs_index::StationScope::Catalogue(["WAT".to_string()].into_iter().collect());
         let mut state = process::ProcessorState::default();
         let today: chrono::NaiveDate = "2026-09-05".parse().unwrap();
         // Safely after the raw timestamp fixtures below (2026-08-28) -- this
@@ -857,7 +864,7 @@ mod tests {
         let events: Vec<_> = messages
             .iter()
             .filter_map(|m| {
-                process::process_message(m, &mut state, &stanox, &crs_index, today, received_at)
+                process::process_message(m, &mut state, &stanox, &scope, today, received_at)
             })
             .collect();
 
@@ -926,7 +933,7 @@ mod tests {
             source_sequence: 1,
             change_time_minutes: None,
         }]);
-        let crs_index: HashSet<String> = ["WAT".to_string()].into_iter().collect();
+        let scope = crs_index::StationScope::Catalogue(["WAT".to_string()].into_iter().collect());
         let batch = [
             movement_feed::FeedEntry {
                 payload: departure("1787769200000"),
@@ -940,7 +947,7 @@ mod tests {
         let now = utc("2026-08-28T18:34:00Z");
 
         let mut state = process::ProcessorState::default();
-        let collected = collect_batch(&batch, &mut state, &stanox, &crs_index, now, 1, false);
+        let collected = collect_batch(&batch, &mut state, &stanox, &scope, now, 1, false);
         assert_eq!(collected.events.len(), 1, "{:?}", collected.events);
         // The fresh one (its timestamp after the Europe/London correction).
         assert_eq!(
@@ -953,8 +960,64 @@ mod tests {
         assert_eq!(collected.unparseable, []);
 
         let mut state = process::ProcessorState::default();
-        let collected = collect_batch(&batch, &mut state, &stanox, &crs_index, now, 0, false);
+        let collected = collect_batch(&batch, &mut state, &stanox, &scope, now, 0, false);
         assert_eq!(collected.events.len(), 2, "0 turns the check off");
+    }
+
+    /// A departure at a station outside the catalogue is collected only
+    /// with the all-stations scope; PASS and an unmapped STANOX are dropped
+    /// under both.
+    #[test]
+    fn all_stations_collects_a_departure_outside_the_catalogue() {
+        let payload = r#"[
+            {"header":{"msg_type":"0003"},"body":{
+                "train_id":"221832406","event_type":"PASS",
+                "planned_timestamp":"1787941920000","actual_timestamp":"1787941920000",
+                "loc_stanox":"87212","variation_status":"ON TIME"
+            }},
+            {"header":{"msg_type":"0003"},"body":{
+                "train_id":"221832406","event_type":"DEPARTURE",
+                "planned_timestamp":"1787942000000","actual_timestamp":"1787942000000",
+                "loc_stanox":"99999","variation_status":"ON TIME"
+            }},
+            {"header":{"msg_type":"0003"},"body":{
+                "train_id":"221832406","event_type":"DEPARTURE",
+                "planned_timestamp":"1787942000000","actual_timestamp":"1787942000000",
+                "loc_stanox":"87212","variation_status":"ON TIME"
+            }}
+        ]"#;
+        let batch = [movement_feed::FeedEntry {
+            payload: payload.to_string(),
+            received_at: Some(utc("2026-08-28T18:33:30Z")),
+        }];
+        let stanox = stanox_crs::StanoxCrsTable::from_records(vec![common::StanoxCrsRecord {
+            stanox: "87212".to_string(),
+            crs: "WAT".to_string(),
+            tiploc: "WATRLMN".to_string(),
+            station_name: "LONDON WATERLOO".to_string(),
+            source_sequence: 1,
+            change_time_minutes: None,
+        }]);
+        let now = utc("2026-08-28T18:34:00Z");
+
+        let catalogue = crs_index::StationScope::Catalogue(HashSet::new());
+        let mut state = process::ProcessorState::default();
+        let off = collect_batch(&batch, &mut state, &stanox, &catalogue, now, 1, false);
+        assert!(off.events.is_empty(), "WAT is not in the catalogue");
+
+        let mut state = process::ProcessorState::default();
+        let on = collect_batch(
+            &batch,
+            &mut state,
+            &stanox,
+            &crs_index::StationScope::AllMapped,
+            now,
+            1,
+            false,
+        );
+        assert_eq!(on.events.len(), 1, "{:?}", on.events);
+        assert_eq!(on.events[0].crs.as_deref(), Some("WAT"));
+        assert_eq!(on.events[0].event_type.as_deref(), Some("DEPARTURE"));
     }
 
     /// A freight Activation is labelled only with the flag on, with the
@@ -971,15 +1034,15 @@ mod tests {
             received_at: Some(utc("2026-08-28T18:33:30Z")),
         }];
         let stanox = stanox_crs::StanoxCrsTable::from_records(Vec::new());
-        let crs_index: HashSet<String> = HashSet::new();
+        let scope = crs_index::StationScope::Catalogue(HashSet::new());
         let now = utc("2026-08-28T18:34:00Z");
 
         let mut state = process::ProcessorState::default();
-        let off = collect_batch(&batch, &mut state, &stanox, &crs_index, now, 1, false);
+        let off = collect_batch(&batch, &mut state, &stanox, &scope, now, 1, false);
         assert_eq!(off.labels, []);
 
         let mut state = process::ProcessorState::default();
-        let on = collect_batch(&batch, &mut state, &stanox, &crs_index, now, 1, true);
+        let on = collect_batch(&batch, &mut state, &stanox, &scope, now, 1, true);
         assert_eq!(
             serde_json::to_string(&on.events).unwrap(),
             serde_json::to_string(&off.events).unwrap(),
@@ -1042,7 +1105,7 @@ mod tests {
                 tp_origin_timestamp: None,
             });
         let stanox = stanox_crs::StanoxCrsTable::from_records(Vec::new());
-        let crs_index = HashSet::new();
+        let scope = crs_index::StationScope::Catalogue(HashSet::new());
         // 22:59Z on 2026-09-30 is 23:59 BST; 23:05Z is 00:05 BST on 10-01.
         let (received_at, rail_day) = arrival(
             &entry_arrived_at("2026-09-30T22:59:00Z"),
@@ -1052,7 +1115,7 @@ mod tests {
             &activation,
             &mut process::ProcessorState::default(),
             &stanox,
-            &crs_index,
+            &scope,
             rail_day,
             received_at,
         )
