@@ -6,8 +6,11 @@
 //!   survive at all -- `ChangeOfOrigin`/`ChangeOfIdentity`/`Unknown` are
 //!   dropped unconditionally, they carry no journey-point data.
 //! - A Movement survives only if its `event_type` is `ARRIVAL` or
-//!   `DEPARTURE` (never `PASS`) AND its translated CRS is in this
-//!   consumer's own `crs_index` (catalogued-line scoping, Decision 2).
+//!   `DEPARTURE` (never `PASS`) AND its translated CRS is in scope:
+//!   this consumer's own `crs_index` (catalogued-line scoping, Decision
+//!   2), or, with `TRUST_BACKLOG_ALL_STATIONS` on, any station whose
+//!   STANOX resolves (`StationScope`). An unmapped STANOX is dropped
+//!   either way.
 //! - An Activation/Cancellation survives regardless of location (neither
 //!   carries one) -- scoping by CRS is meaningless for them; they are
 //!   kept because they're load-bearing plumbing (Activation) or
@@ -61,11 +64,12 @@
 //! `service_date = $2` filter to ever find it -- the M7 finding, 2026-09-26
 //! review.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use chrono::NaiveDate;
 use trust_schema::schema::TrustMessage;
 
+use crate::crs_index::StationScope;
 use crate::stanox_crs::StanoxCrsTable;
 
 /// Cross-batch memory, mirroring `trust-consumer::process::ProcessorState`'s
@@ -226,7 +230,7 @@ pub(crate) fn process_message(
     message: &TrustMessage,
     state: &mut ProcessorState,
     stanox_crs: &StanoxCrsTable,
-    crs_index: &HashSet<String>,
+    scope: &StationScope,
     today: NaiveDate,
     received_at: chrono::DateTime<chrono::Utc>,
 ) -> Option<common::TrustBacklogEventMessage> {
@@ -325,7 +329,7 @@ pub(crate) fn process_message(
                 .loc_stanox
                 .as_deref()
                 .and_then(|stanox| stanox_crs.stanox_to_crs(stanox))?;
-            if !crs_index.contains(&loc_crs.to_uppercase()) {
+            if !scope.admits(&loc_crs) {
                 return None;
             }
 
@@ -645,6 +649,8 @@ pub(crate) fn process_message(
     reason = "test code: paired test values share names"
 )]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     fn stanox_table() -> StanoxCrsTable {
@@ -658,8 +664,8 @@ mod tests {
         }])
     }
 
-    fn crs_index_with(crs: &[&str]) -> HashSet<String> {
-        crs.iter().map(|c| c.to_uppercase()).collect()
+    fn crs_index_with(crs: &[&str]) -> StationScope {
+        StationScope::Catalogue(crs.iter().map(|c| c.to_uppercase()).collect())
     }
 
     fn today() -> NaiveDate {
@@ -784,6 +790,69 @@ mod tests {
             &mut state,
             &stanox_table(),
             &crs_index_with(&["EUS"]), // WAT not in scope
+            today(),
+            test_received_at(),
+        );
+        assert!(result.is_none());
+    }
+
+    /// With `TRUST_BACKLOG_ALL_STATIONS` on, a station outside the catalogue is stored.
+    #[test]
+    fn a_departure_at_an_uncatalogued_crs_is_kept_with_all_stations_on() {
+        let message = TrustMessage::Movement(movement(
+            "221832406",
+            "DEPARTURE",
+            Some("87212"),
+            Some("ON TIME"),
+        ));
+        let mut state = ProcessorState::default();
+        let result = process_message(
+            &message,
+            &mut state,
+            &stanox_table(),
+            &StationScope::AllMapped,
+            today(),
+            test_received_at(),
+        );
+        assert_eq!(result.unwrap().crs, Some("WAT".to_string()));
+    }
+
+    /// The unmapped-STANOX drop holds with the flag on.
+    #[test]
+    fn an_untranslatable_stanox_is_still_dropped_with_all_stations_on() {
+        let message = TrustMessage::Movement(movement(
+            "221832406",
+            "DEPARTURE",
+            Some("99999"),
+            Some("ON TIME"),
+        ));
+        let mut state = ProcessorState::default();
+        let result = process_message(
+            &message,
+            &mut state,
+            &stanox_table(),
+            &StationScope::AllMapped,
+            today(),
+            test_received_at(),
+        );
+        assert!(result.is_none());
+    }
+
+    /// PASS stays dropped with the flag on.
+    #[test]
+    fn a_pass_event_is_still_dropped_with_all_stations_on() {
+        let message = TrustMessage::Movement(movement(
+            "221832406",
+            "PASS",
+            Some("87212"),
+            Some("ON TIME"),
+        ));
+        let mut state = ProcessorState::default();
+        let result = process_message(
+            &message,
+            &mut state,
+            &stanox_table(),
+            &StationScope::AllMapped,
             today(),
             test_received_at(),
         );

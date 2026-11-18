@@ -43,6 +43,46 @@ use std::collections::HashSet;
 
 use common::LineDefinition;
 
+/// Which stations' Movements are stored (the `TRUST_BACKLOG_ALL_STATIONS`
+/// flag, off by default).
+///
+/// `Catalogue` (the default) keeps a Movement only at a CRS in the
+/// line-catalogue index. `AllMapped` keeps a Movement at any station whose
+/// STANOX resolves through `stanox_to_crs`; an unmapped STANOX is dropped
+/// either way, and the event-type filter (never PASS) is unaffected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StationScope {
+    Catalogue(HashSet<String>),
+    AllMapped,
+}
+
+impl StationScope {
+    /// The scope for the flag: the catalogue index, or every mapped station.
+    pub(crate) fn new(all_stations: bool, lines: &[LineDefinition]) -> Self {
+        if all_stations {
+            Self::AllMapped
+        } else {
+            Self::Catalogue(build_crs_index(lines))
+        }
+    }
+
+    /// Whether a Movement at this (already STANOX-resolved) CRS is kept.
+    pub(crate) fn admits(&self, crs: &str) -> bool {
+        match self {
+            Self::Catalogue(index) => index.contains(&crs.to_uppercase()),
+            Self::AllMapped => true,
+        }
+    }
+
+    /// A short name for the startup log.
+    pub(crate) const fn describe(&self) -> &'static str {
+        match self {
+            Self::Catalogue(_) => "catalogue stations only",
+            Self::AllMapped => "all stations with a mapped STANOX",
+        }
+    }
+}
+
 pub(crate) fn build_crs_index(lines: &[LineDefinition]) -> HashSet<String> {
     let mut index = HashSet::new();
     for line in lines {
