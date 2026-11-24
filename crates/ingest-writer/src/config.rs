@@ -125,6 +125,25 @@ pub struct Config {
     )]
     pub ioi_tracked_train_history_retention_days: u32,
 
+    /// Hard upper bound, in days of `train_date` before Dublin's today, on
+    /// the journey hold. The board history of a tracked train a journey leg
+    /// is bound to (`journey_legs.train_subscription_id` ->
+    /// `train_subscriptions.trains_id`) is kept past
+    /// `--ioi-tracked-train-history-retention-days` for as long as the leg
+    /// exists, like the aggregator's hold on a bound GB `trains` row; the api
+    /// deletes the leg at its 548-day journey retention, which releases the
+    /// train. Past this bound the rows go anyway. Named and defaulted like
+    /// the aggregator's variable (600, above the journey retention); 0 turns
+    /// the hold off. Needs the writer role's SELECT on
+    /// `journey_legs (train_subscription_id)` (ds-core v0.17.6 or later).
+    #[arg(
+        long,
+        env = "IOI_TRAINS_SNAPSHOT_GUARD_MAX_DAYS",
+        default_value_t = crate::handlers::island_of_ireland::DEFAULT_TRAINS_SNAPSHOT_GUARD_MAX_DAYS,
+        value_parser = clap::value_parser!(u32).range(0..=3650)
+    )]
+    pub ioi_trains_snapshot_guard_max_days: u32,
+
     /// An entry left pending because this writer does not know its schema
     /// version or envelope version (the producer is newer) is
     /// dead-lettered, reason `unsupported_expired`, once it is this many

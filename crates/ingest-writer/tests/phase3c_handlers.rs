@@ -29,7 +29,8 @@ use common::island_of_ireland::{
 };
 use common::{LineStatus, LineStatusReport, TocReference};
 use ingest_stream::{Envelope, Handled, Handler, HandlerError, SchemaId, StreamEntry};
-use ingest_writer::handlers::registry;
+use ingest_writer::handlers::snapshots::Options;
+use ingest_writer::handlers::{registry, registry_with};
 use ingest_writer::stream::{StreamSpec, WriterHandler};
 use serde::Serialize;
 use sqlx::PgPool;
@@ -109,6 +110,20 @@ impl Db {
             .await
     }
 
+    /// Applies `entry` with a registry built from `options`, which must be
+    /// [`Handled::Applied`].
+    async fn applied_with(&self, entry: &StreamEntry, options: Options) {
+        let spec = StreamSpec::by_stream(&entry.stream).expect("a writer stream");
+        let result = WriterHandler::new(self.pool.clone(), Arc::new(registry_with(options)), spec)
+            .handle(entry)
+            .await;
+        assert!(
+            matches!(result, Ok(Handled::Applied)),
+            "{}: {result:?}",
+            entry.envelope.key
+        );
+    }
+
     /// Applies `entry`, which must be [`Handled::Applied`].
     async fn applied(&self, entry: &StreamEntry) {
         let result = self.apply(entry).await;
@@ -151,6 +166,7 @@ impl Db {
             "DELETE FROM island_of_ireland_live_stations WHERE code LIKE 'TEST-3C-%' AND $1 <> ''",
             "DELETE FROM island_of_ireland_train_calls WHERE train_code LIKE 'Z3C%' AND $1 <> ''",
             "DELETE FROM island_of_ireland_trains WHERE train_code LIKE 'Z3C%' AND $1 <> ''",
+            "DELETE FROM journeys WHERE user_id = 'test-3c-ioi-user' AND $1 <> ''",
             "DELETE FROM train_subscriptions WHERE user_id = 'test-3c-ioi-user' AND $1 <> ''",
             "DELETE FROM users WHERE id = 'test-3c-ioi-user' AND $1 <> ''",
             "DELETE FROM trains WHERE train_uid LIKE 'ie:Z3C%' AND $1 <> ''",
@@ -832,6 +848,152 @@ async fn island_of_ireland_samples_derive_tracked_state_and_keep_tracked_history
         ["Z3C5"],
         "only the tracked train's old history is kept"
     );
+    db.cleanup().await;
+}
+
+/// Journey hold (DS-638): a tracked Irish train a journey leg is bound to
+/// keeps its board history past the tracked cutoff, up to
+/// `IOI_TRAINS_SNAPSHOT_GUARD_MAX_DAYS`; an unbound tracked train and an
+/// untracked one are pruned; deleting the leg releases the train. Runs as
+/// the writer role, so it also proves the role's grants on `journey_legs`
+/// and `train_subscriptions` cover the hold's join.
+#[tokio::test]
+#[ignore = "requires a live database (DATABASE_URL)"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario: seed, apply, read back, release"
+)]
+async fn island_of_ireland_history_of_a_journey_bound_train_is_held() {
+    let db = Db::new().await;
+    db.cleanup().await;
+    let live = "ds:ingest:ioi-live";
+    let t0 = at_millis(Utc::now() - TimeDelta::minutes(2));
+    let today = ingest_writer::handlers::island_of_ireland::history_cutoff(Utc::now(), 0);
+    let old = today - chrono::Days::new(400);
+    sqlx::query("INSERT INTO users (id, name) VALUES ('test-3c-ioi-user', 'test')")
+        .execute(&db.admin)
+        .await
+        .unwrap();
+    // Z3C7: tracked and bound to a leg; Z3C8: tracked, no leg; Z3C9: not
+    // tracked. All 400 days old, far past the 30-day tracked cutoff.
+    for code in ["Z3C7", "Z3C8", "Z3C9"] {
+        for sql in [
+            "INSERT INTO island_of_ireland_trains (network, train_code, train_date, origin, \
+             destination, status, first_seen_at, last_seen_at, changed_at) VALUES \
+             ('republic-of-ireland', $2, $1, 'A', 'B', 'En Route', now(), now(), now())",
+            "INSERT INTO island_of_ireland_train_calls (network, train_code, train_date, \
+             station_code, first_seen_at, changed_at) VALUES \
+             ('republic-of-ireland', $2, $1, 'TEST-3C-OLD', now(), now())",
+        ] {
+            sqlx::query(sql)
+                .bind(old)
+                .bind(code)
+                .execute(&db.admin)
+                .await
+                .unwrap();
+        }
+    }
+    let mut subscriptions = Vec::new();
+    for uid in ["ie:Z3C7", "ie:Z3C8"] {
+        let trains_id: i64 = sqlx::query_scalar(
+            "INSERT INTO trains (train_uid, service_date) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(uid)
+        .bind(old)
+        .fetch_one(&db.admin)
+        .await
+        .unwrap();
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO train_subscriptions (user_id, service_date, trains_id, \
+             resolution_status, pin_origin_ref) \
+             VALUES ('test-3c-ioi-user', $1, $2, 'resolved', 'ie:CNLLY') RETURNING id",
+        )
+        .bind(old)
+        .bind(trains_id)
+        .fetch_one(&db.admin)
+        .await
+        .unwrap();
+        subscriptions.push(id);
+    }
+    let journey: i64 = sqlx::query_scalar(
+        "INSERT INTO journeys (user_id) VALUES ('test-3c-ioi-user') RETURNING id",
+    )
+    .fetch_one(&db.admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO journey_legs (journey_id, leg_order, service_date, train_subscription_id) \
+         VALUES ($1, 1, $2, $3)",
+    )
+    .bind(journey)
+    .bind(old)
+    .bind(subscriptions[0])
+    .execute(&db.admin)
+    .await
+    .unwrap();
+
+    let left = || {
+        let admin = db.admin.clone();
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT DISTINCT train_code FROM island_of_ireland_trains \
+                 WHERE train_code LIKE 'Z3C%' \
+                 UNION SELECT DISTINCT train_code FROM island_of_ireland_train_calls \
+                 WHERE train_code LIKE 'Z3C%' ORDER BY 1",
+            )
+            .fetch_all(&admin)
+            .await
+            .unwrap()
+        }
+    };
+    let empty = |key: &str| {
+        db.entry(
+            live,
+            "ioi-station-samples",
+            key,
+            t0,
+            &Vec::<IslandOfIrelandStationSample>::new(),
+        )
+    };
+
+    // Default hold (600 days): only the bound train's history survives.
+    db.applied(&empty("held-1")).await;
+    assert_eq!(left().await, ["Z3C7"], "the bound train's history is held");
+
+    // A hold shorter than the train's age forces the prune.
+    db.applied_with(
+        &empty("held-forced"),
+        Options {
+            ioi_trains_snapshot_guard_max_days: 300,
+            ..Options::default()
+        },
+    )
+    .await;
+    assert!(
+        left().await.is_empty(),
+        "past the hard bound the history goes, leg or not"
+    );
+
+    // Re-seed the bound train's history; deleting the leg releases it.
+    for sql in [
+        "INSERT INTO island_of_ireland_trains (network, train_code, train_date, origin, \
+         destination, status, first_seen_at, last_seen_at, changed_at) VALUES \
+         ('republic-of-ireland', 'Z3C7', $1, 'A', 'B', 'En Route', now(), now(), now())",
+        "INSERT INTO island_of_ireland_train_calls (network, train_code, train_date, \
+         station_code, first_seen_at, changed_at) VALUES \
+         ('republic-of-ireland', 'Z3C7', $1, 'TEST-3C-OLD', now(), now())",
+    ] {
+        sqlx::query(sql).bind(old).execute(&db.admin).await.unwrap();
+    }
+    db.applied(&empty("held-2")).await;
+    assert_eq!(left().await, ["Z3C7"]);
+    sqlx::query("DELETE FROM journeys WHERE id = $1")
+        .bind(journey)
+        .execute(&db.admin)
+        .await
+        .unwrap();
+    db.applied(&empty("released")).await;
+    assert!(left().await.is_empty(), "the leg is gone, so is the hold");
     db.cleanup().await;
 }
 
