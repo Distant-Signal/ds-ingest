@@ -170,6 +170,7 @@ fn start_streams(
             ioi_train_history_retention_days: config.ioi_train_history_retention_days,
             ioi_tracked_train_history_retention_days: config
                 .ioi_tracked_train_history_retention_days,
+            ioi_trains_snapshot_guard_max_days: config.ioi_trains_snapshot_guard_max_days,
         });
     if config.changed_rows_only {
         tracing::info!(

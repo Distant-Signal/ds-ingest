@@ -79,6 +79,9 @@ pub struct Options {
     /// `IOI_TRACKED_TRAIN_HISTORY_RETENTION_DAYS`: the same for a tracked
     /// train.
     pub ioi_tracked_train_history_retention_days: u32,
+    /// `IOI_TRAINS_SNAPSHOT_GUARD_MAX_DAYS`: the hard bound on the journey
+    /// hold (0: no hold).
+    pub ioi_trains_snapshot_guard_max_days: u32,
 }
 
 impl Default for Options {
@@ -89,6 +92,8 @@ impl Default for Options {
                 super::island_of_ireland::DEFAULT_TRAIN_HISTORY_RETENTION_DAYS,
             ioi_tracked_train_history_retention_days:
                 super::island_of_ireland::DEFAULT_TRACKED_TRAIN_HISTORY_RETENTION_DAYS,
+            ioi_trains_snapshot_guard_max_days:
+                super::island_of_ireland::DEFAULT_TRAINS_SNAPSHOT_GUARD_MAX_DAYS,
         }
     }
 }

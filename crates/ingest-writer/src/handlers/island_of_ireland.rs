@@ -158,6 +158,11 @@ pub const DEFAULT_TRAIN_HISTORY_RETENTION_DAYS: u32 = 14;
 /// days, what the aggregator keeps of a tracked GB train.
 pub const DEFAULT_TRACKED_TRAIN_HISTORY_RETENTION_DAYS: u32 = 30;
 
+/// [`StationSamples`]' default hard bound on the journey hold: 600 days,
+/// the aggregator's `TRAINS_SNAPSHOT_GUARD_MAX_DAYS` default, above the
+/// api's 548-day journey retention. 0 turns the hold off.
+pub const DEFAULT_TRAINS_SNAPSHOT_GUARD_MAX_DAYS: u32 = 600;
+
 /// Departures the board history left out (no `Traindate`, or a train code
 /// the history refuses), by the counter's only label, `reason`.
 pub const TRAIN_HISTORY_SKIPPED_METRIC: &str = "island_of_ireland_history_skipped_departures_total";
@@ -183,7 +188,9 @@ pub const TRACKED_STATES_METRIC: &str = "island_of_ireland_tracked_states_writte
 /// 3. the history's prune, in two tiers: a tracked train's rows once its
 ///    `train_date` is more than `tracked_history_retention_days` before
 ///    Dublin's today, every other train's after `history_retention_days`,
-///    at most `TRAIN_HISTORY_PRUNE_BATCH` per table per entry (§4.3);
+///    except that a tracked train a journey leg is bound to is kept for as
+///    long as the leg exists, up to `trains_snapshot_guard_max_days` from
+///    its `train_date` (0: no hold), at most `TRAIN_HISTORY_PRUNE_BATCH` per table per entry (§4.3);
 /// 4. the live feed's freshness marker
 ///    (`island_of_ireland_station_samples_live`), for a non-empty batch.
 ///
@@ -194,6 +201,9 @@ pub const TRACKED_STATES_METRIC: &str = "island_of_ireland_tracked_states_writte
 pub struct StationSamples {
     pub history_retention_days: u32,
     pub tracked_history_retention_days: u32,
+    /// The hard bound, in days of `train_date`, on the journey hold; 0 turns
+    /// the hold off. Mirrors the aggregator's `TRAINS_SNAPSHOT_GUARD_MAX_DAYS`.
+    pub trains_snapshot_guard_max_days: u32,
 }
 
 impl SchemaHandler for StationSamples {
@@ -218,10 +228,12 @@ impl SchemaHandler for StationSamples {
             let tracked = store::tracked::derive_for_samples(conn, &samples, now)
                 .await
                 .map_err(|err| classify_anyhow(&err))?;
-            let pruned = store::prune_train_history(
+            let tracked_cutoff = history_cutoff(now, self.tracked_history_retention_days);
+            let pruned = store::prune_train_history_with_journey_hold(
                 conn,
                 history_cutoff(now, self.history_retention_days),
-                history_cutoff(now, self.tracked_history_retention_days),
+                tracked_cutoff,
+                journey_hold_cutoff(now, tracked_cutoff, self.trains_snapshot_guard_max_days),
                 store::TRAIN_HISTORY_PRUNE_BATCH,
             )
             .await
@@ -254,6 +266,21 @@ pub fn history_cutoff(
 ) -> chrono::NaiveDate {
     let today = common::zone::Zone::DUBLIN.date(now);
     today - chrono::Days::new(u64::from(retention_days))
+}
+
+/// The first `train_date` a journey-bound train's history keeps:
+/// `max_days` before Dublin's date at `now`, or `tracked_cutoff` (no hold)
+/// when `max_days` is 0.
+pub fn journey_hold_cutoff(
+    now: chrono::DateTime<chrono::Utc>,
+    tracked_cutoff: chrono::NaiveDate,
+    max_days: u32,
+) -> chrono::NaiveDate {
+    if max_days == 0 {
+        tracked_cutoff
+    } else {
+        history_cutoff(now, max_days)
+    }
 }
 
 /// The history's counters for one entry.
@@ -436,6 +463,17 @@ mod tests {
 
     use chrono::Utc;
     use ingest_stream::{Envelope, SchemaId};
+
+    #[test]
+    fn the_journey_hold_cutoff_is_the_hard_bound_or_off() {
+        let now: chrono::DateTime<Utc> = "2026-12-01T12:00:00Z".parse().unwrap();
+        let tracked = history_cutoff(now, 30);
+        assert_eq!(
+            journey_hold_cutoff(now, tracked, 600),
+            chrono::NaiveDate::from_ymd_opt(2025, 4, 10).unwrap()
+        );
+        assert_eq!(journey_hold_cutoff(now, tracked, 0), tracked);
+    }
 
     use super::*;
 

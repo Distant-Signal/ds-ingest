@@ -185,6 +185,7 @@ pub fn registry_with(options: snapshots::Options) -> Registry {
             island_of_ireland::StationSamples {
                 history_retention_days: options.ioi_train_history_retention_days,
                 tracked_history_retention_days: options.ioi_tracked_train_history_retention_days,
+                trains_snapshot_guard_max_days: options.ioi_trains_snapshot_guard_max_days,
             },
         ),
         registry.register(&v1("ioi-live-stations"), island_of_ireland::LiveStations),
