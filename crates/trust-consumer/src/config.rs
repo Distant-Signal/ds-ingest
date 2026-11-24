@@ -32,12 +32,6 @@ pub(crate) struct Config {
     #[arg(long, env, default_value_t = 60)]
     pub reference_reload_secs: u64,
 
-    /// How long to keep `train_movement_events` rows before pruning.
-    /// `tracked_trains`/`train_current_state` are kept indefinitely (see
-    /// this plan's Global Constraints).
-    #[arg(long, env, default_value_t = 90)]
-    pub retention_days: i64,
-
     /// Bind address for the `/healthz` liveness endpoint (Task 7's
     /// `health.rs`). A persistent stream consumer needs
     /// connected/reconnecting/disconnected health semantics, not the
