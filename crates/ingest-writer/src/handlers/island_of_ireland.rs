@@ -175,6 +175,12 @@ pub const UNRECOGNISED_STATUS_METRIC: &str = "island_of_ireland_unrecognised_sta
 /// History rows pruned past the retention window.
 pub const TRAIN_HISTORY_PRUNED_METRIC: &str = "island_of_ireland_history_pruned_rows_total";
 
+/// History rows deleted while a journey leg was still bound to their train
+/// (the hard bound, `IOI_TRAINS_SNAPSHOT_GUARD_MAX_DAYS`, passed with the leg
+/// kept: a leg that lost its train's history), by the `table` label. Exported
+/// as `distant_signal_ingest_writer_ioi_history_forced_total`.
+pub const TRAIN_HISTORY_FORCED_METRIC: &str = "ingest_writer_ioi_history_forced_total";
+
 /// Tracked trains' `train_current_state` rows written from the boards.
 pub const TRACKED_STATES_METRIC: &str = "island_of_ireland_tracked_states_written_total";
 
@@ -229,7 +235,7 @@ impl SchemaHandler for StationSamples {
                 .await
                 .map_err(|err| classify_anyhow(&err))?;
             let tracked_cutoff = history_cutoff(now, self.tracked_history_retention_days);
-            let pruned = store::prune_train_history_with_journey_hold(
+            let pruned = store::prune_train_history_reporting_forced(
                 conn,
                 history_cutoff(now, self.history_retention_days),
                 tracked_cutoff,
@@ -250,7 +256,8 @@ impl SchemaHandler for StationSamples {
                 .await
                 .map_err(|err| classify_anyhow(&err))?;
             }
-            record_history(&samples, history, pruned);
+            record_history(&samples, history, pruned.total());
+            record_forced(pruned);
             record_tracked(tracked);
             count_apply(entry, samples.len(), written);
             Ok(Applied::All)
@@ -317,6 +324,33 @@ fn record_history(
         skipped = history.skipped,
         pruned,
         "island-of-Ireland board history recorded"
+    );
+}
+
+/// The forced prunes of one entry: a WARN with the counts, and the
+/// `table`-labelled counter, only when some row was deleted while a leg was
+/// still bound to its train.
+fn record_forced(pruned: store::TrainHistoryPruned) {
+    if pruned.forced() == 0 {
+        return;
+    }
+    for (table, count) in [
+        ("island_of_ireland_train_calls", pruned.forced_calls),
+        ("island_of_ireland_trains", pruned.forced_trains),
+    ] {
+        if count > 0 {
+            metrics::counter!(
+                ds_runtime::metrics::metric_name(TRAIN_HISTORY_FORCED_METRIC),
+                "table" => table
+            )
+            .increment(count);
+        }
+    }
+    tracing::warn!(
+        forced_calls = pruned.forced_calls,
+        forced_trains = pruned.forced_trains,
+        "island-of-Ireland board history deleted past IOI_TRAINS_SNAPSHOT_GUARD_MAX_DAYS \
+         while a journey leg was still bound to the train; the leg loses its history"
     );
 }
 
@@ -463,6 +497,51 @@ mod tests {
 
     use chrono::Utc;
     use ingest_stream::{Envelope, SchemaId};
+
+    /// Forced rows are counted per table, and an ordinary prune exports
+    /// nothing.
+    #[test]
+    fn forced_prunes_are_counted_per_table_and_ordinary_ones_are_not() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            record_forced(store::TrainHistoryPruned {
+                calls: 40,
+                trains: 5,
+                forced_calls: 0,
+                forced_trains: 0,
+            });
+        });
+        assert!(
+            !handle.render().contains("ioi_history_forced"),
+            "an ordinary prune exports no series"
+        );
+        metrics::with_local_recorder(&recorder, || {
+            record_forced(store::TrainHistoryPruned {
+                calls: 40,
+                trains: 5,
+                forced_calls: 7,
+                forced_trains: 2,
+            });
+            record_forced(store::TrainHistoryPruned {
+                calls: 1,
+                trains: 0,
+                forced_calls: 1,
+                forced_trains: 0,
+            });
+        });
+        let rendered = handle.render();
+        for series in [
+            r#"distant_signal_ingest_writer_ioi_history_forced_total{table="island_of_ireland_train_calls"} 8"#,
+            r#"distant_signal_ingest_writer_ioi_history_forced_total{table="island_of_ireland_trains"} 2"#,
+        ] {
+            assert!(
+                rendered.contains(series),
+                "{series} missing from {rendered}"
+            );
+        }
+    }
 
     #[test]
     fn the_journey_hold_cutoff_is_the_hard_bound_or_off() {

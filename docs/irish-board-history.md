@@ -21,6 +21,19 @@ running. `IOI_TRAINS_SNAPSHOT_GUARD_MAX_DAYS=0` turns the hold off (a tracked
 train then goes at the tracked window). A value under the tracked window is
 treated as that window.
 
+**Forced prunes.** A row the hard bound deletes while a leg still points at
+its train is a leg that loses its train's history, so the prune reports it
+(ds-core v0.18.3, `prune_train_history_reporting_forced`): the writer logs a
+WARN with `forced_calls` and `forced_trains` and adds the rows to
+`distant_signal_ingest_writer_ioi_history_forced_total{table}`, a counter with
+`table` `island_of_ireland_train_calls` or `island_of_ireland_trains`. Nothing
+is exported while the count is zero, which is every ordinary prune (an
+unbound train goes at its window; a bound one is held until the leg goes), so
+the series appears only after the first forced delete; alert on an increase.
+With `IOI_TRAINS_SNAPSHOT_GUARD_MAX_DAYS=0` (hold off) a bound train's rows
+count as forced too. The count is of rows deleted, not of trains or legs, and
+only for the rows the prune deleted in that entry (at most 2,000 per table).
+
 The writer's role needs SELECT on `journey_legs (train_subscription_id)` and
 `train_subscriptions (id, trains_id)` (ds-core v0.17.6 or later; the writer
 already has both).
